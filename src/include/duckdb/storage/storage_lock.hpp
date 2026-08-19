@@ -39,6 +39,8 @@ public:
 	unique_ptr<StorageLockKey> GetExclusiveLock();
 	//! Get a shared lock
 	unique_ptr<StorageLockKey> GetSharedLock();
+	//! Try to get a shared lock - queued exclusive waiters take precedence
+	unique_ptr<StorageLockKey> TryGetSharedLock();
 	//! Try to get an exclusive lock - if we cannot get it immediately we return `nullptr`
 	unique_ptr<StorageLockKey> TryGetExclusiveLock();
 	//! This is a special method that only exists for checkpointing
