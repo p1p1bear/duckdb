@@ -342,6 +342,44 @@ void LocalTableManager::InsertEntry(DataTable &table, shared_ptr<LocalTableStora
 	table_storage[table] = std::move(entry);
 }
 
+void LocalTableManager::PrepareMoveEntry(DataTable &old_dt, DataTable &new_dt) {
+	lock_guard<mutex> l(table_storage_lock);
+	if (table_storage.find(old_dt) == table_storage.end()) {
+		return;
+	}
+	D_ASSERT(table_storage.find(new_dt) == table_storage.end());
+	table_storage.emplace(reference<DataTable>(new_dt), nullptr);
+}
+
+void LocalTableManager::PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept {
+	lock_guard<mutex> l(table_storage_lock);
+	auto old_storage = table_storage.find(old_dt);
+	auto prepared_storage = table_storage.find(new_dt);
+	if (old_storage == table_storage.end()) {
+		if (prepared_storage != table_storage.end()) {
+			D_ASSERT(!prepared_storage->second);
+			table_storage.erase(prepared_storage);
+		}
+		return;
+	}
+	D_ASSERT(prepared_storage != table_storage.end());
+	D_ASSERT(!prepared_storage->second);
+	prepared_storage->second = std::move(old_storage->second);
+	table_storage.erase(old_storage);
+	prepared_storage->second->table_ref = new_dt;
+	prepared_storage->second->table_entry = new_entry;
+}
+
+void LocalTableManager::AbortMoveEntry(DataTable &new_dt) noexcept {
+	lock_guard<mutex> l(table_storage_lock);
+	auto prepared_storage = table_storage.find(new_dt);
+	if (prepared_storage == table_storage.end()) {
+		return;
+	}
+	D_ASSERT(!prepared_storage->second);
+	table_storage.erase(prepared_storage);
+}
+
 //===--------------------------------------------------------------------===//
 // LocalStorage
 //===--------------------------------------------------------------------===//
@@ -670,6 +708,18 @@ void LocalStorage::MoveStorage(DataTable &old_dt, DataTable &new_dt) {
 	// take over the storage from the old entry
 	new_storage->table_ref = new_dt;
 	table_manager.InsertEntry(new_dt, std::move(new_storage));
+}
+
+void LocalStorage::PrepareMoveStorage(DataTable &old_dt, DataTable &new_dt) {
+	table_manager.PrepareMoveEntry(old_dt, new_dt);
+}
+
+void LocalStorage::PublishMoveStorage(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept {
+	table_manager.PublishMoveEntry(old_dt, new_dt, new_entry);
+}
+
+void LocalStorage::AbortMoveStorage(DataTable &new_dt) noexcept {
+	table_manager.AbortMoveEntry(new_dt);
 }
 
 void LocalStorage::AddColumn(DataTable &old_dt, DataTable &new_dt, ColumnDefinition &new_column,

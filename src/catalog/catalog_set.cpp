@@ -1,9 +1,5 @@
 #include "duckdb/catalog/catalog_set.hpp"
 
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
 #include "duckdb/catalog/dependency_manager.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
@@ -335,20 +331,6 @@ bool CatalogSet::AlterEntry(CatalogTransaction transaction, const Identifier &na
 		}
 	}
 
-	// If this ALTER produced a new DuckTableEntry, refresh the LocalTableStorage's table_entry
-	// pointer so that commit-time Flush pushes an AppendInfo referencing the current DuckTableEntry.
-	if (transaction.context && value->type == CatalogType::TABLE_ENTRY) {
-		auto &tce = value->Cast<TableCatalogEntry>();
-		if (tce.IsDuckTable()) {
-			auto &new_entry = tce.Cast<DuckTableEntry>();
-			auto &new_storage = new_entry.GetStorage();
-			auto lstorage = LocalStorage::Get(*transaction.context, new_storage.db).GetStorage(new_storage);
-			if (lstorage) {
-				lstorage->table_entry = &new_entry;
-			}
-		}
-	}
-
 	// lock the catalog for writing
 	unique_lock<mutex> write_lock(catalog.GetWriteLock());
 	// lock this catalog set to disallow reading
@@ -389,6 +371,9 @@ bool CatalogSet::AlterEntry(CatalogTransaction transaction, const Identifier &na
 		// if we don't have a transaction this alter is non-transactional
 		// in that case we are able to just directly destroy the child (if there is any)
 		entry_to_destroy = new_entry->TakeChild();
+	}
+	if (transaction.context) {
+		new_entry->PublishAlter(*transaction.context, *entry);
 	}
 
 	read_lock.unlock();

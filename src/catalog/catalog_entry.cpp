@@ -36,6 +36,9 @@ unique_ptr<CatalogEntry> CatalogEntry::AlterEntry(CatalogTransaction transaction
 	return AlterEntry(*transaction.context, info);
 }
 
+void CatalogEntry::PublishAlter(ClientContext &context, CatalogEntry &previous_entry) {
+}
+
 void CatalogEntry::UndoAlter(ClientContext &context, AlterInfo &info) {
 }
 

@@ -388,6 +388,20 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	}
 }
 
+void DuckTableEntry::PublishAlter(ClientContext &context, CatalogEntry &previous_entry) {
+	if (previous_entry.type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	auto &previous_table = previous_entry.Cast<DuckTableEntry>();
+	if (!RefersToSameObject(*storage, previous_table.GetStorage())) {
+		storage->PublishAlter(*this);
+	}
+	auto local_storage = LocalStorage::Get(context, storage->db).GetStorage(*storage);
+	if (local_storage) {
+		local_storage->table_entry = this;
+	}
+}
+
 void DuckTableEntry::UndoAlter(ClientContext &context, AlterInfo &info) {
 	D_ASSERT(!internal);
 	D_ASSERT(info.type == AlterType::ALTER_TABLE);

@@ -71,6 +71,8 @@ private:
 public:
 	virtual unique_ptr<CatalogEntry> AlterEntry(ClientContext &context, AlterInfo &info);
 	virtual unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction transaction, AlterInfo &info);
+	//! Publishes storage-side state after the catalog write-conflict check succeeds.
+	virtual void PublishAlter(ClientContext &context, CatalogEntry &previous_entry);
 	virtual void UndoAlter(ClientContext &context, AlterInfo &info);
 	virtual void Rollback(CatalogEntry &prev_entry);
 	virtual void OnDrop();

@@ -120,6 +120,9 @@ public:
 	idx_t EstimatedSize() const;
 	bool IsEmpty() const;
 	void InsertEntry(DataTable &table, shared_ptr<LocalTableStorage> entry);
+	void PrepareMoveEntry(DataTable &old_dt, DataTable &new_dt);
+	void PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept;
+	void AbortMoveEntry(DataTable &new_dt) noexcept;
 
 private:
 	mutable mutex table_storage_lock;
@@ -200,6 +203,9 @@ public:
 	                const vector<StorageIndex> &bound_columns, Expression &cast_expr);
 
 	void MoveStorage(DataTable &old_dt, DataTable &new_dt);
+	void PrepareMoveStorage(DataTable &old_dt, DataTable &new_dt);
+	void PublishMoveStorage(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept;
+	void AbortMoveStorage(DataTable &new_dt) noexcept;
 	void FetchChunk(DataTable &table, const Vector &row_ids, idx_t count, const vector<StorageIndex> &col_ids,
 	                DataChunk &chunk, ColumnFetchState &fetch_state);
 	//! Returns true, if the local storage contains the row id.

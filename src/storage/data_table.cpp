@@ -205,8 +205,38 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	if (constraint.type != ConstraintType::UNIQUE) {
 		VerifyNewConstraint(local_storage, parent, constraint);
 	}
-	local_storage.MoveStorage(parent, *this);
+	pending_alter_storage = local_storage;
+	pending_alter_parent = parent;
+	local_storage.PrepareMoveStorage(parent, *this);
+}
+
+DataTable::DataTable(ClientContext &context, DataTable &parent, SortMetadataOnlyAlterTag)
+    : db(parent.db), info(parent.info), row_groups(parent.row_groups), version(DataTableVersion::MAIN_TABLE) {
+	for (auto &column_def : parent.column_definitions) {
+		column_definitions.emplace_back(column_def.Copy());
+	}
+	auto &local_storage = LocalStorage::Get(context, db);
+	pending_alter_storage = local_storage;
+	pending_alter_parent = parent;
+	local_storage.PrepareMoveStorage(parent, *this);
+}
+
+DataTable::~DataTable() {
+	if (pending_alter_storage) {
+		pending_alter_storage->AbortMoveStorage(*this);
+	}
+}
+
+void DataTable::PublishAlter(DuckTableEntry &new_entry) {
+	if (!pending_alter_parent) {
+		return;
+	}
+	auto &parent = *pending_alter_parent;
+	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_storage->PublishMoveStorage(parent, *this, new_entry);
 	parent.version = DataTableVersion::ALTERED;
+	pending_alter_storage = nullptr;
+	pending_alter_parent = nullptr;
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,

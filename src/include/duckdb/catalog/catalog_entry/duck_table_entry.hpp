@@ -32,6 +32,7 @@ public:
 public:
 	unique_ptr<CatalogEntry> AlterEntry(ClientContext &context, AlterInfo &info) override;
 	unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction, AlterInfo &info) override;
+	void PublishAlter(ClientContext &context, CatalogEntry &previous_entry) override;
 	void UndoAlter(ClientContext &context, AlterInfo &info) override;
 	void Rollback(CatalogEntry &prev_entry) override;
 	void OnDrop() override;

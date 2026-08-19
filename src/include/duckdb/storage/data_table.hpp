@@ -49,6 +49,7 @@ struct ColumnFetchState;
 struct ColumnSegmentInfo;
 struct ColumnSegmentInfoScanState;
 struct DataTableInfo;
+struct SortMetadataOnlyAlterTag {};
 struct LocalAppendState;
 struct ParallelTableScanState;
 struct TableAppendState;
@@ -76,6 +77,9 @@ public:
 	          const vector<StorageIndex> &bound_columns, Expression &cast_expr);
 	//! Constructs a DataTable as a delta on an existing data table but with one column added new constraint
 	DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint);
+	//! Constructs a detached metadata-only replacement sharing the parent's row groups.
+	DataTable(ClientContext &context, DataTable &parent, SortMetadataOnlyAlterTag);
+	~DataTable();
 
 	//! A reference to the database instance
 	AttachedDatabase &db;
@@ -226,6 +230,8 @@ public:
 	bool IsRoot() const {
 		return IsMainTable();
 	}
+	//! Publishes a detached metadata-only or constraint replacement.
+	void PublishAlter(DuckTableEntry &new_entry);
 	string TableModification() const;
 
 	//! Get statistics of a physical column within the table
@@ -347,5 +353,8 @@ private:
 	shared_ptr<RowGroupCollection> row_groups;
 	//! The version of the data table
 	atomic<DataTableVersion> version;
+	//! A metadata-only LocalStorage rekey waiting for catalog publication.
+	optional_ptr<LocalStorage> pending_alter_storage;
+	optional_ptr<DataTable> pending_alter_parent;
 };
 } // namespace duckdb
