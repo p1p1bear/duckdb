@@ -515,6 +515,13 @@
         "name": "tags",
         "type": "InsertionOrderPreservingMap<string>",
         "default": "InsertionOrderPreservingMap<string>()"
+      },
+      {
+        "id": 107,
+        "name": "persistent_column_id",
+        "type": "persistent_column_id_t",
+        "default": "0",
+        "version": "v2.0.0"
       }
     ],
     "constructor": [
