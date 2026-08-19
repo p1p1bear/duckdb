@@ -20,6 +20,7 @@
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/checkpoint/checkpoint_options.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 namespace duckdb {
 class AttachedDatabase;
@@ -227,6 +228,13 @@ public:
 	idx_t GetAllocationSize() const {
 		return allocation_size;
 	}
+	const RowGroupSortMetadata &GetSortMetadata() const {
+		return sort_metadata;
+	}
+	bool IsSealed() const {
+		return sealed;
+	}
+	void SetSortMetadata(RowGroupSortMetadata metadata, bool sealed);
 
 	void Verify();
 
@@ -305,6 +313,8 @@ private:
 	//! Whether or not `row_number_column_data` is loaded (mutable because `const` can lazy load)
 	mutable atomic<bool> row_number_is_loaded;
 	atomic<bool> has_changes;
+	RowGroupSortMetadata sort_metadata;
+	bool sealed = false;
 };
 
 } // namespace duckdb

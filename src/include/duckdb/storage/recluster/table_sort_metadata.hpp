@@ -105,6 +105,10 @@ struct RowGroupSortMetadata {
 	bool IsValid() const {
 		return (sort_order_id == INVALID_SORT_ORDER_ID) == (run_id == INVALID_SORT_RUN_ID);
 	}
+
+	bool operator==(const RowGroupSortMetadata &other) const {
+		return sort_order_id == other.sort_order_id && run_id == other.run_id;
+	}
 };
 
 } // namespace duckdb

@@ -14,7 +14,9 @@
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "test_helpers.hpp"
@@ -526,4 +528,56 @@ TEST_CASE("Row group sort metadata requires paired identifiers", "[storage][sort
 	REQUIRE(RowGroupSortMetadata {1, 2}.IsSorted());
 	REQUIRE(!RowGroupSortMetadata {1, 0}.IsValid());
 	REQUIRE(!RowGroupSortMetadata {0, 2}.IsValid());
+}
+
+static RowGroupPointer RowGroupPointerRoundTrip(const RowGroupPointer &input, StorageCompatibility compatibility) {
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	options.storage_compatibility = compatibility;
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	auto copy = input;
+	RowGroup::Serialize(copy, serializer, false);
+	serializer.End();
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto output = RowGroup::Deserialize(deserializer);
+	deserializer.End();
+	return output;
+}
+
+TEST_CASE("Row group pointers persist sort metadata in storage v2", "[storage][sort_metadata]") {
+	RowGroupPointer input;
+	input.row_start = 42;
+	input.tuple_count = 84;
+	input.sort_metadata = {3, 7};
+
+	auto output = RowGroupPointerRoundTrip(input, StorageCompatibility::Latest());
+	REQUIRE(output.row_start == input.row_start);
+	REQUIRE(output.tuple_count == input.tuple_count);
+	REQUIRE(output.sort_metadata == input.sort_metadata);
+
+	auto legacy_output = RowGroupPointerRoundTrip(input, StorageCompatibility::FromString("v1.5.5"));
+	REQUIRE(legacy_output.sort_metadata == RowGroupSortMetadata());
+
+	input.sort_metadata = {3, 0};
+	REQUIRE_THROWS_AS(RowGroupPointerRoundTrip(input, StorageCompatibility::Latest()), SerializationException);
+}
+
+TEST_CASE("Changing row group sort metadata requires a checkpoint rewrite", "[storage][sort_metadata]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sort_metadata_dirty(i INTEGER)"));
+
+	duckdb::shared_ptr<RowGroupCollection> collection;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("sort_metadata_dirty")));
+		collection = entry.GetStorage().GetRowGroupCollection();
+	});
+	RowGroup row_group(*collection, 0);
+	REQUIRE(!row_group.HasChanges());
+	row_group.SetSortMetadata({1, 2}, true);
+	REQUIRE(row_group.HasChanges());
 }

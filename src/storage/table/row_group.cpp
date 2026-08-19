@@ -62,6 +62,11 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, RowGroupPointer pointer)
 	this->extra_metadata_blocks = std::move(pointer.extra_metadata_blocks);
 	this->has_per_column_metadata_blocks = pointer.has_per_column_metadata_blocks;
 	this->per_column_metadata_blocks = std::move(pointer.per_column_metadata_blocks);
+	if (!pointer.sort_metadata.IsValid()) {
+		throw DataCorruptionException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
+	this->sort_metadata = pointer.sort_metadata;
+	this->sealed = sort_metadata.IsSorted();
 
 	Verify();
 }
@@ -444,6 +449,8 @@ unique_ptr<RowGroup> RowGroup::CreateNewRowGroupCopy(RowGroupCollection &new_col
 		row_group->column_pointers.resize(new_column_count);
 	}
 	row_group->has_per_column_metadata_blocks = has_per_column_metadata_blocks;
+	row_group->sort_metadata = sort_metadata;
+	row_group->sealed = sealed;
 	row_group->has_changes = true;
 	return row_group;
 }
@@ -1424,6 +1431,8 @@ vector<RowGroupWriteData> RowGroup::WriteToDisk(RowGroupWriteInfo &info,
 		result_row_group->columns = std::move(result_columns[row_group_idx]);
 		result_row_group->version_info = row_group.version_info.load();
 		result_row_group->owned_version_info = row_group.owned_version_info;
+		result_row_group->sort_metadata = row_group.sort_metadata;
+		result_row_group->sealed = row_group.sealed;
 
 		row_group_write_data.result_row_group = std::move(result_row_group);
 	}
@@ -1591,6 +1600,8 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 	result_row_group->deletes_is_loaded = deletes_is_loaded.load();
 	result_row_group->owned_version_info = owned_version_info;
 	result_row_group->version_info = version_info.load();
+	result_row_group->sort_metadata = sort_metadata;
+	result_row_group->sealed = sealed;
 	if (is_loaded) {
 		result_row_group->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[GetColumnCount()]);
 		for (idx_t c = 0; c < GetColumnCount(); c++) {
@@ -1676,6 +1687,7 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 	// construct the row group pointer and write the column meta data to disk
 	row_group_pointer.row_start = row_group_start;
 	row_group_pointer.tuple_count = count;
+	row_group_pointer.sort_metadata = sort_metadata;
 	if (write_data.write_action == RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
 		// we are re-using the previous metadata
 		row_group_pointer.data_pointers = column_pointers;
@@ -1905,6 +1917,9 @@ vector<MetaBlockPointer> RowGroup::CheckpointDeletes(RowGroupWriter &writer) {
 }
 
 void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes) {
+	if (!pointer.sort_metadata.IsValid()) {
+		throw SerializationException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
 	serializer.WriteProperty(100, "row_start", pointer.row_start);
 	serializer.WriteProperty(101, "tuple_count", pointer.tuple_count);
 	serializer.WriteProperty(102, "data_pointers", pointer.data_pointers);
@@ -1924,6 +1939,10 @@ void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer, bool 
 		serializer.WriteProperty(106, "has_per_column_metadata_blocks", pointer.has_per_column_metadata_blocks);
 		serializer.WritePropertyWithDefault(107, "per_column_metadata_blocks", pointer.per_column_metadata_blocks.data);
 	}
+	if (serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+		serializer.WritePropertyWithDefault(108, "sort_order_id", pointer.sort_metadata.sort_order_id);
+		serializer.WritePropertyWithDefault(109, "run_id", pointer.sort_metadata.run_id);
+	}
 }
 
 RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
@@ -1938,12 +1957,33 @@ RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
 	    deserializer.ReadPropertyWithExplicitDefault<bool>(106, "has_per_column_metadata_blocks", false);
 	result.per_column_metadata_blocks = {
 	    deserializer.ReadPropertyWithDefault<vector<PerColumnMetadataBlock>>(107, "per_column_metadata_blocks")};
+	result.sort_metadata.sort_order_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_order_id_t>(108, "sort_order_id", INVALID_SORT_ORDER_ID);
+	result.sort_metadata.run_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_run_id_t>(109, "run_id", INVALID_SORT_RUN_ID);
+	if (!result.sort_metadata.IsValid()) {
+		throw SerializationException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
 	if (result.has_per_column_metadata_blocks) {
 		// per-column metadata supersedes legacy extra_metadata_blocks
 		result.has_metadata_blocks = false;
 		result.extra_metadata_blocks.clear();
 	}
 	return result;
+}
+
+void RowGroup::SetSortMetadata(RowGroupSortMetadata metadata, bool sealed_p) {
+	if (!metadata.IsValid()) {
+		throw InternalException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
+	if (metadata.IsSorted() && !sealed_p) {
+		throw InternalException("A sorted row group must be sealed");
+	}
+	if (!(sort_metadata == metadata) || sealed != sealed_p) {
+		has_changes = true;
+	}
+	sort_metadata = metadata;
+	sealed = sealed_p;
 }
 
 //===--------------------------------------------------------------------===//
@@ -2054,6 +2094,8 @@ idx_t RowGroup::Delete(TransactionData transaction, DuckTableEntry &table_entry,
 
 void RowGroup::Verify() {
 #ifdef DEBUG
+	D_ASSERT(sort_metadata.IsValid());
+	D_ASSERT(!sort_metadata.IsSorted() || sealed);
 	for (idx_t c = 0; c < columns.size(); c++) {
 		if (!ColumnIsLoaded(c)) {
 			continue;
