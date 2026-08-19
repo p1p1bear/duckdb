@@ -137,22 +137,21 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, ColumnDefinition
 	default_executor.AddExpression(default_value);
 
 	// prevent any new tuples from being added to the parent
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 
 	this->row_groups = parent.row_groups->AddColumn(context, new_column, default_executor);
 
-	// also add this column to client local storage
-	local_storage.AddColumn(parent, *this, new_column, default_executor);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the client-local replacement without changing the currently visible map entry.
+	pending_local_storage_alter = local_storage.PrepareAddColumn(parent, *this, new_column, default_executor);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_column)
     : db(parent.db), info(parent.info), version(DataTableVersion::MAIN_TABLE) {
 	// prevent any new tuples from being added to the parent
 	auto &local_storage = LocalStorage::Get(context, db);
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
@@ -189,11 +188,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_co
 	// alter the row_groups and remove the column from each of them
 	this->row_groups = parent.row_groups->RemoveColumn(removed_column);
 
-	// scan the original table, and fill the new column with the transformed value
-	local_storage.DropColumn(parent, *this, removed_column);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the local collection replacement while preserving the old map entry.
+	pending_local_storage_alter = local_storage.PrepareDropColumn(parent, *this, removed_column);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint)
@@ -204,7 +200,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	info->BindIndexes(context);
 
 	auto &local_storage = LocalStorage::Get(context, db);
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
@@ -212,26 +209,25 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	if (constraint.type != ConstraintType::UNIQUE) {
 		VerifyNewConstraint(local_storage, parent, constraint);
 	}
-	pending_alter_storage = local_storage;
-	pending_alter_parent = parent;
-	local_storage.PrepareMoveStorage(parent, *this);
+	pending_local_storage_alter = local_storage.PrepareMoveStorage(parent, *this);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, const ColumnList &replacement_columns,
                      SortMetadataOnlyAlterTag)
     : db(parent.db), info(parent.info), row_groups(parent.row_groups), version(DataTableVersion::MAIN_TABLE) {
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 	for (auto &column_def : replacement_columns.Physical()) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
 	auto &local_storage = LocalStorage::Get(context, db);
-	pending_alter_storage = local_storage;
-	pending_alter_parent = parent;
-	local_storage.PrepareMoveStorage(parent, *this);
+	pending_local_storage_alter = local_storage.PrepareMoveStorage(parent, *this);
 }
 
 DataTable::~DataTable() {
-	if (pending_alter_storage) {
-		pending_alter_storage->AbortMoveStorage(*this);
+	pending_local_storage_alter.reset();
+	if (pending_alter_lock.owns_lock()) {
+		pending_alter_lock.unlock();
 	}
 }
 
@@ -240,11 +236,13 @@ void DataTable::PublishAlter(DuckTableEntry &new_entry) {
 		return;
 	}
 	auto &parent = *pending_alter_parent;
-	lock_guard<mutex> parent_lock(parent.append_lock);
-	pending_alter_storage->PublishMoveStorage(parent, *this, new_entry);
+	D_ASSERT(pending_alter_lock.owns_lock());
+	D_ASSERT(pending_local_storage_alter);
+	pending_local_storage_alter->Publish(new_entry);
 	parent.version = DataTableVersion::ALTERED;
-	pending_alter_storage = nullptr;
+	pending_local_storage_alter.reset();
 	pending_alter_parent = nullptr;
+	pending_alter_lock.unlock();
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
@@ -253,7 +251,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 	auto &transaction = DuckTransaction::Get(context, db);
 	auto &local_storage = LocalStorage::Get(transaction);
 	// prevent any tuples from being added to the parent
-	lock_guard<mutex> lock(append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
@@ -277,11 +276,9 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 	// the column that had its type changed will have the new statistics computed during conversion
 	row_groups = parent.row_groups->AlterType(context, changed_idx, target_type, bound_columns, cast_expr, transaction);
 
-	// scan the original table, and fill the new column with the transformed value
-	local_storage.ChangeType(parent, *this, changed_idx, target_type, bound_columns, cast_expr);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the local collection replacement while preserving the old map entry.
+	pending_local_storage_alter =
+	    local_storage.PrepareChangeType(parent, *this, changed_idx, target_type, bound_columns, cast_expr);
 }
 
 vector<LogicalType> DataTable::GetTypes() {

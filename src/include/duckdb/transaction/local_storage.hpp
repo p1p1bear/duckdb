@@ -26,16 +26,41 @@ class DuckTableEntry;
 class DuckTransaction;
 class Expression;
 class ExpressionExecutor;
+class LocalStorage;
+class LocalTableStorage;
 class RowGroupCollection;
 class StorageCommitState;
 class Transaction;
 class Vector;
 class WriteAheadLog;
+struct LocalStorageAlterCleanup;
 struct ColumnFetchState;
 struct LocalAppendState;
 struct ParallelCollectionScanState;
 struct TableAppendState;
 struct TransactionData;
+
+enum class PendingLocalStorageAlterMode : uint8_t { REKEY_ONLY, REBUILT };
+
+//! A detached local-storage replacement that remains inert until the catalog alter is published.
+class PendingLocalStorageAlter {
+public:
+	PendingLocalStorageAlter(LocalStorage &storage, DataTable &old_table, DataTable &new_table,
+	                         PendingLocalStorageAlterMode mode);
+	~PendingLocalStorageAlter();
+
+	void Publish(DuckTableEntry &new_entry) noexcept;
+
+private:
+	LocalStorage &storage;
+	DataTable &old_table;
+	DataTable &new_table;
+	PendingLocalStorageAlterMode mode;
+	shared_ptr<LocalTableStorage> replacement_storage;
+	bool active = false;
+
+	friend class LocalStorage;
+};
 
 class LocalTableStorage : public enable_shared_from_this<LocalTableStorage> {
 public:
@@ -46,7 +71,8 @@ public:
 	                  const idx_t alter_column_index, const LogicalType &target_type,
 	                  const vector<StorageIndex> &bound_columns, Expression &cast_expr, TransactionData transaction);
 	//! Create a LocalTableStorage from a DROP COLUMN.
-	LocalTableStorage(DataTable &new_data_table, LocalTableStorage &parent, const idx_t drop_column_index);
+	LocalTableStorage(ClientContext &context, DataTable &new_data_table, LocalTableStorage &parent,
+	                  const idx_t drop_column_index);
 	// Create a LocalTableStorage from an ADD COLUMN
 	LocalTableStorage(ClientContext &context, DataTable &table, LocalTableStorage &parent, ColumnDefinition &new_column,
 	                  ExpressionExecutor &default_executor);
@@ -103,12 +129,18 @@ public:
 	void ResetOptimisticCollection(const PhysicalIndex collection_index);
 	//! Returns the optimistic writer.
 	OptimisticDataWriter &GetOptimisticWriter();
+	//! Completes the ownership transfer from the old local storage after catalog publication.
+	void PublishAlter(LocalTableStorage &parent, DuckTableEntry &new_entry) noexcept;
+	//! Releases blocks made obsolete by published local schema alterations.
+	void FinalizeAlterCleanup();
 
 	RowGroupCollection &GetCollection();
 	OptimisticWriteCollection &GetPrimaryCollection();
 
 private:
 	mutex collections_lock;
+	shared_ptr<LocalStorageAlterCleanup> alter_cleanup;
+	bool has_unpublished_alter_cleanup = false;
 };
 
 class LocalTableManager {
@@ -116,12 +148,15 @@ public:
 	shared_ptr<LocalTableStorage> MoveEntry(DataTable &table);
 	reference_map_t<DataTable, shared_ptr<LocalTableStorage>> MoveEntries();
 	optional_ptr<LocalTableStorage> GetStorage(DataTable &table) const;
+	shared_ptr<LocalTableStorage> GetStorageShared(DataTable &table) const;
 	LocalTableStorage &GetOrCreateStorage(ClientContext &context, DataTable &table);
 	idx_t EstimatedSize() const;
 	bool IsEmpty() const;
 	void InsertEntry(DataTable &table, shared_ptr<LocalTableStorage> entry);
 	void PrepareMoveEntry(DataTable &old_dt, DataTable &new_dt);
-	void PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept;
+	void PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry,
+	                      PendingLocalStorageAlterMode mode,
+	                      shared_ptr<LocalTableStorage> &replacement_storage) noexcept;
 	void AbortMoveEntry(DataTable &new_dt) noexcept;
 
 private:
@@ -196,16 +231,18 @@ public:
 	idx_t AddedRows(DataTable &table);
 	vector<PartitionStatistics> GetPartitionStats(DataTable &table, TransactionData transaction) const;
 
-	void AddColumn(DataTable &old_dt, DataTable &new_dt, ColumnDefinition &new_column,
-	               ExpressionExecutor &default_executor);
-	void DropColumn(DataTable &old_dt, DataTable &new_dt, const idx_t drop_column_index);
-	void ChangeType(DataTable &old_dt, DataTable &new_dt, idx_t changed_idx, const LogicalType &target_type,
-	                const vector<StorageIndex> &bound_columns, Expression &cast_expr);
+	unique_ptr<PendingLocalStorageAlter> PrepareAddColumn(DataTable &old_dt, DataTable &new_dt,
+	                                                      ColumnDefinition &new_column,
+	                                                      ExpressionExecutor &default_executor);
+	unique_ptr<PendingLocalStorageAlter> PrepareDropColumn(DataTable &old_dt, DataTable &new_dt,
+	                                                       const idx_t drop_column_index);
+	unique_ptr<PendingLocalStorageAlter> PrepareChangeType(DataTable &old_dt, DataTable &new_dt, idx_t changed_idx,
+	                                                       const LogicalType &target_type,
+	                                                       const vector<StorageIndex> &bound_columns,
+	                                                       Expression &cast_expr);
 
 	void MoveStorage(DataTable &old_dt, DataTable &new_dt);
-	void PrepareMoveStorage(DataTable &old_dt, DataTable &new_dt);
-	void PublishMoveStorage(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry) noexcept;
-	void AbortMoveStorage(DataTable &new_dt) noexcept;
+	unique_ptr<PendingLocalStorageAlter> PrepareMoveStorage(DataTable &old_dt, DataTable &new_dt);
 	void FetchChunk(DataTable &table, const Vector &row_ids, idx_t count, const vector<StorageIndex> &col_ids,
 	                DataChunk &chunk, ColumnFetchState &fetch_state);
 	//! Returns true, if the local storage contains the row id.
@@ -226,6 +263,12 @@ private:
 
 private:
 	void Flush(DataTable &table, LocalTableStorage &storage, optional_ptr<StorageCommitState> commit_state);
+	void PublishPreparedAlter(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry,
+	                          PendingLocalStorageAlterMode mode,
+	                          shared_ptr<LocalTableStorage> &replacement_storage) noexcept;
+	void AbortPreparedAlter(DataTable &new_dt) noexcept;
+
+	friend class PendingLocalStorageAlter;
 };
 
 } // namespace duckdb

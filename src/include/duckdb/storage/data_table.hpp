@@ -354,8 +354,10 @@ private:
 	shared_ptr<RowGroupCollection> row_groups;
 	//! The version of the data table
 	atomic<DataTableVersion> version;
-	//! A metadata-only LocalStorage rekey waiting for catalog publication.
-	optional_ptr<LocalStorage> pending_alter_storage;
+	//! The parent and append lock retained until this detached replacement is published or discarded.
 	optional_ptr<DataTable> pending_alter_parent;
+	unique_lock<mutex> pending_alter_lock;
+	//! The LocalStorage replacement waiting for catalog publication.
+	unique_ptr<PendingLocalStorageAlter> pending_local_storage_alter;
 };
 } // namespace duckdb
