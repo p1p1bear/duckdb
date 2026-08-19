@@ -4,6 +4,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
@@ -153,6 +154,47 @@ TEST_CASE("Create table sort key projections normalize and validate", "[storage]
 	mixed.sort_metadata = TableSortCatalogMetadata();
 	mixed.sort_keys.push_back(make_uniq<ColumnRefExpression>("event_time"));
 	REQUIRE_THROWS_AS(mixed.NormalizeLegacySortKeys(), SerializationException);
+}
+
+static TableSortCatalogPostImage MakeSortPostImage() {
+	TableSortCatalogPostImage result;
+	result.table_metadata.table_id = hugeint_t(42, 84);
+	result.table_metadata.next_column_id = 2;
+	result.table_metadata.current_sort_order_id = 1;
+	result.table_metadata.next_sort_order_id = 2;
+	result.table_metadata.definitions = {{1, {{1, OrderType::ASCENDING, OrderByNullType::NULLS_LAST}}}};
+	result.columns = {{0, "event_time", LogicalType::TIMESTAMP, 1}};
+	return result;
+}
+
+TEST_CASE("Table alter post-images survive copies and serialization", "[storage][sort_metadata]") {
+	AlterEntryData data(QualifiedName(Identifier("events")), OnEntryNotFound::THROW_EXCEPTION);
+	duckdb::vector<OrderByNode> orders;
+	orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+	                    make_uniq<ColumnRefExpression>("event_time"));
+	SetSortedByInfo input(data, std::move(orders));
+	input.sort_post_image = MakeSortPostImage();
+
+	auto copied = input.Copy();
+	REQUIRE(copied->Cast<AlterTableInfo>().sort_post_image == input.sort_post_image);
+
+	RenameColumnInfo rename(data, "event_time", "created_at");
+	rename.sort_post_image = input.sort_post_image;
+	REQUIRE(rename.Copy()->Cast<AlterTableInfo>().sort_post_image == input.sort_post_image);
+
+	AddColumnInfo add(data, ColumnDefinition("payload", LogicalType::VARCHAR), false);
+	add.sort_post_image = input.sort_post_image;
+	REQUIRE(add.Copy()->Cast<AlterTableInfo>().sort_post_image == input.sort_post_image);
+
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	options.storage_compatibility = StorageCompatibility::Latest();
+	BinarySerializer::Serialize(input, stream, options);
+	stream.Rewind();
+	auto output_info = BinaryDeserializer::Deserialize<ParseInfo>(stream);
+	auto &output = output_info->Cast<AlterInfo>().Cast<AlterTableInfo>();
+	REQUIRE(output.sort_post_image == input.sort_post_image);
 }
 
 TEST_CASE("Row group sort metadata requires paired identifiers", "[storage][sort_metadata]") {
