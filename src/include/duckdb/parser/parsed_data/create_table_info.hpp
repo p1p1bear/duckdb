@@ -10,8 +10,10 @@
 
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/column_list.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 #include "duckdb/common/identifier.hpp"
 namespace duckdb {
@@ -39,6 +41,10 @@ struct CreateTableInfo : public CreateInfo {
 	vector<unique_ptr<ParsedExpression>> partition_keys;
 	//! Table Sort definitions
 	vector<unique_ptr<ParsedExpression>> sort_keys;
+	//! Table Sort definitions including direction and NULL ordering
+	vector<OrderByNode> sort_orders;
+	//! Bound persistent sort metadata, present after a DuckDB catalog bind
+	optional<TableSortCatalogMetadata> sort_metadata;
 	//! Extra Table options if any
 	case_insensitive_map_t<unique_ptr<ParsedExpression>> options;
 
@@ -48,6 +54,9 @@ public:
 	DUCKDB_API void Serialize(Serializer &serializer) const override;
 	DUCKDB_API static unique_ptr<CreateInfo> Deserialize(Deserializer &deserializer);
 
+	bool HasAnySortDefinition() const;
+	void ValidateSortKeySources() const;
+	void NormalizeLegacySortKeys();
 	string ExtraOptionsToString() const;
 	string ToString() const override;
 };

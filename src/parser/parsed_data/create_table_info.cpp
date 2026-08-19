@@ -2,6 +2,8 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -29,13 +31,133 @@ unique_ptr<CreateInfo> CreateTableInfo::Copy() const {
 	for (auto &order : sort_keys) {
 		result->sort_keys.push_back(order->Copy());
 	}
+	for (auto &order : sort_orders) {
+		result->sort_orders.emplace_back(order.type, order.null_order, order.expression->Copy());
+	}
+	result->sort_metadata = sort_metadata;
 	for (auto &option : options) {
 		result->options.emplace(option.first, option.second->Copy());
 	}
 	if (query) {
 		result->query = unique_ptr_cast<SQLStatement, SelectStatement>(query->Copy());
 	}
+	result->NormalizeLegacySortKeys();
 	return std::move(result);
+}
+
+bool CreateTableInfo::HasAnySortDefinition() const {
+	return !sort_keys.empty() || !sort_orders.empty() || sort_metadata.has_value();
+}
+
+void CreateTableInfo::ValidateSortKeySources() const {
+	if (sort_metadata) {
+		if (!sort_keys.empty() || !sort_orders.empty()) {
+			throw SerializationException("Persistent table sort metadata cannot be combined with parser sort keys");
+		}
+		return;
+	}
+	if (sort_keys.empty() || sort_orders.empty()) {
+		return;
+	}
+	if (sort_keys.size() != sort_orders.size()) {
+		throw SerializationException("Table sort key projections have different lengths");
+	}
+	for (idx_t i = 0; i < sort_keys.size(); i++) {
+		if (!ParsedExpression::Equals(sort_keys[i], sort_orders[i].expression)) {
+			throw SerializationException("Table sort key projections do not match");
+		}
+	}
+}
+
+void CreateTableInfo::NormalizeLegacySortKeys() {
+	ValidateSortKeySources();
+	if (sort_orders.empty()) {
+		for (auto &sort_key : sort_keys) {
+			sort_orders.emplace_back(OrderType::ORDER_DEFAULT, OrderByNullType::ORDER_DEFAULT, sort_key->Copy());
+		}
+	} else if (sort_keys.empty()) {
+		for (auto &sort_order : sort_orders) {
+			sort_keys.push_back(sort_order.expression->Copy());
+		}
+	}
+}
+
+void CreateTableInfo::Serialize(Serializer &serializer) const {
+	ValidateSortKeySources();
+	if (sort_metadata && !serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+		throw SerializationException("Persistent SORTED BY metadata requires storage version v2.0.0 or newer");
+	}
+	CreateInfo::Serialize(serializer);
+	serializer.WritePropertyWithDefault<Identifier>(200, "table", qualified_name.Name());
+	serializer.WriteProperty<ColumnList>(201, "columns", columns);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<Constraint>>>(202, "constraints", constraints);
+	serializer.WritePropertyWithDefault<unique_ptr<SelectStatement>>(203, "query", query);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(204, "partition_keys", partition_keys);
+
+	vector<unique_ptr<ParsedExpression>> projected_sort_keys;
+	const auto *serialized_sort_keys = &sort_keys;
+	if (sort_keys.empty() && !sort_orders.empty()) {
+		for (auto &sort_order : sort_orders) {
+			projected_sort_keys.push_back(sort_order.expression->Copy());
+		}
+		serialized_sort_keys = &projected_sort_keys;
+	}
+	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", *serialized_sort_keys);
+	serializer.WritePropertyWithDefault<case_insensitive_map_t<unique_ptr<ParsedExpression>>>(206, "options", options);
+	if (!serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+		return;
+	}
+	serializer.WritePropertyWithDefault<optional<TableSortCatalogMetadata>>(207, "sort_metadata", sort_metadata,
+	                                                                        optional<TableSortCatalogMetadata>());
+	serializer.WritePropertyWithDefault<vector<OrderByNode>>(208, "sort_orders", sort_orders);
+}
+
+unique_ptr<CreateInfo> CreateTableInfo::Deserialize(Deserializer &deserializer) {
+	auto result = make_uniq<CreateTableInfo>();
+	auto table = deserializer.ReadPropertyWithDefault<Identifier>(200, "table");
+	deserializer.ReadProperty<ColumnList>(201, "columns", result->columns);
+	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Constraint>>>(202, "constraints", result->constraints);
+	deserializer.ReadPropertyWithDefault<unique_ptr<SelectStatement>>(203, "query", result->query);
+	deserializer.ReadPropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(204, "partition_keys",
+	                                                                           result->partition_keys);
+	deserializer.ReadPropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", result->sort_keys);
+	deserializer.ReadPropertyWithDefault<case_insensitive_map_t<unique_ptr<ParsedExpression>>>(206, "options",
+	                                                                                           result->options);
+	deserializer.ReadPropertyWithExplicitDefault<optional<TableSortCatalogMetadata>>(
+	    207, "sort_metadata", result->sort_metadata, optional<TableSortCatalogMetadata>());
+	deserializer.ReadPropertyWithDefault<vector<OrderByNode>>(208, "sort_orders", result->sort_orders);
+	result->SetName(std::move(table));
+	result->NormalizeLegacySortKeys();
+	return std::move(result);
+}
+
+static const ColumnDefinition &GetPersistentSortColumn(const ColumnList &columns, persistent_column_id_t column_id) {
+	for (auto &column : columns.Physical()) {
+		if (column.PersistentColumnId() == column_id) {
+			return column;
+		}
+	}
+	throw InternalException("Persistent sort definition references unknown column ID %llu", column_id);
+}
+
+static string PersistentSortColumnToString(const ColumnList &columns, const SortColumnDefinition &sort_column) {
+	string result;
+	result += SQLIdentifier(GetPersistentSortColumn(columns, sort_column.column_id).Name());
+	if (sort_column.order_type == OrderType::ASCENDING) {
+		result += " ASC";
+	} else if (sort_column.order_type == OrderType::DESCENDING) {
+		result += " DESC";
+	} else {
+		throw InternalException("Persistent sort definition contains an invalid order type");
+	}
+	if (sort_column.null_order == OrderByNullType::NULLS_FIRST) {
+		result += " NULLS FIRST";
+	} else if (sort_column.null_order == OrderByNullType::NULLS_LAST) {
+		result += " NULLS LAST";
+	} else {
+		throw InternalException("Persistent sort definition contains an invalid NULL order");
+	}
+	return result;
 }
 
 string CreateTableInfo::ExtraOptionsToString() const {
@@ -48,7 +170,29 @@ string CreateTableInfo::ExtraOptionsToString() const {
 		ret.pop_back();
 		ret += ")";
 	}
-	if (!sort_keys.empty()) {
+	if (sort_metadata) {
+		if (sort_metadata->IsEnabled()) {
+			auto current = sort_metadata->GetCurrent();
+			if (!current || current->columns.empty()) {
+				throw InternalException("Current persistent sort definition is missing or empty");
+			}
+			ret += " SORTED BY (";
+			for (idx_t i = 0; i < current->columns.size(); i++) {
+				if (i > 0) {
+					ret += ",";
+				}
+				ret += PersistentSortColumnToString(columns, current->columns[i]);
+			}
+			ret += ")";
+		}
+	} else if (!sort_orders.empty()) {
+		ret += " SORTED BY (";
+		for (auto &order : sort_orders) {
+			ret += order.ToString() + ",";
+		}
+		ret.pop_back();
+		ret += ")";
+	} else if (!sort_keys.empty()) {
 		ret += " SORTED BY (";
 		for (auto &order : sort_keys) {
 			ret += order->ToString() + ",";

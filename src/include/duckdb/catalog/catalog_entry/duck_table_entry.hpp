@@ -12,6 +12,7 @@
 #include "duckdb/catalog/catalog_set.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/constraints/bound_unique_constraint.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 namespace duckdb {
 
@@ -45,6 +46,17 @@ public:
 	unique_ptr<BlockingSample> GetSample() override;
 
 	unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
+	unique_ptr<CreateInfo> GetInfo() const override;
+
+	const optional<TableSortCatalogMetadata> &GetSortMetadata() const {
+		return sort_metadata;
+	}
+	bool HasSortHistory() const {
+		return sort_metadata.has_value();
+	}
+	bool SortEnabled() const {
+		return sort_metadata && sort_metadata->IsEnabled();
+	}
 
 	void SetAsRoot() override;
 
@@ -105,5 +117,7 @@ private:
 	shared_ptr<CatalogSet> triggers;
 	//! Manages dependencies of the individual columns of the table
 	ColumnDependencyManager column_dependency_manager;
+	//! Persistent sort metadata belonging to this catalog version
+	optional<TableSortCatalogMetadata> sort_metadata;
 };
 } // namespace duckdb

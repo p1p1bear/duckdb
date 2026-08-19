@@ -185,30 +185,6 @@ unique_ptr<CreateInfo> CreateSequenceInfo::Deserialize(Deserializer &deserialize
 	return std::move(result);
 }
 
-void CreateTableInfo::Serialize(Serializer &serializer) const {
-	CreateInfo::Serialize(serializer);
-	serializer.WritePropertyWithDefault<Identifier>(200, "table", qualified_name.Name());
-	serializer.WriteProperty<ColumnList>(201, "columns", columns);
-	serializer.WritePropertyWithDefault<vector<unique_ptr<Constraint>>>(202, "constraints", constraints);
-	serializer.WritePropertyWithDefault<unique_ptr<SelectStatement>>(203, "query", query);
-	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(204, "partition_keys", partition_keys);
-	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", sort_keys);
-	serializer.WritePropertyWithDefault<case_insensitive_map_t<unique_ptr<ParsedExpression>>>(206, "options", options);
-}
-
-unique_ptr<CreateInfo> CreateTableInfo::Deserialize(Deserializer &deserializer) {
-	auto result = duckdb::unique_ptr<CreateTableInfo>(new CreateTableInfo());
-	auto table = deserializer.ReadPropertyWithDefault<Identifier>(200, "table");
-	deserializer.ReadProperty<ColumnList>(201, "columns", result->columns);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Constraint>>>(202, "constraints", result->constraints);
-	deserializer.ReadPropertyWithDefault<unique_ptr<SelectStatement>>(203, "query", result->query);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(204, "partition_keys", result->partition_keys);
-	deserializer.ReadPropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", result->sort_keys);
-	deserializer.ReadPropertyWithDefault<case_insensitive_map_t<unique_ptr<ParsedExpression>>>(206, "options", result->options);
-	result->SetName(std::move(table));
-	return std::move(result);
-}
-
 void CreateTriggerInfo::Serialize(Serializer &serializer) const {
 	CreateInfo::Serialize(serializer);
 	serializer.WritePropertyWithDefault<Identifier>(200, "trigger_name", qualified_name.Name());

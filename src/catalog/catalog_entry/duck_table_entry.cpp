@@ -148,7 +148,8 @@ virtual_column_map_t DuckTableEntry::GetVirtualColumns() const {
 DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, BoundCreateTableInfo &info,
                                shared_ptr<DataTable> inherited_storage, shared_ptr<CatalogSet> inherited_triggers)
     : TableCatalogEntry(catalog, schema, info.Base()), storage(std::move(inherited_storage)),
-      triggers(std::move(inherited_triggers)), column_dependency_manager(std::move(info.column_dependency_manager)) {
+      triggers(std::move(inherited_triggers)), column_dependency_manager(std::move(info.column_dependency_manager)),
+      sort_metadata(std::move(info.Base().sort_metadata)) {
 	if (!triggers) {
 		triggers = make_shared_ptr<CatalogSet>(catalog);
 	}
@@ -1400,6 +1401,12 @@ unique_ptr<CatalogEntry> DuckTableEntry::Copy(ClientContext &context) const {
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableCheckpoint(std::move(create_info), schema);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
+}
+
+unique_ptr<CreateInfo> DuckTableEntry::GetInfo() const {
+	auto result = TableCatalogEntry::GetInfo();
+	result->Cast<CreateTableInfo>().sort_metadata = sort_metadata;
+	return result;
 }
 
 void DuckTableEntry::SetAsRoot() {
