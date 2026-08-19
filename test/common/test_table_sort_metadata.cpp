@@ -8,6 +8,7 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 
@@ -71,6 +72,25 @@ TEST_CASE("Table sort catalog metadata round trips", "[storage][sort_metadata]")
 	REQUIRE(output.table_metadata.GetCurrent()->sort_order_id == 2);
 	REQUIRE(output.table_metadata.GetDefinition(1) != nullptr);
 	REQUIRE(output.table_metadata.GetDefinition(99) == nullptr);
+}
+
+TEST_CASE("Table sort catalog metadata validates stable identifier bounds", "[storage][sort_metadata]") {
+	ColumnList columns;
+	ColumnDefinition id("id", LogicalType::BIGINT);
+	id.SetPersistentColumnId(1);
+	columns.AddColumn(std::move(id));
+
+	TableSortCatalogMetadata metadata;
+	metadata.table_id = hugeint_t(42, 84);
+	metadata.next_column_id = 3;
+	metadata.current_sort_order_id = 2;
+	metadata.next_sort_order_id = 3;
+	metadata.definitions = {{1, {{2, OrderType::ASCENDING, OrderByNullType::NULLS_LAST}}},
+	                        {2, {{1, OrderType::ASCENDING, OrderByNullType::NULLS_LAST}}}};
+	REQUIRE_NOTHROW(ValidateTableSortCatalogMetadata(metadata, columns));
+
+	metadata.definitions[0].columns[0].column_id = metadata.next_column_id;
+	REQUIRE_THROWS_AS(ValidateTableSortCatalogMetadata(metadata, columns), SerializationException);
 }
 
 TEST_CASE("Table sort storage state snapshots persistent counters", "[storage][sort_metadata]") {

@@ -297,6 +297,23 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 		throw CatalogException("Can only modify table with ALTER TABLE statement");
 	}
 	auto &table_info = info.Cast<AlterTableInfo>();
+	if (HasSortHistory()) {
+		switch (table_info.alter_table_type) {
+		case AlterTableType::ADD_COLUMN:
+		case AlterTableType::ADD_FIELD:
+		case AlterTableType::REMOVE_COLUMN:
+		case AlterTableType::REMOVE_FIELD:
+		case AlterTableType::RENAME_FIELD:
+		case AlterTableType::ALTER_COLUMN_TYPE:
+			throw NotImplementedException(
+			    "Changing the physical schema of a table with SORTED BY history is not supported yet");
+		default:
+			break;
+		}
+	}
+	if (SortEnabled() && table_info.alter_table_type == AlterTableType::ADD_CONSTRAINT) {
+		throw BinderException("Cannot add an index constraint while SORTED BY is enabled");
+	}
 	switch (table_info.alter_table_type) {
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename_info = table_info.Cast<RenameColumnInfo>();
@@ -425,6 +442,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 	for (auto &col : columns.Logical()) {
 		auto copy = col.Copy();
 		if (rename_idx == col.Logical()) {

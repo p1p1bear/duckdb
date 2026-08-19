@@ -10,7 +10,7 @@ CREATE TABLE integers(i INTEGER) PARTITIONED BY (i);
 statement error
 CREATE TABLE integers(i INTEGER) SORTED BY (i);
 ----
-<REGEX>:.*SORTED BY is not supported for tables in a duckdb catalog.*
+<REGEX>:.*SORTED BY is only supported for persistent DuckDB tables.*
 
 statement error
 CREATE TABLE integers(i INTEGER) PARTITIONED BY (i) SORTED BY (i);
@@ -71,7 +71,7 @@ WITH (
   format='parquet'
 );
 ----
-<REGEX>:.*SORTED BY is not supported for tables in a duckdb catalog.*
+<REGEX>:.*WITH clause is not supported for tables in a duckdb catalog.*
 
 statement error
 CREATE TABLE iceberg_table (

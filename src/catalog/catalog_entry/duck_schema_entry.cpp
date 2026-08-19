@@ -187,6 +187,13 @@ optional_ptr<CatalogEntry> DuckSchemaEntry::AddEntryInternal(CatalogTransaction 
 }
 
 optional_ptr<CatalogEntry> DuckSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+	if (info.Base().on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+		auto existing = GetCatalogSet(CatalogType::TABLE_ENTRY).GetEntry(transaction, info.Base().GetTableName());
+		if (existing && existing->type == CatalogType::TABLE_ENTRY &&
+		    existing->Cast<TableCatalogEntry>().IsDuckTable() && existing->Cast<DuckTableEntry>().HasSortHistory()) {
+			throw BinderException("CREATE OR REPLACE is not supported for tables with SORTED BY history");
+		}
+	}
 	auto table = make_uniq<DuckTableEntry>(catalog, *this, info);
 	auto &dependencies = info.Base().dependencies;
 

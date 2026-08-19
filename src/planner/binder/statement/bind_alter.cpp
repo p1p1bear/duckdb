@@ -22,6 +22,9 @@ unique_ptr<LogicalOperator> DuckCatalog::BindAlterAddIndex(Binder &binder, Table
                                                            unique_ptr<CreateIndexInfo> create_info,
                                                            unique_ptr<AlterTableInfo> alter_info) {
 	D_ASSERT(plan->type == LogicalOperatorType::LOGICAL_GET);
+	if (table_entry.IsDuckTable() && table_entry.Cast<DuckTableEntry>().SortEnabled()) {
+		throw BinderException("Cannot add an index constraint while SORTED BY is enabled");
+	}
 	IndexBinder index_binder(binder, binder.context);
 	return index_binder.BindCreateIndex(binder.context, std::move(create_info), table_entry, std::move(plan),
 	                                    std::move(alter_info));

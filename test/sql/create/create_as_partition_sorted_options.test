@@ -10,7 +10,7 @@ CREATE TABLE integers PARTITIONED BY (i) as select range i from range(10);
 statement error
 CREATE TABLE integers SORTED BY (i) as select range i from range(10);
 ----
-<REGEX>:.*SORTED BY is not supported for tables in a duckdb catalog.*
+<REGEX>:.*SORTED BY is only supported for persistent DuckDB tables.*
 
 statement error
 CREATE TABLE integers PARTITIONED BY (i) SORTED BY (i) as select range i from range(10);
@@ -50,7 +50,7 @@ WITH (
 )
 as select range i, range::DATE date from range(10);
 ----
-<REGEX>:.*SORTED BY is not supported for tables in a duckdb catalog.*
+<REGEX>:.*WITH clause is not supported for tables in a duckdb catalog.*
 
 statement error
 CREATE TABLE iceberg_table
