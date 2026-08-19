@@ -8,6 +8,7 @@
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "test_helpers.hpp"
 
@@ -341,4 +342,99 @@ TEST_CASE("Row group collection selects and installs versioned layouts", "[stora
 	REQUIRE(checkpoint_layout->base_tree.get() == checkpoint_tree.get());
 	REQUIRE(collection->GetRowGroups().get() == checkpoint_tree.get());
 	REQUIRE(collection->GetSnapshot(TransactionData(103, 9)).layout->layout_version == 0);
+}
+
+TEST_CASE("All row group scan entry points honor transaction layouts", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE layout_scan_test (i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO layout_scan_test VALUES (1), (2), (3)"));
+
+	duckdb::shared_ptr<RowGroupCollection> collection;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("layout_scan_test")));
+		collection = entry.GetStorage().GetRowGroupCollection();
+	});
+	auto tree = collection->GetRowGroups();
+	auto root = tree->GetRootSegment();
+	REQUIRE(root);
+	auto row_count = root->GetNode().count.load();
+	REQUIRE(row_count == 3);
+
+	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
+	auto replacement_patch = MakeReplacementPatch(0, NumericCast<row_t>(row_count), 1, {root->ReferenceNode()});
+	collection->PublishLayout(collection->BuildPatchedLayout(10, std::move(replacement_patch)));
+	auto empty_patch = MakeEmptyReplacementPatch(0, NumericCast<row_t>(row_count), 2);
+	collection->PublishLayout(make_shared_ptr<RowGroupLayout>(
+	    2, 20, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(empty_patch)}));
+	duckdb::vector<StorageIndex> column_ids {StorageIndex(0)};
+	auto scan_rows = [&](TableScanState &scan_state) {
+		DataChunk result;
+		result.Initialize(collection->GetAllocator(), {LogicalType::INTEGER});
+		idx_t count = 0;
+		while (true) {
+			result.Reset();
+			if (!scan_state.table_state.Scan(result, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+				break;
+			}
+			count += result.size();
+		}
+		return count;
+	};
+
+	TableScanState old_scan;
+	old_scan.Initialize(column_ids, nullptr);
+	collection->InitializeScan(TransactionData(100, 9), QueryContext(), old_scan.table_state, column_ids, nullptr);
+	REQUIRE(old_scan.table_state.row_group);
+	REQUIRE(scan_rows(old_scan) == 3);
+
+	TableScanState replacement_scan;
+	replacement_scan.Initialize(column_ids, nullptr);
+	collection->InitializeScan(TransactionData(101, 10), QueryContext(), replacement_scan.table_state, column_ids,
+	                           nullptr);
+	REQUIRE(replacement_scan.table_state.row_group);
+	REQUIRE(scan_rows(replacement_scan) == 3);
+
+	TableScanState current_scan;
+	current_scan.Initialize(column_ids, nullptr);
+	collection->InitializeScan(TransactionData(102, 20), QueryContext(), current_scan.table_state, column_ids, nullptr);
+	REQUIRE(!current_scan.table_state.row_group);
+
+	TableScanState old_range_scan;
+	old_range_scan.Initialize(column_ids, nullptr);
+	collection->InitializeScanWithOffset(TransactionData(103, 9), QueryContext(), old_range_scan.table_state,
+	                                     column_ids, 0, 2);
+	REQUIRE(old_range_scan.table_state.row_group);
+
+	TableScanState current_range_scan;
+	current_range_scan.Initialize(column_ids, nullptr);
+	collection->InitializeScanWithOffset(TransactionData(104, 20), QueryContext(), current_range_scan.table_state,
+	                                     column_ids, 0, 2);
+	REQUIRE(!current_range_scan.table_state.row_group);
+
+	ParallelCollectionScanState old_parallel_scan;
+	collection->InitializeParallelScan(TransactionData(105, 9), old_parallel_scan);
+	REQUIRE(old_parallel_scan.current_layout_row_group);
+	ParallelCollectionScanState replacement_parallel_scan;
+	collection->InitializeParallelScan(TransactionData(106, 10), replacement_parallel_scan);
+	REQUIRE(replacement_parallel_scan.current_layout_row_group);
+	TableScanState parallel_local_scan;
+	parallel_local_scan.Initialize(column_ids, nullptr);
+	idx_t parallel_count = 0;
+	while (collection->NextParallelScan(*con.context, replacement_parallel_scan, parallel_local_scan.table_state)) {
+		parallel_count += scan_rows(parallel_local_scan);
+	}
+	REQUIRE(parallel_count == 3);
+	ParallelCollectionScanState current_parallel_scan;
+	collection->InitializeParallelScan(TransactionData(107, 20), current_parallel_scan);
+	REQUIRE(!current_parallel_scan.current_layout_row_group);
+
+	TableScanState reordered_scan;
+	reordered_scan.Initialize(column_ids, nullptr);
+	RowGroupOrderOptions order_options(StorageIndex(0), OrderByStatistics::MIN, OrderType::ASCENDING,
+	                                   OrderByNullType::NULLS_LAST, OrderByColumnType::NUMERIC);
+	reordered_scan.table_state.reorderer = make_uniq<RowGroupReorderer>(order_options, TransactionData(108, 20));
+	collection->InitializeScan(TransactionData(108, 20), QueryContext(), reordered_scan.table_state, column_ids,
+	                           nullptr);
+	REQUIRE(!reordered_scan.table_state.row_group);
 }

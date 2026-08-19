@@ -254,14 +254,15 @@ void DataTable::InitializeScan(ClientContext &context, DuckTransaction &transact
                                const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> table_filters) {
 	auto &local_storage = LocalStorage::Get(transaction);
 	state.Initialize(column_ids, context, table_filters);
-	row_groups->InitializeScan(context, state.table_state, column_ids, table_filters);
+	row_groups->InitializeScan(TransactionData(transaction), context, state.table_state, column_ids, table_filters);
 	local_storage.InitializeScan(*this, state.local_state, table_filters);
 }
 
 void DataTable::InitializeScanWithOffset(DuckTransaction &transaction, TableScanState &state,
                                          const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row) {
 	state.Initialize(column_ids);
-	row_groups->InitializeScanWithOffset(QueryContext(), state.table_state, column_ids, start_row, end_row);
+	row_groups->InitializeScanWithOffset(TransactionData(transaction), QueryContext(), state.table_state, column_ids,
+	                                     start_row, end_row);
 }
 
 idx_t DataTable::GetRowGroupSize() const {
@@ -290,7 +291,8 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
 void DataTable::InitializeParallelScan(ClientContext &context, ParallelTableScanState &state,
                                        const vector<ColumnIndex> &column_indexes) {
 	auto &local_storage = LocalStorage::Get(context, db);
-	row_groups->InitializeParallelScan(state.scan_state);
+	auto &transaction = DuckTransaction::Get(context, db);
+	row_groups->InitializeParallelScan(TransactionData(transaction), state.scan_state);
 
 	local_storage.InitializeParallelScan(*this, state.local_state);
 }

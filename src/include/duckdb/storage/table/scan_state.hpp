@@ -12,6 +12,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 #include "duckdb/common/random_engine.hpp"
 #include "duckdb/storage/table/segment_lock.hpp"
@@ -286,13 +287,20 @@ public:
 	ScanFilterInfo &GetFilterInfo();
 	ScanSamplingInfo &GetSamplingInfo();
 	TableScanOptions &GetOptions();
-	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentNode<RowGroup> &row_group) const;
-	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentLock &l, SegmentNode<RowGroup> &row_group) const;
-	optional_ptr<SegmentNode<RowGroup>> GetRootSegment() const;
+	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentNode<RowGroup> &row_group);
+	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentLock &l, SegmentNode<RowGroup> &row_group);
+	optional_ptr<SegmentNode<RowGroup>> GetRootSegment();
+	void SetRowGroupSnapshot(RowGroupCollectionSnapshot snapshot, optional<RowGroupRange> scan_range = nullopt);
+	SegmentNode<RowGroup> &SetLayoutRowGroup(LayoutRowGroupEntry entry);
 	bool Scan(DuckTransaction &transaction, DataChunk &result);
 	bool Scan(DataChunk &result, TableScanType type, optional_ptr<SegmentLock> l = nullptr);
 
 private:
+	optional_ptr<SegmentNode<RowGroup>> NextLayoutRowGroup();
+
+	optional<RowGroupCollectionSnapshot> row_group_snapshot;
+	unique_ptr<LayoutRowGroupCursor> layout_cursor;
+	unique_ptr<SegmentNode<RowGroup>> layout_row_group;
 	TableScanState &parent;
 };
 
@@ -360,7 +368,10 @@ private:
 struct ParallelCollectionScanState {
 	ParallelCollectionScanState();
 	void AssignRowGroup(optional_ptr<SegmentNode<RowGroup>> row_group);
-	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(RowGroupSegmentTree &row_groups) const;
+	void SetRowGroupSnapshot(RowGroupCollectionSnapshot snapshot);
+	bool AssignNextLayoutRowGroup();
+	bool UsesLayoutCursor() const;
+	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(RowGroupSegmentTree &row_groups);
 	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(RowGroupSegmentTree &row_groups,
 	                                                    SegmentNode<RowGroup> &row_group) const;
 
@@ -368,6 +379,9 @@ struct ParallelCollectionScanState {
 	RowGroupCollection *collection;
 	shared_ptr<RowGroupSegmentTree> row_groups;
 	optional_ptr<SegmentNode<RowGroup>> current_row_group;
+	optional<RowGroupCollectionSnapshot> row_group_snapshot;
+	unique_ptr<LayoutRowGroupCursor> layout_cursor;
+	unique_ptr<LayoutRowGroupEntry> current_layout_row_group;
 	idx_t vector_index;
 	idx_t max_row;
 	idx_t batch_index;

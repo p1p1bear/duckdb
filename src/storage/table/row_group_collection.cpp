@@ -447,9 +447,21 @@ void RowGroupCollection::Verify() {
 void RowGroupCollection::InitializeScan(const QueryContext &context, CollectionScanState &state,
                                         const vector<StorageIndex> &column_ids,
                                         optional_ptr<TableFilterSet> table_filters) {
-	state.row_groups = GetRowGroups();
+	InitializeScan(context, state, column_ids, table_filters, GetCurrentSnapshot());
+}
+
+void RowGroupCollection::InitializeScan(TransactionData transaction, const QueryContext &context,
+                                        CollectionScanState &state, const vector<StorageIndex> &column_ids,
+                                        optional_ptr<TableFilterSet> table_filters) {
+	InitializeScan(context, state, column_ids, table_filters, GetSnapshot(transaction));
+}
+
+void RowGroupCollection::InitializeScan(const QueryContext &context, CollectionScanState &state,
+                                        const vector<StorageIndex> &column_ids,
+                                        optional_ptr<TableFilterSet> table_filters,
+                                        RowGroupCollectionSnapshot snapshot) {
+	state.SetRowGroupSnapshot(std::move(snapshot));
 	auto row_group = state.GetRootSegment();
-	D_ASSERT(row_group);
 	state.max_row = state.row_groups->GetBaseRowId() + next_row_id.load();
 	state.Initialize(context, GetTypes());
 	while (row_group && !row_group->GetNode().InitializeScan(state, *row_group)) {
@@ -465,12 +477,26 @@ void RowGroupCollection::InitializeCreateIndexScan(CreateIndexScanState &state) 
 void RowGroupCollection::InitializeScanWithOffset(const QueryContext &context, CollectionScanState &state,
                                                   const vector<StorageIndex> &column_ids, idx_t start_row,
                                                   idx_t end_row) {
-	state.row_groups = GetRowGroups();
-	auto row_group = state.row_groups->GetSegment(start_row);
-	D_ASSERT(row_group);
+	InitializeScanWithOffset(TransactionData::Committed(), context, state, column_ids, start_row, end_row);
+}
+
+void RowGroupCollection::InitializeScanWithOffset(TransactionData transaction, const QueryContext &context,
+                                                  CollectionScanState &state, const vector<StorageIndex> &column_ids,
+                                                  idx_t start_row, idx_t end_row) {
+	auto snapshot = GetSnapshot(transaction);
+	auto snapshot_kind = snapshot.kind;
+	state.SetRowGroupSnapshot(std::move(snapshot),
+	                          RowGroupRange {NumericCast<row_t>(start_row), NumericCast<row_t>(end_row)});
+	auto row_group = snapshot_kind == RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT
+	                     ? state.GetRootSegment()
+	                     : state.row_groups->GetSegment(start_row);
 	state.max_row = end_row;
 	state.Initialize(context, GetTypes());
-	idx_t start_vector = (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
+	if (!row_group) {
+		return;
+	}
+	idx_t start_vector =
+	    start_row <= row_group->GetRowStart() ? 0 : (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
 	if (!row_group->GetNode().InitializeScanWithOffset(state, *row_group, start_vector)) {
 		throw InternalException("Failed to initialize row group scan with offset");
 	}
@@ -480,7 +506,9 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
                                                   RowGroupCollection &collection, SegmentNode<RowGroup> &row_group,
                                                   idx_t vector_index, idx_t max_row) {
 	state.max_row = max_row;
-	state.row_groups = collection.GetRowGroups();
+	if (!state.row_groups) {
+		state.row_groups = collection.GetRowGroups();
+	}
 	if (state.column_scans.empty()) {
 		// initialize the scan state
 		state.Initialize(context, collection.GetTypes());
@@ -489,9 +517,17 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
 }
 
 void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
+	InitializeParallelScan(TransactionData::Committed(), state);
+}
+
+void RowGroupCollection::InitializeParallelScan(TransactionData transaction, ParallelCollectionScanState &state) {
 	state.collection = this;
-	state.row_groups = GetRowGroups();
-	state.AssignRowGroup(state.GetRootSegment(*state.row_groups));
+	state.SetRowGroupSnapshot(GetSnapshot(transaction));
+	if (state.UsesLayoutCursor()) {
+		state.AssignNextLayoutRowGroup();
+	} else {
+		state.AssignRowGroup(state.GetRootSegment(*state.row_groups));
+	}
 	state.vector_index = 0;
 	state.max_row = state.row_groups->GetBaseRowId() + next_row_id.load();
 	state.batch_index = 0;
@@ -506,35 +542,54 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 		idx_t max_row;
 		optional_ptr<RowGroupCollection> collection;
 		optional_ptr<SegmentNode<RowGroup>> row_group;
+		LayoutRowGroupEntry layout_entry;
+		bool layout_assignment = false;
 		{
 			// select the next row group to scan from the parallel state
 			lock_guard<mutex> l(state.lock);
-			if (!state.current_row_group) {
+			layout_assignment = state.UsesLayoutCursor();
+			if ((layout_assignment && !state.current_layout_row_group) ||
+			    (!layout_assignment && !state.current_row_group)) {
 				// no more data left to scan
 				break;
 			}
-			auto &current_row_group = state.current_row_group->GetNode();
-			if (current_row_group.count == 0) {
+			optional_ptr<RowGroup> current_row_group;
+			idx_t row_start;
+			if (layout_assignment) {
+				layout_entry = *state.current_layout_row_group;
+				current_row_group = layout_entry.row_group.get();
+				row_start = NumericCast<idx_t>(layout_entry.row_start);
+			} else {
+				current_row_group = state.current_row_group->GetNode();
+				row_start = state.current_row_group->GetRowStart();
+				row_group = state.current_row_group;
+			}
+			if (current_row_group->count == 0) {
 				break;
 			}
-			auto row_start = state.current_row_group->GetRowStart();
 			collection = state.collection;
-			row_group = state.current_row_group;
+			auto assign_next = [&]() {
+				if (layout_assignment) {
+					state.AssignNextLayoutRowGroup();
+				} else {
+					state.AssignRowGroup(state.GetNextRowGroup(*state.row_groups, *row_group).get());
+				}
+			};
 			if (ClientConfig::GetConfig(context).verify_parallelism) {
 				vector_index = state.vector_index;
-				max_row = row_start + MinValue<idx_t>(current_row_group.count,
+				max_row = row_start + MinValue<idx_t>(current_row_group->count,
 				                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
-				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
+				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group->count);
 				state.vector_index++;
-				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
-					state.AssignRowGroup(state.GetNextRowGroup(*state.row_groups, *row_group).get());
+				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group->count) {
+					assign_next();
 					state.vector_index = 0;
 				}
 			} else {
-				state.processed_rows += current_row_group.count;
+				state.processed_rows += current_row_group->count;
 				vector_index = 0;
-				max_row = row_start + current_row_group.count;
-				state.AssignRowGroup(state.GetNextRowGroup(*state.row_groups, *row_group).get());
+				max_row = row_start + current_row_group->count;
+				assign_next();
 			}
 			max_row = MinValue<idx_t>(max_row, state.max_row);
 			scan_state.batch_index = ++state.batch_index;
@@ -546,10 +601,13 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 				// (i.e. non-deleted rows) for the current transaction
 				scan_state.row_number_base = state.row_number_base.GetIndex();
 				auto &tx = DuckTransaction::Get(context, GetAttached());
-				state.row_number_base = state.row_number_base.GetIndex() + current_row_group.GetVisibleRowCount(tx);
+				state.row_number_base = state.row_number_base.GetIndex() + current_row_group->GetVisibleRowCount(tx);
 			}
 		}
 		D_ASSERT(collection);
+		if (layout_assignment) {
+			row_group = scan_state.SetLayoutRowGroup(std::move(layout_entry));
+		}
 		D_ASSERT(row_group);
 
 		// initialize the scan for this row group
@@ -597,7 +655,8 @@ RowGroupIterationHelper::RowGroupIterator::RowGroupIterator(optional_ptr<RowGrou
 		// initialize the scan
 		state = make_uniq<TableScanState>();
 		state->Initialize(column_ids, nullptr);
-		collection->InitializeScan(QueryContext(), state->local_state, column_ids, nullptr);
+		collection->InitializeScan(TransactionData(*transaction), QueryContext(), state->local_state, column_ids,
+		                           nullptr);
 		// scan the first chunk
 		this->operator++();
 	}

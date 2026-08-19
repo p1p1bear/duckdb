@@ -102,13 +102,20 @@ public:
 
 	void InitializeScan(const QueryContext &context, CollectionScanState &state, const vector<StorageIndex> &column_ids,
 	                    optional_ptr<TableFilterSet> table_filters);
+	void InitializeScan(TransactionData transaction, const QueryContext &context, CollectionScanState &state,
+	                    const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> table_filters);
+	void InitializeScan(const QueryContext &context, CollectionScanState &state, const vector<StorageIndex> &column_ids,
+	                    optional_ptr<TableFilterSet> table_filters, RowGroupCollectionSnapshot snapshot);
 	void InitializeCreateIndexScan(CreateIndexScanState &state);
 	void InitializeScanWithOffset(const QueryContext &context, CollectionScanState &state,
+	                              const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row);
+	void InitializeScanWithOffset(TransactionData transaction, const QueryContext &context, CollectionScanState &state,
 	                              const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row);
 	static bool InitializeScanInRowGroup(ClientContext &context, CollectionScanState &state,
 	                                     RowGroupCollection &collection, SegmentNode<RowGroup> &row_group,
 	                                     idx_t vector_index, idx_t max_row);
 	void InitializeParallelScan(ParallelCollectionScanState &state);
+	void InitializeParallelScan(TransactionData transaction, ParallelCollectionScanState &state);
 	bool NextParallelScan(ClientContext &context, ParallelCollectionScanState &state, CollectionScanState &scan_state);
 
 	RowGroupIterationHelper Chunks(DuckTransaction &transaction);
