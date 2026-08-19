@@ -1,0 +1,74 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/storage/recluster/row_group_layout.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/deque.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
+
+namespace duckdb {
+
+class RowGroup;
+class RowGroupSegmentTree;
+
+struct RowGroupRange {
+	row_t start;
+	row_t end;
+
+	bool Contains(row_t row_id) const {
+		return row_id >= start && row_id < end;
+	}
+
+	bool Overlaps(const RowGroupRange &other) const {
+		return start < other.end && other.start < end;
+	}
+};
+
+struct LayoutPatch {
+	recluster_task_id_t task_id = hugeint_t(0, 0);
+	RowGroupRange range {0, 0};
+	sort_order_id_t sort_order_id = INVALID_SORT_ORDER_ID;
+	sort_run_id_t run_id = INVALID_SORT_RUN_ID;
+	idx_t replaced_physical_rows = 0;
+	idx_t replacement_physical_rows = 0;
+	vector<shared_ptr<RowGroup>> replacement_groups;
+};
+
+struct RowGroupLayout {
+	RowGroupLayout(layout_version_t layout_version, transaction_t visible_from,
+	               shared_ptr<RowGroupSegmentTree> base_tree, vector<shared_ptr<const LayoutPatch>> patches = {});
+
+	layout_version_t layout_version;
+	transaction_t visible_from;
+	shared_ptr<RowGroupSegmentTree> base_tree;
+	vector<shared_ptr<const LayoutPatch>> patches;
+};
+
+static constexpr idx_t MAX_LAYOUT_PATCHES_PER_CHECKPOINT = 64;
+
+class TableLayoutHistory {
+public:
+	explicit TableLayoutHistory(shared_ptr<const RowGroupLayout> initial_layout);
+
+	shared_ptr<const RowGroupLayout> GetCurrent() const;
+	shared_ptr<const RowGroupLayout> GetForTransaction(transaction_t start_time) const;
+
+	void Publish(shared_ptr<const RowGroupLayout> new_layout);
+	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
+	void Cleanup(transaction_t oldest_active_start);
+
+private:
+	mutable mutex lock;
+	shared_ptr<const RowGroupLayout> current;
+	deque<shared_ptr<const RowGroupLayout>> previous;
+};
+
+} // namespace duckdb
