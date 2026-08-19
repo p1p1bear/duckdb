@@ -899,7 +899,7 @@ const char INLINED_PEG_GRAMMAR[] = {
 	"PartitionOptSortedOptions <- PartitionOptions SortedOptions?\n"
 	"SortedOptPartitionOptions <- SortedOptions PartitionOptions?\n"
 	"PartitionOptions <- 'PARTITIONED' 'BY' Parens(List(Expression))\n"
-	"SortedOptions <- 'SORTED' 'BY' Parens(List(Expression))\n"
+	"SortedOptions <- 'SORTED' 'BY' Parens(OrderByExpressionList)\n"
 	"WithData <- WithDataOnly / WithNoData\n"
 	"WithDataOnly <- 'WITH' 'DATA'\n"
 	"WithNoData <- 'WITH' 'NO' 'DATA'\n"

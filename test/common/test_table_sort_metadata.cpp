@@ -4,8 +4,10 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 using namespace duckdb;
@@ -123,6 +125,30 @@ TEST_CASE("Create table sort metadata copies, serializes, and reconstructs SQL",
 
 	options.storage_compatibility = StorageCompatibility::FromString("v1.5.5");
 	REQUIRE_THROWS_AS(BinarySerializer::Serialize(input, stream, options), SerializationException);
+}
+
+TEST_CASE("Create table parser preserves sort order modifiers", "[parser][sort_metadata]") {
+	Parser parser;
+	parser.ParseQuery("CREATE TABLE events(tenant_id BIGINT, event_time TIMESTAMP) "
+	                  "SORTED BY (tenant_id, event_time ASC NULLS LAST)");
+	REQUIRE(parser.statements.size() == 1);
+	auto &statement = parser.statements[0]->Cast<CreateStatement>();
+	auto &info = statement.info->Cast<CreateTableInfo>();
+	REQUIRE(info.sort_keys.size() == 2);
+	REQUIRE(info.sort_orders.size() == 2);
+	REQUIRE(info.sort_orders[0].type == OrderType::ORDER_DEFAULT);
+	REQUIRE(info.sort_orders[0].null_order == OrderByNullType::ORDER_DEFAULT);
+	REQUIRE(info.sort_orders[1].type == OrderType::ASCENDING);
+	REQUIRE(info.sort_orders[1].null_order == OrderByNullType::NULLS_LAST);
+	for (idx_t i = 0; i < info.sort_orders.size(); i++) {
+		REQUIRE(ParsedExpression::Equals(info.sort_keys[i], info.sort_orders[i].expression));
+	}
+
+	Parser modified_parser;
+	modified_parser.ParseQuery("CREATE TABLE rejected(i INTEGER) SORTED BY (i DESC NULLS FIRST)");
+	auto &modified_info = modified_parser.statements[0]->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
+	REQUIRE(modified_info.sort_orders[0].type == OrderType::DESCENDING);
+	REQUIRE(modified_info.sort_orders[0].null_order == OrderByNullType::NULLS_FIRST);
 }
 
 TEST_CASE("Create table sort key projections normalize and validate", "[storage][sort_metadata]") {

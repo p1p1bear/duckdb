@@ -2621,11 +2621,10 @@ PEGTransformerFactory::TransformPartitionOptSortedOptionsInternal(PEGTransformer
                                                                   ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
 	auto partition_options = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(list_pr.GetChild(0));
-	optional<vector<unique_ptr<ParsedExpression>>> sorted_options {};
+	optional<vector<OrderByNode>> sorted_options {};
 	auto &sorted_options_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
 	if (sorted_options_opt.HasResult()) {
-		auto sorted_options_value =
-		    transformer.Transform<vector<unique_ptr<ParsedExpression>>>(sorted_options_opt.GetResult());
+		auto sorted_options_value = transformer.Transform<vector<OrderByNode>>(sorted_options_opt.GetResult());
 		sorted_options = std::move(sorted_options_value);
 	}
 	auto result =
@@ -2637,7 +2636,7 @@ unique_ptr<TransformResultValue>
 PEGTransformerFactory::TransformSortedOptPartitionOptionsInternal(PEGTransformer &transformer,
                                                                   ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
-	auto sorted_options = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(list_pr.GetChild(0));
+	auto sorted_options = transformer.Transform<vector<OrderByNode>>(list_pr.GetChild(0));
 	optional<vector<unique_ptr<ParsedExpression>>> partition_options {};
 	auto &partition_options_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
 	if (partition_options_opt.HasResult()) {
@@ -2666,14 +2665,10 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::TransformPartitionOption
 unique_ptr<TransformResultValue> PEGTransformerFactory::TransformSortedOptionsInternal(PEGTransformer &transformer,
                                                                                        ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
-	vector<unique_ptr<ParsedExpression>> expression;
-	auto expression_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
-	for (auto &expression_item : expression_items) {
-		auto expression_value = transformer.Transform<unique_ptr<ParsedExpression>>(expression_item.get());
-		expression.push_back(std::move(expression_value));
-	}
-	auto result = TransformSortedOptions(transformer, std::move(expression));
-	return make_uniq<TypedTransformResult<vector<unique_ptr<ParsedExpression>>>>(std::move(result));
+	auto order_by_expression_list =
+	    transformer.Transform<vector<OrderByNode>>(ExtractResultFromParens(list_pr.GetChild(2)));
+	auto result = TransformSortedOptions(transformer, std::move(order_by_expression_list));
+	return make_uniq<TypedTransformResult<vector<OrderByNode>>>(std::move(result));
 }
 
 unique_ptr<TransformResultValue> PEGTransformerFactory::TransformWithDataInternal(PEGTransformer &transformer,

@@ -67,7 +67,10 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateTableStmt(
 	info->columns = std::move(create_table_definition.columns);
 	info->constraints = std::move(create_table_definition.constraints);
 	info->partition_keys = std::move(create_table_definition.partition_keys);
-	info->sort_keys = std::move(create_table_definition.sort_keys);
+	info->sort_orders = std::move(create_table_definition.sort_orders);
+	for (auto &sort_order : info->sort_orders) {
+		info->sort_keys.push_back(sort_order.expression->Copy());
+	}
 	info->options = std::move(create_table_definition.options);
 
 	result->info = std::move(info);
@@ -85,7 +88,7 @@ PEGTransformerFactory::TransformCreateTableAs(PEGTransformer &transformer, optio
 	}
 	if (partition_sorted_options) {
 		result.partition_keys = std::move(partition_sorted_options->partition_keys);
-		result.sort_keys = std::move(partition_sorted_options->sort_keys);
+		result.sort_orders = std::move(partition_sorted_options->sort_orders);
 	}
 	if (with_list) {
 		result.options = std::move(*with_list);
@@ -123,7 +126,7 @@ CreateTableDefinition PEGTransformerFactory::TransformCreateColumnList(
 	result.constraints = std::move(create_table_column_list->constraints);
 	if (partition_sorted_options) {
 		result.partition_keys = std::move(partition_sorted_options->partition_keys);
-		result.sort_keys = std::move(partition_sorted_options->sort_keys);
+		result.sort_orders = std::move(partition_sorted_options->sort_orders);
 	}
 	if (with_list) {
 		result.options = std::move(*with_list);
@@ -533,28 +536,28 @@ PEGTransformerFactory::TransformPartitionOptions(PEGTransformer &transformer,
 	return expression;
 }
 
-vector<unique_ptr<ParsedExpression>>
-PEGTransformerFactory::TransformSortedOptions(PEGTransformer &transformer,
-                                              vector<unique_ptr<ParsedExpression>> expression) {
-	return expression;
+vector<OrderByNode> PEGTransformerFactory::TransformSortedOptions(PEGTransformer &transformer,
+                                                                  vector<OrderByNode> order_by_expression_list) {
+	return order_by_expression_list;
 }
 
-PartitionSortedOptions PEGTransformerFactory::TransformPartitionOptSortedOptions(
-    PEGTransformer &transformer, vector<unique_ptr<ParsedExpression>> partition_options,
-    optional<vector<unique_ptr<ParsedExpression>>> sorted_options) {
+PartitionSortedOptions
+PEGTransformerFactory::TransformPartitionOptSortedOptions(PEGTransformer &transformer,
+                                                          vector<unique_ptr<ParsedExpression>> partition_options,
+                                                          optional<vector<OrderByNode>> sorted_options) {
 	PartitionSortedOptions result;
 	result.partition_keys = std::move(partition_options);
 	if (sorted_options) {
-		result.sort_keys = std::move(*sorted_options);
+		result.sort_orders = std::move(*sorted_options);
 	}
 	return result;
 }
 
 PartitionSortedOptions PEGTransformerFactory::TransformSortedOptPartitionOptions(
-    PEGTransformer &transformer, vector<unique_ptr<ParsedExpression>> sorted_options,
+    PEGTransformer &transformer, vector<OrderByNode> sorted_options,
     optional<vector<unique_ptr<ParsedExpression>>> partition_options) {
 	PartitionSortedOptions result;
-	result.sort_keys = std::move(sorted_options);
+	result.sort_orders = std::move(sorted_options);
 	if (partition_options) {
 		result.partition_keys = std::move(*partition_options);
 	}
