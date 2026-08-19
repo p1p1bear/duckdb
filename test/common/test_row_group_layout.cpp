@@ -6,19 +6,37 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
+#include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "test_helpers.hpp"
 
 using namespace duckdb; // NOLINT
 
-static duckdb::shared_ptr<RowGroupSegmentTree> GetLayoutTestTree(Connection &con, const duckdb::string &table_name) {
+static duckdb::shared_ptr<RowGroupCollection> GetLayoutTestCollection(Connection &con,
+                                                                      const duckdb::string &table_name) {
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE " + table_name + " (i INTEGER)"));
-	duckdb::shared_ptr<RowGroupSegmentTree> result;
+	duckdb::shared_ptr<RowGroupCollection> result;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
-		result = entry.GetStorage().GetRowGroupCollection()->GetRowGroups();
+		result = entry.GetStorage().GetRowGroupCollection();
 	});
 	return result;
+}
+
+static duckdb::shared_ptr<RowGroupSegmentTree> GetLayoutTestTree(Connection &con, const duckdb::string &table_name) {
+	return GetLayoutTestCollection(con, table_name)->GetRowGroups();
+}
+
+static duckdb::shared_ptr<RowGroupSegmentTree> MakeLayoutTestTree(RowGroupCollection &collection,
+                                                                  const duckdb::vector<idx_t> &counts) {
+	auto tree = make_shared_ptr<RowGroupSegmentTree>(collection, 0);
+	idx_t row_start = 0;
+	for (auto count : counts) {
+		tree->AppendSegment(make_shared_ptr<RowGroup>(collection, count), row_start);
+		row_start += count;
+	}
+	return tree;
 }
 
 static duckdb::shared_ptr<const LayoutPatch> MakeEmptyReplacementPatch(row_t start, row_t end, uint64_t task_id) {
@@ -29,6 +47,22 @@ static duckdb::shared_ptr<const LayoutPatch> MakeEmptyReplacementPatch(row_t sta
 	patch->run_id = task_id;
 	patch->replaced_physical_rows = NumericCast<idx_t>(end - start);
 	patch->replacement_physical_rows = 0;
+	return patch;
+}
+
+static duckdb::shared_ptr<const LayoutPatch>
+MakeReplacementPatch(row_t start, row_t end, uint64_t task_id,
+                     duckdb::vector<duckdb::shared_ptr<RowGroup>> replacement_groups) {
+	auto patch = make_shared_ptr<LayoutPatch>();
+	patch->task_id = hugeint_t(0, task_id);
+	patch->range = {start, end};
+	patch->sort_order_id = 1;
+	patch->run_id = task_id;
+	patch->replaced_physical_rows = NumericCast<idx_t>(end - start);
+	for (auto &row_group : replacement_groups) {
+		patch->replacement_physical_rows += row_group->count.load();
+	}
+	patch->replacement_groups = std::move(replacement_groups);
 	return patch;
 }
 
@@ -125,4 +159,142 @@ TEST_CASE("Row group layouts reject invalid patch sequences", "[storage][row_gro
 	TableLayoutHistory history(make_shared_ptr<RowGroupLayout>(INITIAL_LAYOUT_VERSION, 0, tree));
 	REQUIRE_THROWS_AS(history.Publish(make_shared_ptr<RowGroupLayout>(2, 10, tree)), InternalException);
 	REQUIRE_THROWS_AS(history.Publish(make_shared_ptr<RowGroupLayout>(1, 0, tree)), InternalException);
+}
+
+TEST_CASE("Layout row group cursor merges patches and preserves row ID gaps", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_cursor_test");
+	auto tree = MakeLayoutTestTree(*collection, {10, 10, 10});
+	auto first_replacement = make_shared_ptr<RowGroup>(*collection, 6);
+	auto second_replacement = make_shared_ptr<RowGroup>(*collection, 3);
+	auto patch = MakeReplacementPatch(10, 20, 1, {first_replacement, second_replacement});
+	auto layout =
+	    make_shared_ptr<RowGroupLayout>(1, 10, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {patch});
+	RowGroupCollectionSnapshot snapshot(layout);
+	LayoutRowGroupCursor cursor(snapshot);
+
+	duckdb::vector<LayoutRowGroupEntry> entries;
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		entries.push_back(entry);
+	}
+	REQUIRE(entries.size() == 4);
+	REQUIRE(entries[0].row_start == 0);
+	REQUIRE(entries[0].GetRowEnd() == 10);
+	REQUIRE(entries[0].layout_index == 0);
+	REQUIRE(entries[1].row_group.get() == first_replacement.get());
+	REQUIRE(entries[1].row_start == 10);
+	REQUIRE(entries[1].GetRowEnd() == 16);
+	REQUIRE(entries[1].layout_index == 1);
+	REQUIRE(entries[2].row_group.get() == second_replacement.get());
+	REQUIRE(entries[2].row_start == 16);
+	REQUIRE(entries[2].GetRowEnd() == 19);
+	REQUIRE(entries[2].layout_index == 2);
+	REQUIRE(entries[3].row_start == 20);
+	REQUIRE(entries[3].GetRowEnd() == 30);
+	REQUIRE(entries[3].layout_index == 3);
+
+	REQUIRE(snapshot.Lookup(15, entry));
+	REQUIRE(entry.row_group.get() == first_replacement.get());
+	REQUIRE(snapshot.Lookup(16, entry));
+	REQUIRE(entry.row_group.get() == second_replacement.get());
+	REQUIRE(!snapshot.Lookup(19, entry));
+	REQUIRE(snapshot.Lookup(20, entry));
+	REQUIRE(entry.row_group.get() == entries[3].row_group.get());
+	REQUIRE(!snapshot.Lookup(30, entry));
+
+	LayoutRowGroupCursor range_cursor(snapshot, RowGroupRange {15, 21});
+	entries.clear();
+	while (range_cursor.Next(entry)) {
+		entries.push_back(entry);
+	}
+	REQUIRE(entries.size() == 3);
+	REQUIRE(entries[0].row_start == 10);
+	REQUIRE(entries[1].row_start == 16);
+	REQUIRE(entries[2].row_start == 20);
+
+	LayoutRowGroupCursor empty_range_cursor(snapshot, RowGroupRange {20, 20});
+	REQUIRE(!empty_range_cursor.Next(entry));
+}
+
+TEST_CASE("Layout row group cursor supports adjacent and empty patches", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_adjacent_patch_test");
+	auto tree = MakeLayoutTestTree(*collection, {10, 10, 10, 10});
+	auto replacement = make_shared_ptr<RowGroup>(*collection, 10);
+	auto layout = make_shared_ptr<RowGroupLayout>(
+	    1, 10, tree,
+	    duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {MakeEmptyReplacementPatch(0, 10, 1),
+	                                                           MakeReplacementPatch(10, 20, 2, {replacement})});
+	LayoutRowGroupCursor cursor {RowGroupCollectionSnapshot(layout)};
+
+	LayoutRowGroupEntry entry;
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_group.get() == replacement.get());
+	REQUIRE(entry.row_start == 10);
+	REQUIRE(entry.layout_index == 0);
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_start == 20);
+	REQUIRE(entry.layout_index == 1);
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_start == 30);
+	REQUIRE(entry.layout_index == 2);
+	REQUIRE(!cursor.Next(entry));
+
+	RowGroupCollectionSnapshot base_snapshot(tree);
+	REQUIRE(base_snapshot.Lookup(10, entry));
+	REQUIRE(entry.row_start == 10);
+	REQUIRE(entry.layout_index == 1);
+}
+
+TEST_CASE("Layout row group cursor rejects patches inside base row groups", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_cursor_alignment_test");
+	auto tree = MakeLayoutTestTree(*collection, {10, 10});
+	auto replacement = make_shared_ptr<RowGroup>(*collection, 10);
+	auto layout = make_shared_ptr<RowGroupLayout>(
+	    1, 10, tree,
+	    duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {MakeReplacementPatch(5, 15, 1, {replacement})});
+	LayoutRowGroupCursor cursor {RowGroupCollectionSnapshot(layout)};
+	LayoutRowGroupEntry entry;
+	REQUIRE_THROWS_AS(cursor.Next(entry), InternalException);
+}
+
+TEST_CASE("Layout row group cursor accepts row ID gaps between replaced groups", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_cursor_base_gap_test");
+	auto tree = make_shared_ptr<RowGroupSegmentTree>(*collection, 0);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 5), 0);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 10), 10);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 10), 20);
+
+	auto replacement = make_shared_ptr<RowGroup>(*collection, 12);
+	auto patch = make_shared_ptr<LayoutPatch>();
+	patch->task_id = hugeint_t(0, 1);
+	patch->range = {0, 20};
+	patch->sort_order_id = 1;
+	patch->run_id = 1;
+	patch->replaced_physical_rows = 15;
+	patch->replacement_physical_rows = 12;
+	patch->replacement_groups.push_back(replacement);
+	auto layout =
+	    make_shared_ptr<RowGroupLayout>(1, 10, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {patch});
+	RowGroupCollectionSnapshot snapshot(layout);
+	LayoutRowGroupCursor cursor(snapshot);
+
+	LayoutRowGroupEntry entry;
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_group.get() == replacement.get());
+	REQUIRE(entry.row_start == 0);
+	REQUIRE(entry.GetRowEnd() == 12);
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_start == 20);
+	REQUIRE(!cursor.Next(entry));
+	REQUIRE(!snapshot.Lookup(12, entry));
+	REQUIRE(snapshot.Lookup(20, entry));
+	REQUIRE(entry.layout_index == DConstants::INVALID_INDEX);
 }

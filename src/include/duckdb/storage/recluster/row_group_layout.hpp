@@ -8,8 +8,11 @@
 
 #pragma once
 
+#include "duckdb/common/constants.hpp"
 #include "duckdb/common/deque.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/recluster/recluster_types.hpp"
@@ -18,6 +21,9 @@ namespace duckdb {
 
 class RowGroup;
 class RowGroupSegmentTree;
+struct LayoutRowGroupEntry;
+template <class T>
+struct SegmentNode;
 
 struct RowGroupRange {
 	row_t start;
@@ -69,6 +75,51 @@ private:
 	mutable mutex lock;
 	shared_ptr<const RowGroupLayout> current;
 	deque<shared_ptr<const RowGroupLayout>> previous;
+};
+
+struct RowGroupCollectionSnapshot {
+	enum class Kind : uint8_t { BASE_TREE, VERSIONED_LAYOUT };
+
+	explicit RowGroupCollectionSnapshot(shared_ptr<RowGroupSegmentTree> tree);
+	explicit RowGroupCollectionSnapshot(shared_ptr<const RowGroupLayout> layout);
+
+	const shared_ptr<RowGroupSegmentTree> &GetBaseTree() const;
+	bool Lookup(row_t row_id, LayoutRowGroupEntry &result) const;
+
+	Kind kind;
+	shared_ptr<RowGroupSegmentTree> base_tree;
+	shared_ptr<const RowGroupLayout> layout;
+};
+
+struct LayoutRowGroupEntry {
+	shared_ptr<RowGroup> row_group;
+	row_t row_start = 0;
+	//! VERSIONED_LAYOUT point lookups leave this invalid because preceding patches can shift the merged index.
+	idx_t layout_index = DConstants::INVALID_INDEX;
+
+	row_t GetRowEnd() const;
+};
+
+class LayoutRowGroupCursor {
+public:
+	LayoutRowGroupCursor(RowGroupCollectionSnapshot snapshot, optional<RowGroupRange> scan_range = nullopt);
+
+	bool Next(LayoutRowGroupEntry &result);
+
+private:
+	bool NextUnfiltered(LayoutRowGroupEntry &result);
+	void AdvanceBase();
+	void BeginPatch(const LayoutPatch &patch);
+
+private:
+	RowGroupCollectionSnapshot snapshot;
+	optional<RowGroupRange> scan_range;
+	optional_ptr<SegmentNode<RowGroup>> base_node;
+	idx_t patch_index = 0;
+	idx_t replacement_index = 0;
+	idx_t next_layout_index = 0;
+	row_t replacement_row_start = 0;
+	bool emitting_patch = false;
 };
 
 } // namespace duckdb
