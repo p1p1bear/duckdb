@@ -82,6 +82,19 @@ ALTER TABLE tbl SET SORTED BY (i)
 statement ok
 DROP INDEX tbl_i_idx
 
+# Disabled SORTED BY history can coexist with an index and reload from a checkpoint.
+statement ok
+CREATE TABLE reset_index_tbl(i INTEGER)
+
+statement ok
+ALTER TABLE reset_index_tbl SET SORTED BY (i)
+
+statement ok
+ALTER TABLE reset_index_tbl RESET SORTED BY
+
+statement ok
+CREATE INDEX reset_index_tbl_i_idx ON reset_index_tbl(i)
+
 # RESET followed by SET creates a fresh current definition.
 statement ok
 ALTER TABLE tbl SET SORTED BY (i)
@@ -95,6 +108,14 @@ query T
 SELECT sql FROM duckdb_tables() WHERE table_name = 'tbl'
 ----
 CREATE TABLE tbl(i INTEGER, j VARCHAR, g INTEGER GENERATED ALWAYS AS((i + 1))) SORTED BY (i ASC NULLS LAST);
+
+statement ok
+INSERT INTO reset_index_tbl VALUES (1)
+
+query I
+SELECT * FROM reset_index_tbl
+----
+1
 
 # Metadata-only wrappers keep transaction-local data attached to the latest entry.
 statement ok

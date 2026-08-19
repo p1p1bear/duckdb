@@ -200,6 +200,174 @@ TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loa
 	DeleteDatabase(path);
 }
 
+struct TableSortIdentitySnapshot {
+	TableSortCatalogMetadata metadata;
+	duckdb::vector<string> column_names;
+	duckdb::vector<LogicalType> column_types;
+	duckdb::vector<persistent_column_id_t> catalog_column_ids;
+	duckdb::vector<LogicalType> storage_column_types;
+	duckdb::vector<persistent_column_id_t> storage_column_ids;
+
+	bool operator==(const TableSortIdentitySnapshot &other) const {
+		return metadata == other.metadata && column_names == other.column_names && column_types == other.column_types &&
+		       catalog_column_ids == other.catalog_column_ids && storage_column_types == other.storage_column_types &&
+		       storage_column_ids == other.storage_column_ids;
+	}
+};
+
+static TableSortIdentitySnapshot GetTableSortIdentitySnapshot(Connection &con, const string &table_name) {
+	TableSortIdentitySnapshot result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		if (!entry.GetSortMetadata()) {
+			throw InternalException("Expected table %s to have sort metadata", table_name);
+		}
+		result.metadata = *entry.GetSortMetadata();
+		for (auto &column : entry.GetColumns().Logical()) {
+			result.column_names.push_back(column.Name().GetIdentifierName());
+			result.column_types.push_back(column.Type());
+			result.catalog_column_ids.push_back(column.PersistentColumnId());
+		}
+		for (auto &column : entry.GetStorage().Columns()) {
+			result.storage_column_types.push_back(column.Type());
+			result.storage_column_ids.push_back(column.PersistentColumnId());
+		}
+	});
+	return result;
+}
+
+TEST_CASE("Schema alters preserve table sort identities through WAL replay", "[storage][sort_metadata]") {
+	auto path = TestCreatePath("table_sort_schema_alter.db");
+	DeleteDatabase(path);
+	TableSortIdentitySnapshot before_restart;
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET checkpoint_threshold = '10 GB'"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(sort_key INTEGER, payload VARCHAR, nested STRUCT(a INTEGER), "
+		                          "generated INTEGER GENERATED ALWAYS AS (42))"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl(sort_key, payload, nested) VALUES (1, 'abc', {'a': 10})"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (sort_key)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+
+		auto initial = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(initial.metadata.next_column_id == 4);
+		REQUIRE(initial.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 2, 3, 0});
+		REQUIRE(initial.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 2, 3});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl RENAME COLUMN sort_key TO renamed_key"));
+		auto renamed = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(renamed.catalog_column_ids == initial.catalog_column_ids);
+		REQUIRE(renamed.metadata == initial.metadata);
+		REQUIRE(renamed.column_names[0] == "renamed_key");
+
+		auto drop_key = con.Query("ALTER TABLE tbl DROP COLUMN renamed_key");
+		REQUIRE(drop_key->HasError());
+		REQUIRE(StringUtil::Contains(drop_key->GetError(), "RESET SORTED BY first"));
+		auto type_key = con.Query("ALTER TABLE tbl ALTER renamed_key SET DATA TYPE BIGINT");
+		REQUIRE(type_key->HasError());
+		REQUIRE(StringUtil::Contains(type_key->GetError(), "RESET SORTED BY first"));
+		REQUIRE(GetTableSortIdentitySnapshot(con, "tbl") == renamed);
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ADD COLUMN extra BIGINT DEFAULT 7"));
+		auto added = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(added.metadata.next_column_id == 5);
+		REQUIRE(added.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 2, 3, 0, 4});
+		REQUIRE(added.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 2, 3, 4});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ALTER payload TYPE BIGINT USING length(payload)"));
+		auto changed_type = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(changed_type.metadata.next_column_id == 6);
+		REQUIRE(changed_type.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 3, 0, 4});
+		REQUIRE(changed_type.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 3, 4});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ADD COLUMN nested.b VARCHAR DEFAULT 'x'"));
+		auto added_field = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(added_field.metadata.next_column_id == 7);
+		REQUIRE(added_field.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 6, 0, 4});
+		REQUIRE(added_field.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 6, 4});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl RENAME COLUMN nested.b TO c"));
+		auto renamed_field = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(renamed_field.metadata.next_column_id == 8);
+		REQUIRE(renamed_field.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 7, 0, 4});
+		REQUIRE(renamed_field.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 5, 7, 4});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl DROP COLUMN nested.c"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl DROP COLUMN payload"));
+		auto dropped = GetTableSortIdentitySnapshot(con, "tbl");
+		REQUIRE(dropped.metadata.next_column_id == 9);
+		REQUIRE(dropped.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1, 8, 0, 4});
+		REQUIRE(dropped.storage_column_ids == duckdb::vector<persistent_column_id_t> {1, 8, 4});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl RESET SORTED BY"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ALTER renamed_key SET DATA TYPE BIGINT"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (renamed_key)"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ALTER extra SET DEFAULT 9"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ALTER extra SET NOT NULL"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl ALTER extra DROP NOT NULL"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl RENAME TO renamed_tbl"));
+
+		before_restart = GetTableSortIdentitySnapshot(con, "renamed_tbl");
+		REQUIRE(before_restart.metadata.next_column_id == 10);
+		REQUIRE(before_restart.metadata.next_sort_order_id == 3);
+		REQUIRE(before_restart.metadata.current_sort_order_id == 2);
+		REQUIRE(before_restart.metadata.definitions[0].columns[0].column_id == 1);
+		REQUIRE(before_restart.metadata.definitions[1].columns[0].column_id == 9);
+		REQUIRE(before_restart.catalog_column_ids == duckdb::vector<persistent_column_id_t> {9, 8, 0, 4});
+		REQUIRE(before_restart.storage_column_ids == duckdb::vector<persistent_column_id_t> {9, 8, 4});
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		auto after_restart = GetTableSortIdentitySnapshot(con, "renamed_tbl");
+		REQUIRE(after_restart == before_restart);
+		auto result = con.Query("SELECT renamed_key, nested, generated, extra FROM renamed_tbl");
+		REQUIRE(!result->HasError());
+		REQUIRE(result->RowCount() == 1);
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Foreign key dependency alters preserve table sort history", "[storage][sort_metadata]") {
+	auto path = TestCreatePath("table_sort_foreign_key_alter.db");
+	DeleteDatabase(path);
+	TableSortIdentitySnapshot expected;
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET checkpoint_threshold = '10 GB'"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE parent(i INTEGER)"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE parent SET SORTED BY (i)"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE parent RESET SORTED BY"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE parent ADD PRIMARY KEY (i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+
+		expected = GetTableSortIdentitySnapshot(con, "parent");
+		REQUIRE(!expected.metadata.IsEnabled());
+		REQUIRE(expected.catalog_column_ids == duckdb::vector<persistent_column_id_t> {1});
+		REQUIRE(expected.storage_column_ids == duckdb::vector<persistent_column_id_t> {1});
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE child(j INTEGER REFERENCES parent(i))"));
+		REQUIRE(GetTableSortIdentitySnapshot(con, "parent") == expected);
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE(GetTableSortIdentitySnapshot(con, "parent") == expected);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE child"));
+		REQUIRE(GetTableSortIdentitySnapshot(con, "parent") == expected);
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE(GetTableSortIdentitySnapshot(con, "parent") == expected);
+	}
+	DeleteDatabase(path);
+}
+
 TEST_CASE("Column definitions preserve persistent column IDs", "[storage][sort_metadata]") {
 	ColumnDefinition input("payload", LogicalType::VARCHAR);
 	input.SetPersistentColumnId(42);

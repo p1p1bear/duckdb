@@ -245,8 +245,9 @@ void DataTable::PublishAlter(DuckTableEntry &new_entry) {
 	pending_alter_lock.unlock();
 }
 
-DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
-                     const vector<StorageIndex> &bound_columns, Expression &cast_expr)
+DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx,
+                     const ColumnDefinition &replacement_column, const vector<StorageIndex> &bound_columns,
+                     Expression &cast_expr)
     : db(parent.db), info(parent.info), version(DataTableVersion::MAIN_TABLE) {
 	auto &transaction = DuckTransaction::Get(context, db);
 	auto &local_storage = LocalStorage::Get(transaction);
@@ -270,15 +271,17 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 	}
 
 	// change the type in this DataTable
-	column_definitions[changed_idx].SetType(target_type);
+	column_definitions[changed_idx].SetType(replacement_column.Type());
+	column_definitions[changed_idx].SetPersistentColumnId(replacement_column.PersistentColumnId());
 
 	// set up the statistics for the table
 	// the column that had its type changed will have the new statistics computed during conversion
-	row_groups = parent.row_groups->AlterType(context, changed_idx, target_type, bound_columns, cast_expr, transaction);
+	row_groups = parent.row_groups->AlterType(context, changed_idx, replacement_column.Type(), bound_columns, cast_expr,
+	                                          transaction);
 
 	// Prepare the local collection replacement while preserving the old map entry.
-	pending_local_storage_alter =
-	    local_storage.PrepareChangeType(parent, *this, changed_idx, target_type, bound_columns, cast_expr);
+	pending_local_storage_alter = local_storage.PrepareChangeType(parent, *this, changed_idx, replacement_column.Type(),
+	                                                              bound_columns, cast_expr);
 }
 
 vector<LogicalType> DataTable::GetTypes() {

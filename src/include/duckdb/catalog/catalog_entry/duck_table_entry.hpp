@@ -100,7 +100,7 @@ private:
 	unique_ptr<CatalogEntry> RemoveField(ClientContext &context, RemoveFieldInfo &info);
 	unique_ptr<CatalogEntry> SetDefault(ClientContext &context, SetDefaultInfo &info);
 	unique_ptr<CatalogEntry> ChangeColumnType(ClientContext &context, ChangeColumnTypeInfo &info,
-	                                          AlterTableType alter_table_type);
+	                                          AlterTableType alter_table_type, AlterTableInfo &post_image_info);
 	unique_ptr<CatalogEntry> SetNotNull(ClientContext &context, SetNotNullInfo &info);
 	unique_ptr<CatalogEntry> DropNotNull(ClientContext &context, DropNotNullInfo &info);
 	unique_ptr<CatalogEntry> AddForeignKeyConstraint(AlterForeignKeyInfo &info);

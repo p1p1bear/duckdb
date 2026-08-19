@@ -61,7 +61,8 @@ TEST_CASE("Failed physical alters preserve transaction-local storage", "[storage
 
 		auto reference = make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0);
 		auto cast = BoundCastExpression::AddCastToType(*con.context, std::move(reference), LogicalType::INTEGER);
-		REQUIRE_THROWS(make_uniq<DataTable>(*con.context, table, 0, LogicalType::INTEGER,
+		ColumnDefinition replacement_column("i", LogicalType::INTEGER);
+		REQUIRE_THROWS(make_uniq<DataTable>(*con.context, table, 0, replacement_column,
 		                                    duckdb::vector<StorageIndex> {StorageIndex(0)}, *cast));
 		VerifyFailedAlterPreservesLocalStorage(con, table);
 		REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
