@@ -3,9 +3,14 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -470,4 +475,118 @@ TEST_CASE("All row group scan entry points honor transaction layouts", "[storage
 	collection->InitializeScan(TransactionData(108, 20), QueryContext(), reordered_scan.table_state, column_ids,
 	                           nullptr);
 	REQUIRE(!reordered_scan.table_state.row_group);
+}
+
+TEST_CASE("Physical schema transforms consume the current row group layout", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("layout_schema_alter.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS layout_alter (ROW_GROUP_SIZE 2048)"));
+	REQUIRE_NO_FAIL(con.Query("USE layout_alter"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER, j INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER, (i * 10)::INTEGER FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT layout_alter"));
+
+	duckdb::shared_ptr<RowGroupCollection> collection;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		collection = entry.GetStorage().GetRowGroupCollection();
+	});
+	auto tree = collection->GetRowGroups();
+	REQUIRE(tree->GetSegmentCount() == 2);
+	auto first = tree->GetRootSegment();
+	REQUIRE(first);
+	REQUIRE(first->GetRowStart() == 0);
+	REQUIRE(first->GetCount() == 2048);
+	auto remaining_rows = 4096 - first->GetCount();
+
+	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
+	collection->PublishLayout(collection->BuildPatchedLayout(10, MakeEmptyReplacementPatch(0, first->GetCount(), 1)));
+
+	auto scan_column = [&](RowGroupCollection &source, StorageIndex column_id, const LogicalType &type) {
+		duckdb::vector<Value> result;
+		duckdb::vector<StorageIndex> column_ids {column_id};
+		TableScanState scan_state;
+		scan_state.Initialize(column_ids, nullptr);
+		source.InitializeScan(TransactionData::Committed(), QueryContext(), scan_state.table_state, column_ids,
+		                      nullptr);
+		DataChunk chunk;
+		chunk.Initialize(source.GetAllocator(), {type});
+		while (true) {
+			chunk.Reset();
+			if (!scan_state.table_state.Scan(chunk, TableScanType::TABLE_SCAN_COMMITTED_ROWS)) {
+				break;
+			}
+			for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+				result.push_back(chunk.GetValue(0, row_idx));
+			}
+		}
+		return result;
+	};
+
+	BoundConstantExpression default_value(Value::INTEGER(99));
+	ExpressionExecutor default_executor(*con.context);
+	default_executor.AddExpression(default_value);
+	ColumnDefinition new_column("k", LogicalType::INTEGER);
+	auto added = collection->AddColumn(*con.context, new_column, default_executor);
+	REQUIRE(added->GetTotalRows() == remaining_rows);
+	REQUIRE(added->GetNextRowId() == 4096);
+	REQUIRE(added->HasLayoutHistory());
+	REQUIRE(added->GetCurrentLayout()->layout_version == 1);
+	REQUIRE(added->GetCurrentLayout()->patches.empty());
+	auto added_values = scan_column(*added, StorageIndex(0), LogicalType::INTEGER);
+	REQUIRE(added_values.size() == remaining_rows);
+	REQUIRE(added_values.front() == Value::INTEGER(NumericCast<int32_t>(first->GetCount())));
+	REQUIRE(added_values.back() == Value::INTEGER(4095));
+	auto default_values = scan_column(*added, StorageIndex(2), LogicalType::INTEGER);
+	REQUIRE(default_values.size() == remaining_rows);
+	REQUIRE(default_values.front() == Value::INTEGER(99));
+	REQUIRE(default_values.back() == Value::INTEGER(99));
+
+	auto removed = collection->RemoveColumn(1);
+	REQUIRE(removed->GetTotalRows() == remaining_rows);
+	REQUIRE(removed->GetNextRowId() == 4096);
+	REQUIRE(removed->HasLayoutHistory());
+	REQUIRE(removed->GetCurrentLayout()->layout_version == 1);
+	REQUIRE(removed->GetCurrentLayout()->patches.empty());
+	auto removed_values = scan_column(*removed, StorageIndex(0), LogicalType::INTEGER);
+	REQUIRE(removed_values.size() == remaining_rows);
+	REQUIRE(removed_values.front() == Value::INTEGER(NumericCast<int32_t>(first->GetCount())));
+	REQUIRE(removed_values.back() == Value::INTEGER(4095));
+
+	auto reference = make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0);
+	auto cast = BoundCastExpression::AddCastToType(*con.context, std::move(reference), LogicalType::BIGINT);
+	auto changed = collection->AlterType(*con.context, 0, LogicalType::BIGINT, {StorageIndex(0)}, *cast,
+	                                     TransactionData::Committed());
+	REQUIRE(changed->GetTotalRows() == remaining_rows);
+	REQUIRE(changed->GetNextRowId() == 4096);
+	REQUIRE(changed->HasLayoutHistory());
+	REQUIRE(changed->GetCurrentLayout()->layout_version == 1);
+	REQUIRE(changed->GetCurrentLayout()->patches.empty());
+	auto changed_values = scan_column(*changed, StorageIndex(0), LogicalType::BIGINT);
+	REQUIRE(changed_values.size() == remaining_rows);
+	REQUIRE(changed_values.front() == Value::BIGINT(NumericCast<int64_t>(first->GetCount())));
+	REQUIRE(changed_values.back() == Value::BIGINT(4095));
+
+	auto trailing_patch = MakeEmptyReplacementPatch(first->GetCount(), 4096, 2);
+	collection->PublishLayout(make_shared_ptr<RowGroupLayout>(
+	    2, 20, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(trailing_patch)}));
+	auto trailing_gap = collection->RemoveColumn(1);
+	REQUIRE(trailing_gap->GetTotalRows() == first->GetCount());
+	REQUIRE(trailing_gap->GetNextRowId() == 4096);
+
+	TableAppendState append_state;
+	trailing_gap->InitializeAppend(TransactionData::Committed(), append_state);
+	DataChunk append_chunk;
+	append_chunk.Initialize(trailing_gap->GetAllocator(), {LogicalType::INTEGER});
+	append_chunk.data[0].Append(Value::INTEGER(5000));
+	append_chunk.SetChildCardinality(1);
+	trailing_gap->Append(append_chunk, append_state);
+	trailing_gap->FinalizeAppend(TransactionData::Committed(), append_state);
+	auto appended_tree = trailing_gap->GetRowGroups();
+	REQUIRE(appended_tree->GetSegmentCount() == 2);
+	REQUIRE(appended_tree->GetSegmentByIndex(1)->GetRowStart() == 4096);
+	REQUIRE(trailing_gap->GetTotalRows() == first->GetCount() + 1);
+	REQUIRE(trailing_gap->GetNextRowId() == 4097);
 }

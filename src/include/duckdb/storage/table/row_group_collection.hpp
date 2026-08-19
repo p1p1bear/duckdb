@@ -248,6 +248,8 @@ public:
 private:
 	LayoutRowGroupEntry NextUpdateRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t *ids, idx_t &pos,
 	                                       idx_t count) const;
+	void FinalizeAlteredCollection(const RowGroupCollectionSnapshot &snapshot, idx_t total_rows, idx_t next_row_id,
+	                               idx_t current_rowid_end);
 
 	void SetRowGroups(shared_ptr<RowGroupSegmentTree> row_groups);
 

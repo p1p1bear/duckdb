@@ -451,7 +451,7 @@ void RowGroupCollection::Verify() {
 		current_rowid_end = entry.GetRowStart() + row_group.count;
 	}
 	D_ASSERT(current_total_rows == total_rows.load());
-	D_ASSERT(row_groups->GetBaseRowId() + next_row_id.load() == current_rowid_end);
+	D_ASSERT(row_groups->GetBaseRowId() + next_row_id.load() >= current_rowid_end);
 #endif
 }
 
@@ -2597,15 +2597,29 @@ bool RowGroupCollection::SupportsPerColumnWrites() {
 //===--------------------------------------------------------------------===//
 // Alter
 //===--------------------------------------------------------------------===//
+void RowGroupCollection::FinalizeAlteredCollection(const RowGroupCollectionSnapshot &snapshot, idx_t total_rows_p,
+                                                   idx_t next_row_id_p, idx_t current_rowid_end) {
+	total_rows = total_rows_p;
+	next_row_id = next_row_id_p;
+	auto base_row_id = snapshot.GetBaseTree()->GetBaseRowId();
+	if (current_rowid_end < base_row_id + next_row_id_p) {
+		SetRowGroupAppendMode(RowGroupAppendMode::REQUIRE_NEW);
+	}
+	if (snapshot.kind == RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT) {
+		InitializeLayoutHistory(snapshot.layout->layout_version);
+	}
+	Verify();
+}
+
 shared_ptr<RowGroupCollection> RowGroupCollection::AddColumn(ClientContext &context, ColumnDefinition &new_column,
                                                              ExpressionExecutor &default_executor) {
 	idx_t new_column_idx = types.size();
 	auto new_types = types;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
+	auto row_groups = snapshot.GetBaseTree();
 	new_types.push_back(new_column.GetType());
 	auto result = make_shared_ptr<RowGroupCollection>(info, block_manager, std::move(new_types),
-	                                                  row_groups->GetBaseRowId(), total_rows.load(), row_group_size);
-	result->next_row_id = next_row_id.load();
+	                                                  row_groups->GetBaseRowId(), 0, row_group_size);
 
 	result->stats.InitializeAddColumn(stats, new_column.GetType());
 	auto lock = result->stats.GetLock();
@@ -2614,14 +2628,21 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AddColumn(ClientContext &cont
 	// fill the column with its DEFAULT value, or NULL if none is specified
 	auto new_stats = make_uniq<SegmentStatistics>(new_column.GetType());
 	auto result_row_groups = result->GetRowGroups();
-	for (auto &node : row_groups->SegmentNodes()) {
-		auto &current_row_group = node.GetNode();
+	LayoutRowGroupCursor cursor(snapshot);
+	LayoutRowGroupEntry entry;
+	idx_t transformed_rows = 0;
+	idx_t current_rowid_end = row_groups->GetBaseRowId();
+	while (cursor.Next(entry)) {
+		auto &current_row_group = *entry.row_group;
 		auto new_row_group = current_row_group.AddColumn(*result, new_column, default_executor);
 		// merge in the statistics
 		new_row_group->MergeIntoStatistics(new_column_idx, new_column_stats.Statistics());
 
-		result_row_groups->AppendSegment(std::move(new_row_group), node.GetRowStart());
+		transformed_rows += new_row_group->count.load();
+		current_rowid_end = NumericCast<idx_t>(entry.row_start) + new_row_group->count.load();
+		result_row_groups->AppendSegment(std::move(new_row_group), NumericCast<idx_t>(entry.row_start));
 	}
+	result->FinalizeAlteredCollection(snapshot, transformed_rows, next_row_id.load(), current_rowid_end);
 
 	return result;
 }
@@ -2629,23 +2650,30 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AddColumn(ClientContext &cont
 shared_ptr<RowGroupCollection> RowGroupCollection::RemoveColumn(idx_t col_idx) {
 	D_ASSERT(col_idx < types.size());
 	auto new_types = types;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
+	auto row_groups = snapshot.GetBaseTree();
 	new_types.erase_at(col_idx);
 
 	auto result = make_shared_ptr<RowGroupCollection>(info, block_manager, std::move(new_types),
-	                                                  row_groups->GetBaseRowId(), total_rows.load(), row_group_size);
-	result->next_row_id = next_row_id.load();
+	                                                  row_groups->GetBaseRowId(), 0, row_group_size);
 	result->stats.InitializeRemoveColumn(stats, col_idx);
 
 	auto result_lock = result->stats.GetLock();
 	result->stats.DestroyTableSample(*result_lock);
 
 	auto result_row_groups = result->GetRowGroups();
-	for (auto &node : row_groups->SegmentNodes()) {
-		auto &current_row_group = node.GetNode();
+	LayoutRowGroupCursor cursor(snapshot);
+	LayoutRowGroupEntry entry;
+	idx_t transformed_rows = 0;
+	idx_t current_rowid_end = row_groups->GetBaseRowId();
+	while (cursor.Next(entry)) {
+		auto &current_row_group = *entry.row_group;
 		auto new_row_group = current_row_group.RemoveColumn(*result, col_idx);
-		result_row_groups->AppendSegment(std::move(new_row_group), node.GetRowStart());
+		transformed_rows += new_row_group->count.load();
+		current_rowid_end = NumericCast<idx_t>(entry.row_start) + new_row_group->count.load();
+		result_row_groups->AppendSegment(std::move(new_row_group), NumericCast<idx_t>(entry.row_start));
 	}
+	result->FinalizeAlteredCollection(snapshot, transformed_rows, next_row_id.load(), current_rowid_end);
 	return result;
 }
 
@@ -2655,12 +2683,12 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AlterType(ClientContext &cont
                                                              TransactionData transaction) {
 	D_ASSERT(changed_idx < types.size());
 	auto new_types = types;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
+	auto row_groups = snapshot.GetBaseTree();
 	new_types[changed_idx] = target_type;
 
 	auto result = make_shared_ptr<RowGroupCollection>(info, block_manager, std::move(new_types),
-	                                                  row_groups->GetBaseRowId(), total_rows.load(), row_group_size);
-	result->next_row_id = next_row_id.load();
+	                                                  row_groups->GetBaseRowId(), 0, row_group_size);
 	result->stats.InitializeAlterType(stats, changed_idx, target_type);
 
 	vector<LogicalType> scan_types;
@@ -2687,13 +2715,21 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AlterType(ClientContext &cont
 	auto &changed_stats = result->stats.GetStats(*lock, changed_idx);
 	auto result_row_groups = result->GetRowGroups();
 
-	for (auto &node : row_groups->SegmentNodes()) {
-		auto &current_row_group = node.GetNode();
+	LayoutRowGroupCursor cursor(snapshot);
+	LayoutRowGroupEntry entry;
+	idx_t transformed_rows = 0;
+	idx_t current_rowid_end = row_groups->GetBaseRowId();
+	while (cursor.Next(entry)) {
+		auto &current_row_group = *entry.row_group;
+		SegmentNode<RowGroup> node(NumericCast<idx_t>(entry.row_start), entry.row_group, entry.layout_index);
 		auto new_row_group = current_row_group.AlterType(*result, target_type, changed_idx, executor,
 		                                                 scan_state.table_state, node, scan_chunk, transaction);
 		new_row_group->MergeIntoStatistics(changed_idx, changed_stats.Statistics());
-		result_row_groups->AppendSegment(std::move(new_row_group), node.GetRowStart());
+		transformed_rows += new_row_group->count.load();
+		current_rowid_end = NumericCast<idx_t>(entry.row_start) + new_row_group->count.load();
+		result_row_groups->AppendSegment(std::move(new_row_group), NumericCast<idx_t>(entry.row_start));
 	}
+	result->FinalizeAlteredCollection(snapshot, transformed_rows, next_row_id.load(), current_rowid_end);
 	return result;
 }
 
