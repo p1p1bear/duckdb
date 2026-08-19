@@ -11,6 +11,7 @@
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/segment_tree.hpp"
 #include "duckdb/storage/statistics/column_statistics.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/common/enums/column_segment_info_scan_type.hpp"
@@ -45,6 +46,10 @@ class DuckTableEntry;
 class RowGroupIterationHelper;
 class TableScanState;
 class BoundIndex;
+class TableLayoutHistory;
+struct LayoutPatch;
+struct RowGroupCollectionSnapshot;
+struct RowGroupLayout;
 
 //! How checkpoint vacuum handles table indexes when rowids may change.
 enum class VacuumIndexStrategy : uint8_t {
@@ -218,6 +223,18 @@ public:
 	//! Get a ptr to the raw segment tree. This can be useful for some extensions to have directly exposed.
 	shared_ptr<RowGroupSegmentTree> GetRowGroups() const;
 
+	void InitializeLayoutHistory(layout_version_t version);
+	bool HasLayoutHistory() const;
+	RowGroupCollectionSnapshot GetSnapshot(TransactionData transaction) const;
+	RowGroupCollectionSnapshot GetSnapshot(DuckTransaction &transaction) const;
+	RowGroupCollectionSnapshot GetCurrentSnapshot() const;
+	shared_ptr<const RowGroupLayout> GetCurrentLayout() const;
+	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
+	                                                    shared_ptr<const LayoutPatch> patch) const;
+	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
+	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
+	void CleanupLayoutHistory(transaction_t oldest_active_start);
+
 private:
 	optional_ptr<SegmentNode<RowGroup>> NextUpdateRowGroup(RowGroupSegmentTree &row_groups, row_t *ids, idx_t &pos,
 	                                                       idx_t count) const;
@@ -242,6 +259,8 @@ private:
 	mutable mutex row_group_pointer_lock;
 	//! The owning pointer of the segment tree
 	shared_ptr<RowGroupSegmentTree> owned_row_groups;
+	//! Present only for collections that have persistent sort storage metadata.
+	shared_ptr<TableLayoutHistory> layout_history;
 	//! Table statistics
 	TableStatistics stats;
 	//! Allocation size, only tracked for appends

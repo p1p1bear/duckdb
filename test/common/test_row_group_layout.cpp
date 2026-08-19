@@ -298,3 +298,47 @@ TEST_CASE("Layout row group cursor accepts row ID gaps between replaced groups",
 	REQUIRE(snapshot.Lookup(20, entry));
 	REQUIRE(entry.layout_index == DConstants::INVALID_INDEX);
 }
+
+TEST_CASE("Row group collection selects and installs versioned layouts", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "collection_layout_history_test");
+	auto tree = collection->GetRowGroups();
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 10), 0);
+
+	auto base_snapshot = collection->GetSnapshot(TransactionData(100, 5));
+	REQUIRE(base_snapshot.kind == RowGroupCollectionSnapshot::Kind::BASE_TREE);
+
+	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
+	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
+	REQUIRE(collection->HasLayoutHistory());
+	REQUIRE_THROWS_AS(collection->InitializeLayoutHistory(1), InternalException);
+
+	auto replacement = make_shared_ptr<RowGroup>(*collection, 8);
+	auto patch = MakeReplacementPatch(0, 10, 1, {replacement});
+	auto published_layout = collection->BuildPatchedLayout(10, patch);
+	REQUIRE(published_layout->layout_version == 1);
+	REQUIRE(published_layout->patches.size() == 1);
+	collection->PublishLayout(published_layout);
+
+	auto old_snapshot = collection->GetSnapshot(TransactionData(101, 9));
+	auto new_snapshot = collection->GetSnapshot(TransactionData(102, 10));
+	auto committed_snapshot = collection->GetSnapshot(TransactionData::Committed());
+	REQUIRE(old_snapshot.kind == RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT);
+	REQUIRE(old_snapshot.layout->layout_version == 0);
+	REQUIRE(new_snapshot.layout.get() == published_layout.get());
+	REQUIRE(committed_snapshot.layout.get() == published_layout.get());
+
+	auto overlapping_patch = MakeEmptyReplacementPatch(0, 10, 2);
+	REQUIRE_THROWS_AS(collection->BuildPatchedLayout(20, overlapping_patch), InternalException);
+
+	auto checkpoint_tree = MakeLayoutTestTree(*collection, {8});
+	collection->InstallCheckpointTree(checkpoint_tree);
+	auto checkpoint_layout = collection->GetCurrentLayout();
+	REQUIRE(checkpoint_layout->layout_version == 1);
+	REQUIRE(checkpoint_layout->visible_from == 10);
+	REQUIRE(checkpoint_layout->patches.empty());
+	REQUIRE(checkpoint_layout->base_tree.get() == checkpoint_tree.get());
+	REQUIRE(collection->GetRowGroups().get() == checkpoint_tree.get());
+	REQUIRE(collection->GetSnapshot(TransactionData(103, 9)).layout->layout_version == 0);
+}

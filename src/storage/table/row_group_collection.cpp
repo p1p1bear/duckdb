@@ -3,6 +3,7 @@
 #include "duckdb/transaction/commit_state.hpp"
 
 #include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/index/art/art.hpp"
@@ -16,6 +17,7 @@
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
+#include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -194,8 +196,142 @@ shared_ptr<RowGroupSegmentTree> RowGroupCollection::GetRowGroups() const {
 }
 
 void RowGroupCollection::SetRowGroups(shared_ptr<RowGroupSegmentTree> new_row_groups) {
+	if (!new_row_groups) {
+		throw InternalException("Cannot install a null row group tree");
+	}
 	lock_guard<mutex> guard(row_group_pointer_lock);
+	if (layout_history) {
+		throw InternalException("Versioned row group collections must install trees through the layout history");
+	}
 	owned_row_groups = std::move(new_row_groups);
+}
+
+void RowGroupCollection::InitializeLayoutHistory(layout_version_t version) {
+	lock_guard<mutex> guard(row_group_pointer_lock);
+	if (layout_history) {
+		if (layout_history->GetCurrent()->layout_version != version) {
+			throw InternalException("Row group layout history is already initialized at a different version");
+		}
+		return;
+	}
+	auto initial_layout = make_shared_ptr<RowGroupLayout>(version, 0, owned_row_groups);
+	layout_history = make_shared_ptr<TableLayoutHistory>(std::move(initial_layout));
+}
+
+bool RowGroupCollection::HasLayoutHistory() const {
+	lock_guard<mutex> guard(row_group_pointer_lock);
+	return layout_history != nullptr;
+}
+
+RowGroupCollectionSnapshot RowGroupCollection::GetSnapshot(TransactionData transaction) const {
+	shared_ptr<TableLayoutHistory> history;
+	shared_ptr<RowGroupSegmentTree> tree;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+		if (!history) {
+			tree = owned_row_groups;
+		}
+	}
+	if (!history) {
+		return RowGroupCollectionSnapshot(std::move(tree));
+	}
+	if (transaction.start_time == 0 && transaction.transaction_id == MAX_TRANSACTION_ID) {
+		return RowGroupCollectionSnapshot(history->GetCurrent());
+	}
+	return RowGroupCollectionSnapshot(history->GetForTransaction(transaction.start_time));
+}
+
+RowGroupCollectionSnapshot RowGroupCollection::GetSnapshot(DuckTransaction &transaction) const {
+	return GetSnapshot(TransactionData(transaction));
+}
+
+RowGroupCollectionSnapshot RowGroupCollection::GetCurrentSnapshot() const {
+	shared_ptr<TableLayoutHistory> history;
+	shared_ptr<RowGroupSegmentTree> tree;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+		if (!history) {
+			tree = owned_row_groups;
+		}
+	}
+	return history ? RowGroupCollectionSnapshot(history->GetCurrent()) : RowGroupCollectionSnapshot(std::move(tree));
+}
+
+shared_ptr<const RowGroupLayout> RowGroupCollection::GetCurrentLayout() const {
+	shared_ptr<TableLayoutHistory> history;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+	}
+	return history ? history->GetCurrent() : nullptr;
+}
+
+shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transaction_t visible_from,
+                                                                        shared_ptr<const LayoutPatch> patch) const {
+	if (!patch) {
+		throw InternalException("Cannot build a row group layout with a null patch");
+	}
+	auto current = GetCurrentLayout();
+	if (!current) {
+		throw InternalException("Cannot patch a row group collection without layout history");
+	}
+	if (current->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT) {
+		throw InternalException("Row group layout reached the checkpoint patch limit");
+	}
+	if (current->layout_version == NumericLimits<layout_version_t>::Maximum()) {
+		throw InternalException("Row group layout version is exhausted");
+	}
+
+	auto patches = current->patches;
+	idx_t insert_position = 0;
+	while (insert_position < patches.size() && patches[insert_position]->range.start < patch->range.start) {
+		insert_position++;
+	}
+	if (insert_position > 0 && patches[insert_position - 1]->range.Overlaps(patch->range)) {
+		throw InternalException("Cannot publish overlapping row group layout patches");
+	}
+	if (insert_position < patches.size() && patches[insert_position]->range.Overlaps(patch->range)) {
+		throw InternalException("Cannot publish overlapping row group layout patches");
+	}
+	patches.insert(patches.begin() + NumericCast<int64_t>(insert_position), std::move(patch));
+	return make_shared_ptr<RowGroupLayout>(current->layout_version + 1, visible_from, current->base_tree,
+	                                       std::move(patches));
+}
+
+void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) {
+	shared_ptr<TableLayoutHistory> history;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+	}
+	if (!history) {
+		throw InternalException("Cannot publish a layout without layout history");
+	}
+	history->Publish(std::move(layout));
+}
+
+void RowGroupCollection::InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree) {
+	if (!tree) {
+		throw InternalException("Cannot install a null checkpoint row group tree");
+	}
+	lock_guard<mutex> guard(row_group_pointer_lock);
+	if (layout_history) {
+		layout_history->InstallCheckpointTree(tree);
+	}
+	owned_row_groups = std::move(tree);
+}
+
+void RowGroupCollection::CleanupLayoutHistory(transaction_t oldest_active_start) {
+	shared_ptr<TableLayoutHistory> history;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+	}
+	if (history) {
+		history->Cleanup(oldest_active_start);
+	}
 }
 
 //===--------------------------------------------------------------------===//
