@@ -2,6 +2,9 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -11,6 +14,10 @@
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "test_helpers.hpp"
 
 using namespace duckdb;
 
@@ -93,6 +100,40 @@ TEST_CASE("Table sort catalog metadata validates stable identifier bounds", "[st
 	REQUIRE_THROWS_AS(ValidateTableSortCatalogMetadata(metadata, columns), SerializationException);
 }
 
+TEST_CASE("Table sort ALTER post-images assign and restore table identity", "[storage][sort_metadata]") {
+	ColumnList columns;
+	columns.AddColumn(ColumnDefinition("id", LogicalType::BIGINT));
+	columns.AddColumn(ColumnDefinition("payload", LogicalType::VARCHAR));
+	columns.AddColumn(ColumnDefinition("derived", LogicalType::BIGINT, make_uniq<ColumnRefExpression>("id"),
+	                                   TableColumnType::GENERATED));
+
+	auto metadata = CreateTableSortIdentity(columns);
+	REQUIRE(metadata.table_id != hugeint_t(0, 0));
+	REQUIRE(metadata.next_column_id == 3);
+	REQUIRE(columns.GetColumn(LogicalIndex(0)).PersistentColumnId() == 1);
+	REQUIRE(columns.GetColumn(LogicalIndex(1)).PersistentColumnId() == 2);
+	REQUIRE(columns.GetColumn(LogicalIndex(2)).PersistentColumnId() == 0);
+	metadata.current_sort_order_id = 1;
+	metadata.next_sort_order_id = 2;
+	metadata.definitions = {{1, {{2, OrderType::ASCENDING, OrderByNullType::NULLS_LAST}}}};
+	auto post_image = BuildTableSortPostImage(metadata, columns);
+
+	ColumnList restored_columns;
+	restored_columns.AddColumn(ColumnDefinition("id", LogicalType::BIGINT));
+	restored_columns.AddColumn(ColumnDefinition("payload", LogicalType::VARCHAR));
+	restored_columns.AddColumn(ColumnDefinition("derived", LogicalType::BIGINT, make_uniq<ColumnRefExpression>("id"),
+	                                            TableColumnType::GENERATED));
+	optional<TableSortCatalogMetadata> restored_metadata;
+	ApplyTableSortPostImage(post_image, restored_columns, restored_metadata);
+	REQUIRE(restored_metadata == metadata);
+	REQUIRE(restored_columns.GetColumn(LogicalIndex(0)).PersistentColumnId() == 1);
+	REQUIRE(restored_columns.GetColumn(LogicalIndex(1)).PersistentColumnId() == 2);
+	REQUIRE(restored_columns.GetColumn(LogicalIndex(2)).PersistentColumnId() == 0);
+
+	restored_columns.GetColumnMutable(LogicalIndex(1)).SetName("renamed");
+	REQUIRE_THROWS_AS(ApplyTableSortPostImage(post_image, restored_columns, restored_metadata), SerializationException);
+}
+
 TEST_CASE("Table sort storage state snapshots persistent counters", "[storage][sort_metadata]") {
 	PersistentTableSortStorageMetadata input {7, 3};
 	TableSortStorageState state(input);
@@ -108,6 +149,55 @@ TEST_CASE("Table sort storage state snapshots persistent counters", "[storage][s
 	PersistentTableSortStorageMetadata invalid;
 	invalid.next_run_id = INVALID_SORT_RUN_ID;
 	REQUIRE_THROWS_AS(TableSortStorageState(invalid), SerializationException);
+}
+
+TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loading", "[storage][sort_metadata]") {
+	auto path = TestCreatePath("table_sort_layout_state.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
+
+		duckdb::shared_ptr<RowGroupCollection> original_collection;
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			original_collection = entry.GetStorage().GetRowGroupCollection();
+			REQUIRE(!entry.GetStorage().GetDataTableInfo()->HasSortStorage());
+			REQUIRE(!original_collection->HasLayoutHistory());
+		});
+
+		REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			REQUIRE(entry.GetStorage().GetDataTableInfo()->HasSortStorage());
+			REQUIRE(entry.GetStorage().GetRowGroupCollection()->HasLayoutHistory());
+		});
+		REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
+
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			REQUIRE(entry.GetStorage().GetRowGroupCollection().get() == original_collection.get());
+			REQUIRE(!entry.GetStorage().GetDataTableInfo()->HasSortStorage());
+			REQUIRE(!entry.GetStorage().GetRowGroupCollection()->HasLayoutHistory());
+		});
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			REQUIRE(entry.GetStorage().GetDataTableInfo()->HasSortStorage());
+			REQUIRE(entry.GetStorage().GetRowGroupCollection()->HasLayoutHistory());
+			REQUIRE(entry.GetStorage().GetRowGroupCollection()->GetCurrentLayout()->layout_version ==
+			        INITIAL_LAYOUT_VERSION);
+		});
+	}
+	DeleteDatabase(path);
 }
 
 TEST_CASE("Column definitions preserve persistent column IDs", "[storage][sort_metadata]") {

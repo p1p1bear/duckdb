@@ -10,7 +10,6 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/function/function_list.hpp"
 #include "duckdb/common/encryption_state.hpp"
-#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table/persistent_table_data.hpp"
@@ -95,27 +94,11 @@ static ErrorData ValidateSortedCreateCapabilities(DuckCatalog &catalog, BoundCre
 	return ErrorData();
 }
 
-static void AssignPersistentColumnIds(CreateTableInfo &base, TableSortCatalogMetadata &metadata) {
-	metadata.next_column_id = 1;
-	for (idx_t column_idx = 0; column_idx < base.columns.LogicalColumnCount(); column_idx++) {
-		auto &column = base.columns.GetColumnMutable(LogicalIndex(column_idx));
-		if (column.Generated()) {
-			column.SetPersistentColumnId(0);
-			continue;
-		}
-		column.SetPersistentColumnId(metadata.next_column_id++);
-	}
-}
-
 static void InitializeSortedCreate(BoundCreateTableInfo &info) {
 	auto &base = info.Base();
 	base.NormalizeLegacySortKeys();
 	if (!base.sort_metadata) {
-		TableSortCatalogMetadata metadata;
-		do {
-			metadata.table_id = UUID::GenerateRandomUUID();
-		} while (metadata.table_id == hugeint_t(0, 0));
-		AssignPersistentColumnIds(base, metadata);
+		auto metadata = CreateTableSortIdentity(base.columns);
 		metadata.current_sort_order_id = 1;
 		metadata.next_sort_order_id = 2;
 		metadata.definitions.push_back(BindPersistentSortDefinition(base.sort_orders, base.columns, 1));

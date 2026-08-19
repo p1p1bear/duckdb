@@ -78,7 +78,8 @@ public:
 	//! Constructs a DataTable as a delta on an existing data table but with one column added new constraint
 	DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint);
 	//! Constructs a detached metadata-only replacement sharing the parent's row groups.
-	DataTable(ClientContext &context, DataTable &parent, SortMetadataOnlyAlterTag);
+	DataTable(ClientContext &context, DataTable &parent, const ColumnList &replacement_columns,
+	          SortMetadataOnlyAlterTag);
 	~DataTable();
 
 	//! A reference to the database instance

@@ -232,6 +232,7 @@ public:
 	shared_ptr<RowGroupSegmentTree> GetRowGroups() const;
 
 	void InitializeLayoutHistory(layout_version_t version);
+	void ResetLayoutHistory();
 	bool HasLayoutHistory() const;
 	RowGroupCollectionSnapshot GetSnapshot(TransactionData transaction) const;
 	RowGroupCollectionSnapshot GetSnapshot(DuckTransaction &transaction) const;

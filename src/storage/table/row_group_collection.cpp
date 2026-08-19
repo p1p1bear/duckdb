@@ -218,6 +218,15 @@ void RowGroupCollection::InitializeLayoutHistory(layout_version_t version) {
 	layout_history = make_shared_ptr<TableLayoutHistory>(std::move(initial_layout));
 }
 
+void RowGroupCollection::ResetLayoutHistory() {
+	lock_guard<mutex> guard(row_group_pointer_lock);
+	if (!layout_history) {
+		return;
+	}
+	owned_row_groups = layout_history->GetCurrent()->base_tree;
+	layout_history.reset();
+}
+
 bool RowGroupCollection::HasLayoutHistory() const {
 	lock_guard<mutex> guard(row_group_pointer_lock);
 	return layout_history != nullptr;
@@ -2453,13 +2462,13 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 	// flush any partial blocks BEFORE updating the row group pointer
 	// flushing partial blocks updates where data lives
 	// this cannot be done after other threads start scanning the row groups
-	// so this HAS to happen before we call "SetRowGroups" to update the row groups
+	// so this HAS to happen before we install the checkpoint tree
 	writer.FlushPartialBlocks();
 	// override the row group segment tree
 	total_rows = new_total_rows;
 	next_row_id = new_next_row_id;
 	D_ASSERT(next_row_id.load() >= total_rows.load());
-	SetRowGroups(std::move(new_row_groups));
+	InstallCheckpointTree(std::move(new_row_groups));
 	Verify();
 	// Rebuild indexes if the REBUILD strategy was chosen (legacy vacuum_rebuild_indexes path) and rowids changed.
 	if (vacuum_state.index_strategy == VacuumIndexStrategy::REBUILD && writer.RowIdsChanged()) {

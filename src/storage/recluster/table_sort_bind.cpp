@@ -1,6 +1,7 @@
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -51,6 +52,55 @@ SortOrderDefinition BindPersistentSortDefinition(const vector<OrderByNode> &orde
 		result.columns.push_back({column_id, OrderType::ASCENDING, OrderByNullType::NULLS_LAST});
 	}
 	return result;
+}
+
+TableSortCatalogMetadata CreateTableSortIdentity(ColumnList &columns) {
+	TableSortCatalogMetadata metadata;
+	do {
+		metadata.table_id = UUID::GenerateRandomUUID();
+	} while (metadata.table_id == hugeint_t(0, 0));
+	for (idx_t column_idx = 0; column_idx < columns.LogicalColumnCount(); column_idx++) {
+		auto &column = columns.GetColumnMutable(LogicalIndex(column_idx));
+		if (column.Generated()) {
+			column.SetPersistentColumnId(0);
+			continue;
+		}
+		column.SetPersistentColumnId(metadata.next_column_id++);
+	}
+	return metadata;
+}
+
+TableSortCatalogPostImage BuildTableSortPostImage(const TableSortCatalogMetadata &metadata, const ColumnList &columns) {
+	TableSortCatalogPostImage result;
+	result.table_metadata = metadata;
+	for (idx_t column_idx = 0; column_idx < columns.LogicalColumnCount(); column_idx++) {
+		auto &column = columns.GetColumn(LogicalIndex(column_idx));
+		result.columns.push_back(
+		    {column_idx, column.Name().GetIdentifierName(), column.Type(), column.PersistentColumnId()});
+	}
+	return result;
+}
+
+void ApplyTableSortPostImage(const TableSortCatalogPostImage &post_image, ColumnList &columns,
+                             optional<TableSortCatalogMetadata> &metadata) {
+	if (post_image.columns.size() != columns.LogicalColumnCount()) {
+		throw SerializationException("SORTED BY ALTER post-image has an invalid column count");
+	}
+	vector<bool> seen(columns.LogicalColumnCount(), false);
+	for (auto &assignment : post_image.columns) {
+		if (assignment.logical_column_index >= columns.LogicalColumnCount() || seen[assignment.logical_column_index]) {
+			throw SerializationException("SORTED BY ALTER post-image has duplicate or invalid column indexes");
+		}
+		seen[assignment.logical_column_index] = true;
+		auto &column = columns.GetColumnMutable(LogicalIndex(assignment.logical_column_index));
+		if (column.Name().GetIdentifierName() != assignment.name || column.Type() != assignment.type) {
+			throw SerializationException("SORTED BY ALTER post-image does not match column %llu",
+			                             assignment.logical_column_index);
+		}
+		column.SetPersistentColumnId(assignment.column_id);
+	}
+	ValidateTableSortCatalogMetadata(post_image.table_metadata, columns);
+	metadata = post_image.table_metadata;
 }
 
 void ValidateTableSortCatalogMetadata(const TableSortCatalogMetadata &metadata, const ColumnList &columns) {

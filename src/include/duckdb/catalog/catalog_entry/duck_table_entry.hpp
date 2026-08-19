@@ -20,6 +20,7 @@ class CommitDropState;
 
 struct AddConstraintInfo;
 struct CreateTriggerInfo;
+struct SetSortedByInfo;
 
 //! A table catalog entry
 class DuckTableEntry : public TableCatalogEntry {
@@ -106,6 +107,7 @@ private:
 	unique_ptr<CatalogEntry> DropForeignKeyConstraint(ClientContext &context, AlterForeignKeyInfo &info);
 	unique_ptr<CatalogEntry> SetColumnComment(ClientContext &context, SetColumnCommentInfo &info);
 	unique_ptr<CatalogEntry> AddConstraint(ClientContext &context, AddConstraintInfo &info);
+	unique_ptr<CatalogEntry> SetSortedBy(ClientContext &context, SetSortedByInfo &info);
 
 	void UpdateConstraintsOnColumnDrop(const LogicalIndex &removed_index, const vector<LogicalIndex> &adjusted_indices,
 	                                   const RemoveColumnInfo &info, CreateTableInfo &create_info,

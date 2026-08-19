@@ -27,6 +27,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/catalog/catalog_entry/trigger_catalog_entry.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -136,6 +137,28 @@ static void CheckTypeIsSupported(const LogicalType &logical_type, AttachedDataba
 
 static void SetAlterDependencies(BoundCreateTableInfo &info, AlterInfo &alter_info) {
 	alter_info.new_dependencies = make_uniq<LogicalDependencyList>(info.Base().dependencies);
+}
+
+static void VerifySortedAlterCapabilities(DuckTableEntry &table) {
+	auto &catalog = table.ParentCatalog();
+	if (table.temporary || catalog.GetAttached().IsTemporary() || catalog.InMemory()) {
+		throw BinderException("SORTED BY is only supported for persistent DuckDB tables");
+	}
+	auto storage_version = StorageManager::Get(catalog).GetStorageVersion();
+	if (storage_version < MIN_SORTED_BY_STORAGE_VERSION) {
+		throw BinderException(
+		    "SORTED BY requires storage version %s or newer (database \"%s\" uses storage version %s)",
+		    GetStorageVersionName(MIN_SORTED_BY_STORAGE_VERSION, false), catalog.GetName().GetIdentifierName(),
+		    GetStorageVersionName(storage_version, false));
+	}
+	for (auto &constraint : table.GetConstraints()) {
+		if (constraint->type == ConstraintType::UNIQUE || constraint->type == ConstraintType::FOREIGN_KEY) {
+			throw BinderException("SORTED BY tables cannot have PRIMARY KEY, UNIQUE, or FOREIGN KEY constraints");
+		}
+	}
+	if (table.GetStorage().HasIndexes()) {
+		throw BinderException("SORTED BY tables cannot have indexes");
+	}
 }
 
 virtual_column_map_t DuckTableEntry::GetVirtualColumns() const {
@@ -377,7 +400,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	case AlterTableType::SET_PARTITIONED_BY:
 		throw NotImplementedException("SET PARTITIONED BY is not supported for DuckDB tables");
 	case AlterTableType::SET_SORTED_BY:
-		throw NotImplementedException("SET SORTED BY is not supported for DuckDB tables");
+		return SetSortedBy(context, table_info.Cast<SetSortedByInfo>());
 	case AlterTableType::SET_TABLE_OPTIONS:
 		throw NotImplementedException("SET (<options>) is not supported for DuckDB tables");
 	case AlterTableType::RESET_TABLE_OPTIONS: {
@@ -388,6 +411,51 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	}
 }
 
+unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, SetSortedByInfo &info) {
+	auto create_info = GetInfo();
+	auto &table_info = create_info->Cast<CreateTableInfo>();
+
+	if (info.bind_mode == AlterBindMode::SKIP_BINDING) {
+		if (!info.sort_post_image) {
+			throw SerializationException("SORTED BY ALTER WAL record has no catalog post-image");
+		}
+		ApplyTableSortPostImage(*info.sort_post_image, table_info.columns, table_info.sort_metadata);
+	} else if (info.orders.empty()) {
+		if (!table_info.sort_metadata || !table_info.sort_metadata->IsEnabled()) {
+			return nullptr;
+		}
+		table_info.sort_metadata->current_sort_order_id = INVALID_SORT_ORDER_ID;
+		info.sort_post_image = BuildTableSortPostImage(*table_info.sort_metadata, table_info.columns);
+	} else {
+		VerifySortedAlterCapabilities(*this);
+		if (!table_info.sort_metadata) {
+			table_info.sort_metadata = CreateTableSortIdentity(table_info.columns);
+		}
+		auto &metadata = *table_info.sort_metadata;
+		auto definition = BindPersistentSortDefinition(info.orders, table_info.columns, metadata.next_sort_order_id);
+		auto current = metadata.GetCurrent();
+		if (current && current->columns == definition.columns) {
+			return nullptr;
+		}
+		if (metadata.next_sort_order_id == NumericLimits<sort_order_id_t>::Maximum()) {
+			throw InvalidInputException("SORTED BY sort order ID space is exhausted");
+		}
+		metadata.current_sort_order_id = metadata.next_sort_order_id++;
+		metadata.definitions.push_back(std::move(definition));
+		ValidateTableSortCatalogMetadata(metadata, table_info.columns);
+		info.sort_post_image = BuildTableSortPostImage(metadata, table_info.columns);
+	}
+
+	table_info.sort_keys.clear();
+	table_info.sort_orders.clear();
+	auto binder = Binder::CreateBinder(context);
+	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	SetAlterDependencies(*bound_create_info, info);
+	auto new_storage =
+	    make_shared_ptr<DataTable>(context, *storage, bound_create_info->Base().columns, SortMetadataOnlyAlterTag());
+	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage, triggers);
+}
+
 void DuckTableEntry::PublishAlter(ClientContext &context, CatalogEntry &previous_entry) {
 	if (previous_entry.type != CatalogType::TABLE_ENTRY) {
 		return;
@@ -395,6 +463,14 @@ void DuckTableEntry::PublishAlter(ClientContext &context, CatalogEntry &previous
 	auto &previous_table = previous_entry.Cast<DuckTableEntry>();
 	if (!RefersToSameObject(*storage, previous_table.GetStorage())) {
 		storage->PublishAlter(*this);
+	}
+	auto &storage_info = *storage->GetDataTableInfo();
+	if (HasSortHistory() && !storage_info.HasSortStorage()) {
+		storage_info.InitializeSortStorage(PersistentTableSortStorageMetadata());
+	}
+	if (HasSortHistory() && !storage->GetRowGroupCollection()->HasLayoutHistory()) {
+		storage->GetRowGroupCollection()->InitializeLayoutHistory(
+		    storage_info.GetSortStorage().current_layout_version.load());
 	}
 	auto local_storage = LocalStorage::Get(context, storage->db).GetStorage(*storage);
 	if (local_storage) {
@@ -1360,6 +1436,10 @@ void DuckTableEntry::Rollback(CatalogEntry &prev_entry) {
 	auto &prev_table = prev_entry.Cast<DuckTableEntry>();
 	auto &prev_info = prev_table.GetStorage().GetDataTableInfo();
 	auto &prev_indexes = prev_info->GetIndexes();
+	if (table.HasSortHistory() && !prev_table.HasSortHistory()) {
+		prev_table.GetStorage().GetRowGroupCollection()->ResetLayoutHistory();
+		prev_info->ResetSortStorage();
+	}
 
 	// Find all index-based constraints that exist in rollback_table, but not in table.
 	// Then, remove them.

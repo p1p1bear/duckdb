@@ -53,6 +53,7 @@ public:
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
 	void InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata);
+	void ResetSortStorage();
 	bool HasSortStorage() const;
 	TableSortStorageState &GetSortStorage();
 	const TableSortStorageState &GetSortStorage() const;

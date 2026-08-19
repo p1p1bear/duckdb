@@ -59,6 +59,10 @@ void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetada
 	sort_storage = make_uniq<TableSortStorageState>(metadata);
 }
 
+void DataTableInfo::ResetSortStorage() {
+	sort_storage.reset();
+}
+
 bool DataTableInfo::HasSortStorage() const {
 	return sort_storage != nullptr;
 }
@@ -112,6 +116,9 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
 	} else {
 		this->row_groups->InitializeEmpty();
 		D_ASSERT(row_groups->GetTotalRows() == 0);
+	}
+	if (info->HasSortStorage()) {
+		row_groups->InitializeLayoutHistory(info->GetSortStorage().current_layout_version.load());
 	}
 	row_groups->Verify();
 }
@@ -210,9 +217,10 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	local_storage.PrepareMoveStorage(parent, *this);
 }
 
-DataTable::DataTable(ClientContext &context, DataTable &parent, SortMetadataOnlyAlterTag)
+DataTable::DataTable(ClientContext &context, DataTable &parent, const ColumnList &replacement_columns,
+                     SortMetadataOnlyAlterTag)
     : db(parent.db), info(parent.info), row_groups(parent.row_groups), version(DataTableVersion::MAIN_TABLE) {
-	for (auto &column_def : parent.column_definitions) {
+	for (auto &column_def : replacement_columns.Physical()) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
 	auto &local_storage = LocalStorage::Get(context, db);
