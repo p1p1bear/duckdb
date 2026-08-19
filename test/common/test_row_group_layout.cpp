@@ -368,6 +368,39 @@ TEST_CASE("All row group scan entry points honor transaction layouts", "[storage
 	collection->PublishLayout(make_shared_ptr<RowGroupLayout>(
 	    2, 20, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(empty_patch)}));
 	duckdb::vector<StorageIndex> column_ids {StorageIndex(0)};
+	REQUIRE(collection->CanFetch(TransactionData(90, 9), 0));
+	REQUIRE(collection->CanFetch(TransactionData(91, 10), 0));
+	REQUIRE(!collection->CanFetch(TransactionData(92, 20), 0));
+
+	Vector row_ids(LogicalType::ROW_TYPE);
+	row_ids.Append(Value::BIGINT(0));
+	row_ids.Append(Value::BIGINT(1));
+	row_ids.Append(Value::BIGINT(2));
+	DataChunk fetched;
+	fetched.Initialize(collection->GetAllocator(), {LogicalType::INTEGER});
+	ColumnFetchState fetch_state;
+	collection->Fetch(TransactionData(93, 10), fetched, column_ids, row_ids, 3, fetch_state);
+	REQUIRE(fetched.size() == 3);
+	REQUIRE(fetched.GetValue(0, 0) == Value::INTEGER(1));
+	REQUIRE(fetched.GetValue(0, 1) == Value::INTEGER(2));
+	REQUIRE(fetched.GetValue(0, 2) == Value::INTEGER(3));
+	fetched.Reset();
+	collection->Fetch(TransactionData(94, 20), fetched, column_ids, row_ids, 3, fetch_state);
+	REQUIRE(fetched.size() == 0);
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("layout_scan_test")));
+		row_t row_id = 0;
+		REQUIRE_THROWS_AS(collection->Delete(TransactionData::Committed(), entry, &row_id, 1), InternalException);
+
+		DataChunk updates;
+		updates.Initialize(collection->GetAllocator(), {LogicalType::INTEGER});
+		updates.data[0].Append(Value::INTEGER(42));
+		updates.SetChildCardinality(1);
+		duckdb::vector<PhysicalIndex> update_columns {PhysicalIndex(0)};
+		REQUIRE_THROWS_AS(collection->Update(TransactionData::Committed(), entry, &row_id, update_columns, updates),
+		                  InternalException);
+	});
+
 	auto scan_rows = [&](TableScanState &scan_state) {
 		DataChunk result;
 		result.Initialize(collection->GetAllocator(), {LogicalType::INTEGER});

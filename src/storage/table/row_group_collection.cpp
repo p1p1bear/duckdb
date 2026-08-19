@@ -334,6 +334,11 @@ void RowGroupCollection::CleanupLayoutHistory(transaction_t oldest_active_start)
 	}
 }
 
+bool RowGroupCollection::LookupRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t row_id,
+                                        LayoutRowGroupEntry &result) const {
+	return snapshot.Lookup(row_id, result);
+}
+
 //===--------------------------------------------------------------------===//
 // Initialize
 //===--------------------------------------------------------------------===//
@@ -710,6 +715,24 @@ RowGroupIterationHelper RowGroupCollection::Chunks(DuckTransaction &transaction,
 //===--------------------------------------------------------------------===//
 // Fetch
 //===--------------------------------------------------------------------===//
+class ScopedFetchRowGroup {
+public:
+	ScopedFetchRowGroup(ColumnFetchState &state_p, const LayoutRowGroupEntry &entry)
+	    : state(state_p), previous(state.row_group),
+	      node(NumericCast<idx_t>(entry.row_start), entry.row_group, entry.layout_index) {
+		state.row_group = node;
+	}
+
+	~ScopedFetchRowGroup() {
+		state.row_group = previous;
+	}
+
+private:
+	ColumnFetchState &state;
+	optional_ptr<SegmentNode<RowGroup>> previous;
+	SegmentNode<RowGroup> node;
+};
+
 void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, const vector<StorageIndex> &column_ids,
                                const Vector &row_identifiers, idx_t fetch_count, ColumnFetchState &state) {
 	if (fetch_count == 0) {
@@ -719,7 +742,7 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 	ALWAYS_ASSERT(fetch_count <= STANDARD_VECTOR_SIZE);
 
 	auto row_ids = FlatVector::GetData<row_t>(row_identifiers);
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetSnapshot(transaction);
 	idx_t count = 0;
 
 	// Stack-allocated scratch buffers reused across runs/iterations within this call.
@@ -734,31 +757,26 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 	idx_t pos = 0;
 	while (pos < fetch_count) {
 		// 1. resolve the row group containing row_ids[pos]
-		optional_ptr<SegmentNode<RowGroup>> row_group;
-		{
-			idx_t segment_index;
-			auto l = row_groups->Lock();
-			if (!row_groups->TryGetSegmentIndex(l, NumericCast<idx_t>(row_ids[pos]), segment_index)) {
-				// row not yet visible, skip
-				pos++;
-				continue;
-			}
-			row_group = row_groups->GetSegmentByIndex(l, UnsafeNumericCast<int64_t>(segment_index));
+		LayoutRowGroupEntry row_group;
+		if (!LookupRowGroup(snapshot, row_ids[pos], row_group)) {
+			// row not yet visible, skip
+			pos++;
+			continue;
 		}
-		auto &current_row_group = row_group->GetNode();
-		const idx_t row_start = row_group->GetRowStart();
-		const idx_t row_end = row_start + current_row_group.count;
+		auto &current_row_group = *row_group.row_group;
+		const row_t row_start = row_group.row_start;
+		const row_t row_end = row_group.GetRowEnd();
 
 		// 2. extend the run while consecutive row-ids stay in [row_start, row_end)
 		const idx_t run_start = pos;
-		offsets[0] = NumericCast<idx_t>(row_ids[pos]) - row_start;
+		offsets[0] = NumericCast<idx_t>(row_ids[pos] - row_start);
 		pos++;
 		while (pos < fetch_count) {
-			const idx_t rid = NumericCast<idx_t>(row_ids[pos]);
+			const row_t rid = row_ids[pos];
 			if (rid < row_start || rid >= row_end) {
 				break;
 			}
-			offsets[pos - run_start] = rid - row_start;
+			offsets[pos - run_start] = NumericCast<idx_t>(rid - row_start);
 			pos++;
 		}
 		const idx_t run_count = pos - run_start;
@@ -780,7 +798,7 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 		}
 
 		// 4. bulk per-column fetch
-		state.row_group = row_group;
+		ScopedFetchRowGroup fetch_row_group(state, row_group);
 		current_row_group.FetchRows(transaction, state, column_ids, offsets, sel_for_fetch.get(), visible_count, result,
 		                            count);
 		count += visible_count;
@@ -789,18 +807,13 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 }
 
 bool RowGroupCollection::CanFetch(TransactionData transaction, const row_t row_id) {
-	auto row_groups = GetRowGroups();
-	optional_ptr<SegmentNode<RowGroup>> row_group;
-	{
-		idx_t segment_index;
-		auto l = row_groups->Lock();
-		if (!row_groups->TryGetSegmentIndex(l, UnsafeNumericCast<idx_t>(row_id), segment_index)) {
-			return false;
-		}
-		row_group = row_groups->GetSegmentByIndex(l, UnsafeNumericCast<int64_t>(segment_index));
+	auto snapshot = GetSnapshot(transaction);
+	LayoutRowGroupEntry row_group;
+	if (!LookupRowGroup(snapshot, row_id, row_group)) {
+		return false;
 	}
-	auto &current_row_group = row_group->GetNode();
-	auto offset_in_row_group = UnsafeNumericCast<idx_t>(row_id) - row_group->GetRowStart();
+	auto &current_row_group = *row_group.row_group;
+	auto offset_in_row_group = NumericCast<idx_t>(row_id - row_group.row_start);
 	SelectionVector visible_sel(1);
 	return current_row_group.Fetch(transaction, &offset_in_row_group, /*count=*/1, visible_sel) == 1;
 }
@@ -1125,27 +1138,31 @@ idx_t RowGroupCollection::Delete(TransactionData transaction, DuckTableEntry &ta
 	// usually all (or many) ids belong to the same row group
 	// we iterate over the ids and check for every id if it belongs to the same row group as their predecessor
 	idx_t pos = 0;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
 	do {
 		idx_t start = pos;
-		auto row_group = row_groups->GetSegment(UnsafeNumericCast<idx_t>(ids[start]));
+		LayoutRowGroupEntry row_group;
+		if (!LookupRowGroup(snapshot, ids[start], row_group)) {
+			throw InternalException("Could not find row group for DELETE row ID %lld", ids[start]);
+		}
 
-		auto &current_row_group = row_group->GetNode();
-		auto row_start = row_group->GetRowStart();
-		auto row_end = row_start + current_row_group.count;
+		auto &current_row_group = *row_group.row_group;
+		auto row_start = row_group.row_start;
+		auto row_end = row_group.GetRowEnd();
 		for (pos++; pos < count; pos++) {
 			D_ASSERT(ids[pos] >= 0);
 			// check if this id still belongs to this row group
-			if (idx_t(ids[pos]) < row_start) {
+			if (ids[pos] < row_start) {
 				// id is before row_group start -> it does not
 				break;
 			}
-			if (idx_t(ids[pos]) >= row_end) {
+			if (ids[pos] >= row_end) {
 				// id is after row group end -> it does not
 				break;
 			}
 		}
-		delete_count += current_row_group.Delete(transaction, table_entry, ids + start, pos - start, row_start);
+		delete_count +=
+		    current_row_group.Delete(transaction, table_entry, ids + start, pos - start, NumericCast<idx_t>(row_start));
 	} while (pos < count);
 
 	return delete_count;
@@ -1154,16 +1171,17 @@ idx_t RowGroupCollection::Delete(TransactionData transaction, DuckTableEntry &ta
 //===--------------------------------------------------------------------===//
 // Update
 //===--------------------------------------------------------------------===//
-optional_ptr<SegmentNode<RowGroup>> RowGroupCollection::NextUpdateRowGroup(RowGroupSegmentTree &row_groups, row_t *ids,
-                                                                           idx_t &pos, idx_t count) const {
-	auto row_group = row_groups.GetSegment(UnsafeNumericCast<idx_t>(ids[pos]));
+LayoutRowGroupEntry RowGroupCollection::NextUpdateRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t *ids,
+                                                           idx_t &pos, idx_t count) const {
+	LayoutRowGroupEntry row_group;
+	if (!LookupRowGroup(snapshot, ids[pos], row_group)) {
+		throw InternalException("Could not find row group for UPDATE row ID %lld", ids[pos]);
+	}
 
-	auto &current_row_group = row_group->GetNode();
-	auto row_start = row_group->GetRowStart();
-	row_t base_id = UnsafeNumericCast<row_t>(
-	    row_start + ((UnsafeNumericCast<idx_t>(ids[pos]) - row_start) / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE));
-	auto max_id =
-	    MinValue<row_t>(base_id + STANDARD_VECTOR_SIZE, UnsafeNumericCast<row_t>(row_start + current_row_group.count));
+	auto row_start = row_group.row_start;
+	row_t base_id = row_start + ((ids[pos] - row_start) / NumericCast<row_t>(STANDARD_VECTOR_SIZE) *
+	                             NumericCast<row_t>(STANDARD_VECTOR_SIZE));
+	auto max_id = MinValue<row_t>(base_id + NumericCast<row_t>(STANDARD_VECTOR_SIZE), row_group.GetRowEnd());
 	for (pos++; pos < count; pos++) {
 		D_ASSERT(ids[pos] >= 0);
 		// check if this id still belongs to this vector in this row group
@@ -1183,14 +1201,14 @@ void RowGroupCollection::Update(TransactionData transaction, DuckTableEntry &tab
                                 const vector<PhysicalIndex> &column_ids, DataChunk &updates) {
 	D_ASSERT(updates.size() >= 1);
 	idx_t pos = 0;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
 	do {
 		idx_t start = pos;
-		auto row_group = NextUpdateRowGroup(*row_groups, ids, pos, updates.size());
+		auto row_group = NextUpdateRowGroup(snapshot, ids, pos, updates.size());
 
-		auto &current_row_group = row_group->GetNode();
+		auto &current_row_group = *row_group.row_group;
 		current_row_group.Update(transaction, table_entry, updates, ids, start, pos - start, column_ids,
-		                         row_group->GetRowStart());
+		                         NumericCast<idx_t>(row_group.row_start));
 
 		auto l = stats.GetLock();
 		for (idx_t i = 0; i < column_ids.size(); i++) {
@@ -1433,13 +1451,13 @@ void RowGroupCollection::UpdateColumn(TransactionData transaction, DuckTableEntr
 	D_ASSERT(updates.size() >= 1);
 	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	idx_t pos = 0;
-	auto row_groups = GetRowGroups();
+	auto snapshot = GetCurrentSnapshot();
 	do {
 		idx_t start = pos;
-		auto row_group = NextUpdateRowGroup(*row_groups, ids, pos, updates.size());
-		auto &current_row_group = row_group->GetNode();
+		auto row_group = NextUpdateRowGroup(snapshot, ids, pos, updates.size());
+		auto &current_row_group = *row_group.row_group;
 		current_row_group.UpdateColumn(transaction, table_entry, updates, row_ids, start, pos - start, column_path,
-		                               row_group->GetRowStart());
+		                               NumericCast<idx_t>(row_group.row_start));
 
 		auto lock = stats.GetLock();
 		auto primary_column_idx = column_path[0];

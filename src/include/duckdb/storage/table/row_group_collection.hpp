@@ -50,6 +50,7 @@ class TableLayoutHistory;
 struct LayoutPatch;
 struct RowGroupCollectionSnapshot;
 struct RowGroupLayout;
+struct LayoutRowGroupEntry;
 
 //! How checkpoint vacuum handles table indexes when rowids may change.
 enum class VacuumIndexStrategy : uint8_t {
@@ -241,10 +242,11 @@ public:
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
 	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
 	void CleanupLayoutHistory(transaction_t oldest_active_start);
+	bool LookupRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t row_id, LayoutRowGroupEntry &result) const;
 
 private:
-	optional_ptr<SegmentNode<RowGroup>> NextUpdateRowGroup(RowGroupSegmentTree &row_groups, row_t *ids, idx_t &pos,
-	                                                       idx_t count) const;
+	LayoutRowGroupEntry NextUpdateRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t *ids, idx_t &pos,
+	                                       idx_t count) const;
 
 	void SetRowGroups(shared_ptr<RowGroupSegmentTree> row_groups);
 
