@@ -10,6 +10,8 @@
 
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/storage/metadata/metadata_manager.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
+#include "duckdb/common/optional.hpp"
 
 namespace duckdb {
 class BaseStatistics;
@@ -26,6 +28,7 @@ public:
 	idx_t next_row_id;
 	idx_t row_group_count;
 	MetaBlockPointer block_pointer;
+	optional<PersistentTableSortStorageMetadata> sort_storage_metadata;
 };
 
 } // namespace duckdb

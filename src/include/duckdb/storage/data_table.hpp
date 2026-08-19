@@ -239,7 +239,7 @@ public:
 	//! Obtains a lock during a checkpoint operation that prevents other threads from reading this table
 	unique_ptr<StorageLockKey> GetCheckpointLock();
 	//! Checkpoint the table to the specified table data writer
-	void Checkpoint(TableDataWriter &writer, Serializer &serializer);
+	void Checkpoint(TableDataWriter &writer, Serializer &serializer, const StorageLockKey &checkpoint_lock);
 	//! Accumulates the table's on-disk blocks for reclamation into the drop state.
 	void CommitDropTable(CommitDropState &drop_state);
 	//! Accumulates the column's on-disk blocks for reclamation into the drop state.

@@ -702,7 +702,7 @@ void SingleFileCheckpointWriter::WriteTable(TableCatalogEntry &table, Serializer
 	auto table_lock = table.GetStorage().GetCheckpointLock();
 	auto writer = GetTableDataWriter(table);
 	if (writer) {
-		writer->WriteTableData(serializer);
+		writer->WriteTableData(serializer, *table_lock);
 	}
 }
 
@@ -736,6 +736,10 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	// Read next_row_id as total_rows for backwards compatibility. Older storage versions do not allow for gaps in
 	// row_id numbering, in which case next_row_id = total_rows.
 	auto next_row_id = deserializer.ReadPropertyWithExplicitDefault<idx_t>(105, "next_row_id", total_rows);
+	auto next_run_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_run_id_t>(106, "next_run_id", INVALID_SORT_RUN_ID);
+	auto layout_version =
+	    deserializer.ReadPropertyWithExplicitDefault<layout_version_t>(107, "layout_version", INITIAL_LAYOUT_VERSION);
 	D_ASSERT(next_row_id >= total_rows);
 
 	if (!index_storage_infos.empty()) {
@@ -763,6 +767,16 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	bound_info.data->total_rows = total_rows;
 	bound_info.data->next_row_id = next_row_id;
 	bound_info.data->read_metadata_pointers = read_pointers;
+	if (bound_info.Base().sort_metadata) {
+		if (next_run_id == INVALID_SORT_RUN_ID) {
+			throw SerializationException("Table \"%s\" has SORTED BY catalog metadata but no storage state",
+			                             bound_info.Base().GetTableName());
+		}
+		bound_info.data->sort_storage_metadata = {next_run_id, layout_version};
+	} else if (next_run_id != INVALID_SORT_RUN_ID || layout_version != INITIAL_LAYOUT_VERSION) {
+		throw SerializationException("Table \"%s\" has SORTED BY storage state but no catalog metadata",
+		                             bound_info.Base().GetTableName());
+	}
 }
 
 } // namespace duckdb

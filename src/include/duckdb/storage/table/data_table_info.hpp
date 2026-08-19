@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 
 namespace duckdb {
@@ -51,6 +52,10 @@ public:
 	bool AppendRequiresNewRowGroup(RowGroupCollection &collection, transaction_t checkpoint_id);
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
+	void InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata);
+	bool HasSortStorage() const;
+	TableSortStorageState &GetSortStorage();
+	const TableSortStorageState &GetSortStorage() const;
 
 	Identifier GetSchemaName();
 	//! The full (possibly nested) schema path of the table
@@ -79,6 +84,8 @@ private:
 	optional_idx last_seen_checkpoint;
 	//! The amount of row groups the checkpoint is processing
 	optional_idx checkpoint_row_group_count;
+	//! Physical counters for tables that have SORTED BY history
+	unique_ptr<TableSortStorageState> sort_storage;
 };
 
 } // namespace duckdb

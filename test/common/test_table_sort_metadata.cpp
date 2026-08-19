@@ -9,6 +9,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
+#include "duckdb/storage/storage_lock.hpp"
 
 using namespace duckdb;
 
@@ -70,6 +71,23 @@ TEST_CASE("Table sort catalog metadata round trips", "[storage][sort_metadata]")
 	REQUIRE(output.table_metadata.GetCurrent()->sort_order_id == 2);
 	REQUIRE(output.table_metadata.GetDefinition(1) != nullptr);
 	REQUIRE(output.table_metadata.GetDefinition(99) == nullptr);
+}
+
+TEST_CASE("Table sort storage state snapshots persistent counters", "[storage][sort_metadata]") {
+	PersistentTableSortStorageMetadata input {7, 3};
+	TableSortStorageState state(input);
+	StorageLock checkpoint_lock;
+	auto lock = checkpoint_lock.GetExclusiveLock();
+	REQUIRE(state.GetPersistentSnapshot(*lock) == input);
+
+	state.next_run_id.store(8);
+	state.current_layout_version.store(4);
+	PersistentTableSortStorageMetadata updated {8, 4};
+	REQUIRE(state.GetPersistentSnapshot(*lock) == updated);
+
+	PersistentTableSortStorageMetadata invalid;
+	invalid.next_run_id = INVALID_SORT_RUN_ID;
+	REQUIRE_THROWS_AS(TableSortStorageState(invalid), SerializationException);
 }
 
 TEST_CASE("Column definitions preserve persistent column IDs", "[storage][sort_metadata]") {

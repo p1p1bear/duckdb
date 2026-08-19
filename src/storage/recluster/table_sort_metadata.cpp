@@ -90,12 +90,17 @@ bool PersistentTableSortStorageMetadata::operator==(const PersistentTableSortSto
 
 TableSortStorageState::TableSortStorageState(const PersistentTableSortStorageMetadata &metadata)
     : next_run_id(metadata.next_run_id), current_layout_version(metadata.current_layout_version) {
+	if (metadata.next_run_id == INVALID_SORT_RUN_ID) {
+		throw SerializationException("SORTED BY storage state has an invalid next run ID");
+	}
 }
 
 PersistentTableSortStorageMetadata
 TableSortStorageState::GetPersistentSnapshot(const StorageLockKey &checkpoint_or_finalize_lock) const {
 	(void)checkpoint_or_finalize_lock;
-	return {next_run_id.load(), current_layout_version.load()};
+	auto result = PersistentTableSortStorageMetadata {next_run_id.load(), current_layout_version.load()};
+	D_ASSERT(result.next_run_id != INVALID_SORT_RUN_ID);
+	return result;
 }
 
 void PersistentColumnIdAssignment::Serialize(Serializer &serializer) const {

@@ -33,9 +33,9 @@ TableDataWriter::TableDataWriter(TableCatalogEntry &table_p, QueryContext contex
 TableDataWriter::~TableDataWriter() {
 }
 
-void TableDataWriter::WriteTableData(Serializer &metadata_serializer) {
+void TableDataWriter::WriteTableData(Serializer &metadata_serializer, const StorageLockKey &checkpoint_lock) {
 	// start scanning the table and append the data to the uncompressed segments
-	table.GetStorage().Checkpoint(*this, metadata_serializer);
+	table.GetStorage().Checkpoint(*this, metadata_serializer, checkpoint_lock);
 }
 
 void TableDataWriter::AddRowGroup(RowGroupPointer &&row_group_pointer, unique_ptr<RowGroupWriter> writer) {
@@ -94,7 +94,8 @@ void SingleFileTableDataWriter::FlushPartialBlocks() {
 }
 
 void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stats, DataTableInfo &info,
-                                              RowGroupCollection &collection, Serializer &serializer) {
+                                              RowGroupCollection &collection, Serializer &serializer,
+                                              const StorageLockKey &checkpoint_lock) {
 	MetaBlockPointer pointer;
 	idx_t total_rows;
 	idx_t next_row_id;
@@ -217,6 +218,19 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 	    [&](Serializer::List &list, idx_t i) { list.WriteElement(index_storage_infos.ordered_infos[i].get()); });
 	if (serializer.ShouldSerialize(StorageVersion::V2_0_0)) {
 		serializer.WriteProperty(105, "next_row_id", next_row_id);
+	}
+	if (table.HasSortHistory()) {
+		if (!serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+			throw SerializationException("SORTED BY table metadata requires storage version %s or newer",
+			                             GetStorageVersionName(MIN_SORTED_BY_STORAGE_VERSION, false));
+		}
+		if (!info.HasSortStorage()) {
+			throw SerializationException("Table \"%s\" has SORTED BY catalog metadata but no storage state",
+			                             table.name);
+		}
+		auto sort_storage = info.GetSortStorage().GetPersistentSnapshot(checkpoint_lock);
+		serializer.WriteProperty(106, "next_run_id", sort_storage.next_run_id);
+		serializer.WriteProperty(107, "layout_version", sort_storage.current_layout_version);
 	}
 	// ¬serializer.ShouldSerialize(StorageVersion::V2_0_0) ==> (next_row_id == total_rows)
 	D_ASSERT(serializer.ShouldSerialize(StorageVersion::V2_0_0) || (next_row_id == total_rows));

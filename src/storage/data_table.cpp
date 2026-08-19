@@ -52,6 +52,31 @@ void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) 
 	indexes.Bind(context, *this, index_type);
 }
 
+void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata) {
+	if (sort_storage) {
+		throw InternalException("Sort storage state has already been initialized");
+	}
+	sort_storage = make_uniq<TableSortStorageState>(metadata);
+}
+
+bool DataTableInfo::HasSortStorage() const {
+	return sort_storage != nullptr;
+}
+
+TableSortStorageState &DataTableInfo::GetSortStorage() {
+	if (!sort_storage) {
+		throw InternalException("Table does not have sort storage state");
+	}
+	return *sort_storage;
+}
+
+const TableSortStorageState &DataTableInfo::GetSortStorage() const {
+	if (!sort_storage) {
+		throw InternalException("Table does not have sort storage state");
+	}
+	return *sort_storage;
+}
+
 bool DataTableInfo::IsTemporary() const {
 	return db.IsTemporary();
 }
@@ -75,6 +100,9 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
       info(make_shared_ptr<DataTableInfo>(db, std::move(table_io_manager_p), std::move(schema_path), std::move(table))),
       column_definitions(std::move(column_definitions_p)), version(DataTableVersion::MAIN_TABLE) {
 	// initialize the table with the existing data from disk, if any
+	if (data && data->sort_storage_metadata) {
+		info->InitializeSortStorage(*data->sort_storage_metadata);
+	}
 	auto types = GetTypes();
 	auto &io_manager = TableIOManager::Get(*this);
 	this->row_groups = make_shared_ptr<RowGroupCollection>(info, io_manager, types, 0);
@@ -1835,7 +1863,7 @@ unique_ptr<StorageLockKey> DataTable::GetCheckpointLock() {
 	return info->checkpoint_lock.GetExclusiveLock();
 }
 
-void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer) {
+void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer, const StorageLockKey &checkpoint_lock) {
 	writer.SetRowGroupCount(info->CheckpointRowGroupCount(writer.GetCheckpointOptions()));
 	// checkpoint each individual row group
 	TableStatistics global_stats;
@@ -1856,7 +1884,7 @@ void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer) {
 	//   row-group pointers
 	//   table pointer
 	//   index data
-	writer.FinalizeTable(global_stats, *info, *row_groups, serializer);
+	writer.FinalizeTable(global_stats, *info, *row_groups, serializer, checkpoint_lock);
 	row_groups->SetStats(global_stats);
 }
 
