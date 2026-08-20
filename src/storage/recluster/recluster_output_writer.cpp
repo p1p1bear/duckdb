@@ -3,11 +3,13 @@
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/metadata/metadata_writer.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_sorter.hpp"
@@ -54,15 +56,47 @@ private:
 	RowGroupWriteData &result;
 };
 
+static vector<block_id_t> UniqueSortedBlocks(vector<block_id_t> blocks) {
+	std::sort(blocks.begin(), blocks.end());
+	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+	return blocks;
+}
+
+class ReclusterTaskMetadataWriter : public MetadataWriter {
+public:
+	explicit ReclusterTaskMetadataWriter(TaskPrivateMetadataBlockOwner &owner_p)
+	    : MetadataWriter(owner_p.GetManager()), owner(owner_p) {
+	}
+
+protected:
+	MetadataHandle NextHandle() override {
+		return owner.AllocateHandle();
+	}
+
+private:
+	TaskPrivateMetadataBlockOwner &owner;
+};
+
 ReclusterOutput::ReclusterOutput(BlockManager &block_manager_p, shared_ptr<RowGroupCollection> collection_p,
                                  unique_ptr<PersistentCollectionData> persistent_data_p,
-                                 sort_order_id_t sort_order_id_p, sort_run_id_t run_id_p, idx_t row_count_p)
+                                 sort_order_id_t sort_order_id_p, sort_run_id_t run_id_p, idx_t row_count_p,
+                                 unique_ptr<TaskPrivateMetadataBlockOwner> replacement_metadata_owner_p,
+                                 unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner_p,
+                                 ReplacementManifest manifest_p, MetaBlockPointer manifest_pointer_p)
     : block_manager(block_manager_p), collection(std::move(collection_p)),
-      persistent_data(std::move(persistent_data_p)), sort_order_id(sort_order_id_p), run_id(run_id_p),
-      row_count(row_count_p) {
+      persistent_data(std::move(persistent_data_p)),
+      replacement_metadata_owner(std::move(replacement_metadata_owner_p)), manifest_owner(std::move(manifest_owner_p)),
+      manifest(std::move(manifest_p)), manifest_pointer(manifest_pointer_p), sort_order_id(sort_order_id_p),
+      run_id(run_id_p), row_count(row_count_p) {
 	if (!collection || !persistent_data || sort_order_id == INVALID_SORT_ORDER_ID || run_id == INVALID_SORT_RUN_ID ||
-	    collection->GetTotalRows() != row_count) {
+	    collection->GetTotalRows() != row_count || !replacement_metadata_owner || !manifest_owner ||
+	    !manifest_pointer.IsValid()) {
 		throw InternalException("Invalid recluster private output");
+	}
+	manifest.Validate();
+	auto manifest_blocks = manifest_owner->GetBlockIds();
+	if (!std::binary_search(manifest_blocks.begin(), manifest_blocks.end(), manifest_pointer.GetBlockId())) {
+		throw InternalException("Recluster manifest pointer is not owned by its metadata chain");
 	}
 }
 
@@ -94,17 +128,33 @@ vector<shared_ptr<RowGroup>> ReclusterOutput::GetRowGroups() const {
 }
 
 void ReclusterOutput::AdoptTaskPrivateBlocks(vector<block_id_t> block_ids_p) {
-	if (owns_blocks || !block_ids.empty()) {
+	if (owns_blocks || !data_block_ids.empty() || !block_ids.empty()) {
 		throw InternalException("Recluster output already owns task-private blocks");
 	}
-	block_ids = std::move(block_ids_p);
+	data_block_ids = std::move(block_ids_p);
 	owns_blocks = true;
+
+	block_ids = data_block_ids;
+	auto replacement_metadata_blocks = replacement_metadata_owner->GetBlockIds();
+	block_ids.insert(block_ids.end(), replacement_metadata_blocks.begin(), replacement_metadata_blocks.end());
+	auto expected_referenced_blocks = UniqueSortedBlocks(block_ids);
+	if (expected_referenced_blocks != manifest.all_referenced_blocks) {
+		throw InternalException("Recluster replacement block ownership does not match its manifest");
+	}
+	auto manifest_blocks = manifest_owner->GetBlockIds();
+	block_ids.insert(block_ids.end(), manifest_blocks.begin(), manifest_blocks.end());
+	block_ids = UniqueSortedBlocks(std::move(block_ids));
 }
 
 void ReclusterOutput::MarkPublished() {
 	if (!owns_blocks) {
 		throw InternalException("Cannot publish recluster output without private block ownership");
 	}
+	for (auto block_id : data_block_ids) {
+		block_manager.MarkBlockAsCheckpointed(block_id);
+	}
+	replacement_metadata_owner->MarkPublished();
+	manifest_owner->MarkPublished();
 	owns_blocks = false;
 }
 
@@ -112,9 +162,11 @@ void ReclusterOutput::Abort() {
 	if (!owns_blocks) {
 		return;
 	}
-	for (auto block_id : block_ids) {
+	for (auto block_id : data_block_ids) {
 		block_manager.MarkBlockAsModified(block_id);
 	}
+	replacement_metadata_owner->Abort();
+	manifest_owner->Abort();
 	owns_blocks = false;
 }
 
@@ -143,12 +195,6 @@ static vector<column_t> ReclusterPhysicalColumns(idx_t column_count) {
 		result.push_back(NumericCast<column_t>(column_index));
 	}
 	return result;
-}
-
-static vector<block_id_t> UniqueSortedBlocks(vector<block_id_t> blocks) {
-	std::sort(blocks.begin(), blocks.end());
-	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
-	return blocks;
 }
 
 void ReclusterOutputWriter::Write() {
@@ -258,12 +304,89 @@ void ReclusterOutputWriter::Write() {
 			throw InternalException("Recluster output row IDs exceed the candidate range");
 		}
 
-		auto referenced_blocks = UniqueSortedBlocks(persistent_data->GetBlockIds());
+		auto data_blocks = UniqueSortedBlocks(persistent_data->GetBlockIds());
+		auto &metadata_manager = block_manager.GetMetadataManager();
+		auto replacement_metadata_owner = metadata_manager.CreateTaskPrivateBlockOwner();
+		vector<RowGroupPointer> replacement_groups;
+		replacement_groups.reserve(persistent_data->row_group_data.size());
+		{
+			ReclusterTaskMetadataWriter metadata_writer(*replacement_metadata_owner);
+			for (auto &row_group_data : persistent_data->row_group_data) {
+				CheckTask();
+				if (row_group_data.column_data.size() != types.size() || row_group_data.types != types ||
+				    row_group_data.count == 0) {
+					throw InternalException("Invalid persistent recluster replacement row group");
+				}
+
+				RowGroupPointer pointer;
+				pointer.row_start = row_group_data.start;
+				pointer.tuple_count = row_group_data.count;
+				pointer.has_per_column_metadata_blocks = true;
+				pointer.sort_metadata = {organization.sort_order_id, run_id};
+				for (idx_t column_index = 0; column_index < row_group_data.column_data.size(); column_index++) {
+					vector<MetaBlockPointer> column_written_blocks;
+					metadata_writer.SetWrittenPointers(column_written_blocks);
+					auto column_pointer = metadata_writer.GetMetaBlockPointer();
+					pointer.data_pointers.push_back(column_pointer);
+
+					BinarySerializer serializer(metadata_writer,
+					                            SerializationOptions(storage.GetDataTableInfo()->GetDB()));
+					serializer.Begin();
+					row_group_data.column_data[column_index].Serialize(serializer);
+					serializer.End();
+					metadata_writer.SetWrittenPointers(nullptr);
+
+					vector<idx_t> extra_blocks;
+					for (auto &written_pointer : column_written_blocks) {
+						if (written_pointer.block_pointer != column_pointer.block_pointer) {
+							extra_blocks.push_back(written_pointer.block_pointer);
+						}
+					}
+					pointer.per_column_metadata_blocks.AddColumn(column_index, std::move(extra_blocks));
+				}
+				replacement_groups.push_back(std::move(pointer));
+			}
+			metadata_writer.Flush();
+		}
+		replacement_metadata_owner->Flush();
+		CheckTask();
+
+		ReplacementManifest manifest;
+		manifest.header.task_id = task.GetTaskId();
+		manifest.header.table_id = task_context.GetTableId();
+		manifest.header.prepared_layout_version = task_context.GetCandidate().layout_version;
+		manifest.header.sort_order_id = organization.sort_order_id;
+		manifest.header.run_id = run_id;
+		manifest.header.input_range = range;
+		manifest.sort_columns = task_context.GetSortDefinition().columns;
+		manifest.old_groups = task_context.GetCandidate().expected_row_groups;
+		manifest.replacement_groups = std::move(replacement_groups);
+		manifest.physical_columns.reserve(storage.Columns().size());
+		for (auto &column : storage.Columns()) {
+			manifest.physical_columns.push_back({column.PersistentColumnId(), column.Type()});
+		}
+		manifest.all_referenced_blocks = data_blocks;
+		auto replacement_metadata_blocks = replacement_metadata_owner->GetBlockIds();
+		manifest.all_referenced_blocks.insert(manifest.all_referenced_blocks.end(), replacement_metadata_blocks.begin(),
+		                                      replacement_metadata_blocks.end());
+		manifest.all_referenced_blocks = UniqueSortedBlocks(std::move(manifest.all_referenced_blocks));
+		manifest.Seal();
+
+		auto manifest_owner = metadata_manager.CreateTaskPrivateBlockOwner();
+		MetaBlockPointer manifest_pointer;
+		{
+			ReclusterTaskMetadataWriter manifest_writer(*manifest_owner);
+			manifest_pointer = manifest_writer.GetMetaBlockPointer();
+			manifest.Write(manifest_writer);
+			manifest_writer.Flush();
+		}
+		manifest_owner->Flush();
 		block_manager.FileSync();
 		CheckTask();
 		auto output = unique_ptr<ReclusterOutput>(
 		    new ReclusterOutput(block_manager, collection, std::move(persistent_data), organization.sort_order_id,
-		                        run_id, collection->GetTotalRows()));
+		                        run_id, collection->GetTotalRows(), std::move(replacement_metadata_owner),
+		                        std::move(manifest_owner), std::move(manifest), manifest_pointer));
 		vector<block_id_t> task_blocks;
 		for (auto &partial_manager : partial_managers) {
 			auto manager_blocks = partial_manager->TakeTaskPrivateBlocks();
@@ -271,9 +394,6 @@ void ReclusterOutputWriter::Write() {
 		}
 		task_blocks = UniqueSortedBlocks(std::move(task_blocks));
 		output->AdoptTaskPrivateBlocks(std::move(task_blocks));
-		if (output->GetBlockIds() != referenced_blocks) {
-			throw InternalException("Recluster task-private block ownership does not match its persistent output");
-		}
 		task_context.SetOutput(std::move(output));
 	} catch (...) {
 		for (auto &partial_manager : partial_managers) {

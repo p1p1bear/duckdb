@@ -7,6 +7,8 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/database_size.hpp"
+#include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
@@ -87,8 +89,7 @@ private:
 	string table_name;
 };
 
-static void CheckOutputRows(Connection &con, ReclusterOutput &output, MaterializedQueryResult &expected) {
-	auto &collection = *output.GetCollection();
+static void CheckCollectionRows(Connection &con, RowGroupCollection &collection, MaterializedQueryResult &expected) {
 	auto types = collection.GetTypes();
 	duckdb::vector<StorageIndex> column_ids;
 	for (idx_t column_index = 0; column_index < types.size(); column_index++) {
@@ -108,9 +109,7 @@ static void CheckOutputRows(Connection &con, ReclusterOutput &output, Materializ
 		}
 		for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
 			for (idx_t column_index = 0; column_index < chunk.ColumnCount(); column_index++) {
-				INFO("output row " << output_row << ", column " << column_index << ", actual "
-				                   << chunk.GetValue(column_index, row_index).ToString() << ", expected "
-				                   << expected.GetValue(column_index, output_row).ToString());
+				INFO("output row " << output_row << ", column " << column_index);
 				REQUIRE(Value::NotDistinctFrom(chunk.GetValue(column_index, row_index),
 				                               expected.GetValue(column_index, output_row)));
 			}
@@ -120,6 +119,36 @@ static void CheckOutputRows(Connection &con, ReclusterOutput &output, Materializ
 	REQUIRE(output_row == expected.RowCount());
 }
 
+static ReplacementManifest ReadOutputManifest(ReclusterOutput &output, MetadataManager &metadata_manager) {
+	MetadataReader reader(metadata_manager, output.GetManifestPointer());
+	return ReplacementManifest::Read(reader);
+}
+
+static duckdb::shared_ptr<RowGroupCollection> CreateLazyReplacementCollection(DataTable &storage,
+                                                                              ReplacementManifest &manifest) {
+	idx_t row_count = 0;
+	for (auto &pointer : manifest.replacement_groups) {
+		row_count += pointer.tuple_count;
+	}
+	auto result =
+	    make_shared_ptr<RowGroupCollection>(storage.GetDataTableInfo(), storage.GetTableIOManager(), storage.GetTypes(),
+	                                        NumericCast<idx_t>(manifest.header.input_range.start), row_count);
+	result->InitializeEmpty();
+	for (auto &pointer : manifest.replacement_groups) {
+		auto row_start = NumericCast<idx_t>(pointer.row_start);
+		auto row_group = make_shared_ptr<RowGroup>(*result, std::move(pointer));
+		result->GetRowGroups()->AppendSegment(std::move(row_group), row_start);
+	}
+	result->Verify();
+	return result;
+}
+
+static duckdb::vector<block_id_t> UniqueBlocks(duckdb::vector<block_id_t> blocks) {
+	std::sort(blocks.begin(), blocks.end());
+	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+	return blocks;
+}
+
 TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][recluster_output]") {
 	auto path = TestCreatePath("recluster_output.db");
 	DeleteDatabase(path);
@@ -127,10 +156,13 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS output_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE output_db"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k1 INTEGER, k2 VARCHAR, payload BIGINT)"));
+	REQUIRE_NO_FAIL(
+	    con.Query("CREATE TABLE tbl(k1 INTEGER, k2 VARCHAR, payload BIGINT, nested STRUCT(a INTEGER, b VARCHAR[]))"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT CASE WHEN i % 23 = 0 THEN NULL ELSE (i * 37) % 4096 END, "
 	                          "CASE WHEN i % 29 = 0 AND i % 23 <> 0 THEN NULL "
-	                          "ELSE lpad(i::VARCHAR, 4, '0') END, i * 101 FROM range(4096) t(i)"));
+	                          "ELSE lpad(i::VARCHAR, 4, '0') END, i * 101, "
+	                          "struct_pack(a := i::INTEGER, b := [i::VARCHAR, NULL::VARCHAR]) "
+	                          "FROM range(4096) t(i)"));
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT output_db"));
 	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k1, k2)"));
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT output_db"));
@@ -145,6 +177,7 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
 	auto &storage = *start.task->GetTaskContext().GetStorage();
 	auto &block_manager = storage.GetTableIOManager().GetBlockManagerForRowData();
+	auto &metadata_manager = block_manager.GetMetadataManager();
 	auto first_private_block = block_manager.PeekFreeBlockId();
 
 	ReclusterOutputWriter writer(*start.task);
@@ -164,7 +197,7 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	REQUIRE(output.GetCollection()->GetTotalRows() == 4096);
 	REQUIRE(output.GetCollection()->GetNextRowId() == 4096);
 	REQUIRE(output.GetPersistentData().row_group_data.size() == 2);
-	REQUIRE(output.GetBlockIds().size() >= 6);
+	REQUIRE(output.GetBlockIds().size() >= 8);
 	REQUIRE(std::find(output.GetBlockIds().begin(), output.GetBlockIds().end(), first_private_block) !=
 	        output.GetBlockIds().end());
 	REQUIRE(std::find(output.GetBlockIds().begin(), output.GetBlockIds().end(), block_manager.PeekFreeBlockId()) ==
@@ -188,12 +221,69 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	REQUIRE(second_group->GetRowStart() == 2048);
 	REQUIRE(second_group->GetNode().count == 2048);
 	REQUIRE(!output_tree->GetNextSegment(*second_group));
-	CheckOutputRows(con, output, expected);
+	CheckCollectionRows(con, *output.GetCollection(), expected);
+
+	auto &manifest = output.GetManifest();
+	REQUIRE(manifest.header.task_id == start.task->GetTaskId());
+	REQUIRE(manifest.header.table_id == task_context.GetTableId());
+	REQUIRE(manifest.header.prepared_layout_version == task_context.GetCandidate().layout_version);
+	REQUIRE(manifest.header.sort_order_id == output.GetSortOrderId());
+	REQUIRE(manifest.header.run_id == output.GetRunId());
+	REQUIRE(manifest.header.input_range.start == 0);
+	REQUIRE(manifest.header.input_range.end == 4096);
+	REQUIRE(manifest.header.last_applied_delete_sequence == 0);
+	REQUIRE(manifest.header.manifest_revision == 1);
+	REQUIRE(manifest.sort_columns == task_context.GetSortDefinition().columns);
+	REQUIRE(manifest.old_groups == task_context.GetCandidate().expected_row_groups);
+	REQUIRE(manifest.replacement_groups.size() == 2);
+	REQUIRE(manifest.replacement_groups[0].row_start == 0);
+	REQUIRE(manifest.replacement_groups[0].tuple_count == 2048);
+	REQUIRE(manifest.replacement_groups[1].row_start == 2048);
+	REQUIRE(manifest.replacement_groups[1].tuple_count == 2048);
+	REQUIRE(manifest.replacement_groups[0].data_pointers.size() == 4);
+	REQUIRE(manifest.replacement_groups[1].data_pointers.size() == 4);
+	REQUIRE(manifest.all_referenced_blocks.size() < output.GetBlockIds().size());
+	REQUIRE(!std::binary_search(manifest.all_referenced_blocks.begin(), manifest.all_referenced_blocks.end(),
+	                            output.GetManifestPointer().GetBlockId()));
+	for (auto block_id : manifest.all_referenced_blocks) {
+		REQUIRE(std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(), block_id));
+	}
+
+	auto loaded_manifest = ReadOutputManifest(output, metadata_manager);
+	REQUIRE(loaded_manifest.header.task_id == manifest.header.task_id);
+	REQUIRE(loaded_manifest.payload_size == manifest.payload_size);
+	REQUIRE(loaded_manifest.checksum == manifest.checksum);
+	REQUIRE(loaded_manifest.all_referenced_blocks == manifest.all_referenced_blocks);
+
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT output_db"));
+	auto data_blocks = UniqueBlocks(output.GetPersistentData().GetBlockIds());
+	for (auto block_id : output.GetBlockIds()) {
+		if (std::binary_search(data_blocks.begin(), data_blocks.end(), block_id)) {
+			continue;
+		}
+		for (auto &info : metadata_manager.GetMetadataInfo()) {
+			REQUIRE(info.block_id != block_id);
+		}
+	}
+	auto checkpoint_manifest = ReadOutputManifest(output, metadata_manager);
+	REQUIRE(checkpoint_manifest.checksum == manifest.checksum);
+	auto lazy_collection = CreateLazyReplacementCollection(storage, checkpoint_manifest);
+	REQUIRE(lazy_collection->GetRowGroupCount() == 2);
+	for (idx_t row_group_index = 0; row_group_index < lazy_collection->GetRowGroupCount(); row_group_index++) {
+		auto row_group = lazy_collection->GetRowGroup(NumericCast<int64_t>(row_group_index));
+		REQUIRE(row_group);
+		REQUIRE(row_group->GetColumnStartPointers().size() == 4);
+		for (auto &pointer : row_group->GetColumnStartPointers()) {
+			REQUIRE(pointer.IsValid());
+		}
+	}
+	CheckCollectionRows(con, *lazy_collection, expected);
 
 	auto main_result = con.Query("SELECT count(*), count(DISTINCT payload) FROM tbl");
 	REQUIRE_NO_FAIL(*main_result);
 	REQUIRE(CHECK_COLUMN(main_result, 0, {4096}));
 	REQUIRE(CHECK_COLUMN(main_result, 1, {4096}));
+	lazy_collection.reset();
 	output_groups.clear();
 	output_tree.reset();
 	RemoveOutputTask(con, start, "tbl");
@@ -230,9 +320,19 @@ TEST_CASE("Recluster output supports an empty replacement", "[storage][recluster
 	REQUIRE(output.GetRowCount() == 0);
 	REQUIRE(output.GetCollection()->GetRowGroupCount() == 0);
 	REQUIRE(output.GetPersistentData().row_group_data.empty());
-	REQUIRE(output.GetBlockIds().empty());
+	REQUIRE(!output.GetBlockIds().empty());
 	REQUIRE(output.GetRowGroups().empty());
 	REQUIRE(!start.task->GetTaskContext().HasActiveSnapshot());
+	REQUIRE(output.GetManifest().replacement_groups.empty());
+	REQUIRE(output.GetManifest().all_referenced_blocks.empty());
+	REQUIRE(std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(),
+	                           output.GetManifestPointer().GetBlockId()));
+	auto &storage = *start.task->GetTaskContext().GetStorage();
+	auto &metadata_manager = storage.GetTableIOManager().GetBlockManagerForRowData().GetMetadataManager();
+	auto manifest = ReadOutputManifest(output, metadata_manager);
+	REQUIRE(manifest.replacement_groups.empty());
+	REQUIRE(manifest.all_referenced_blocks.empty());
+	REQUIRE(manifest.old_groups == start.task->GetTaskContext().GetCandidate().expected_row_groups);
 
 	RemoveOutputTask(con, start, "tbl");
 	DeleteDatabase(path);
