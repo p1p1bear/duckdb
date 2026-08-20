@@ -122,6 +122,14 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 		table = insert_table.get_mutable();
 	}
 	auto result = make_uniq<InsertGlobalState>(context, GetTypes(), *table);
+	if (table->SortEnabled()) {
+		if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
+			throw NotImplementedException(
+			    "UPDATE conflict: table \"%s\" has SORTED BY enabled; use DELETE + INSERT or RESET SORTED BY",
+			    table->name);
+		}
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
+	}
 	return std::move(result);
 }
 
@@ -616,6 +624,17 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 	auto &table = gstate.table;
 	auto &storage = table.GetStorage();
 	insert_chunk.Flatten();
+	if (gstate.adaptive_sort) {
+		auto updated_tuples = OnConflictHandling(table, context, gstate, lstate, insert_chunk);
+		if (updated_tuples != 0) {
+			throw InternalException("Adaptive sorted write unexpectedly updated existing tuples");
+		}
+		if (return_chunk) {
+			gstate.return_collection.Append(insert_chunk);
+		}
+		return gstate.adaptive_sort->Sink(context, insert_chunk, lstate.adaptive_sort, InsertOrderToken::ArrivalOrder(),
+		                                  input.interrupt_state);
+	}
 
 	if (!parallel) {
 		idx_t updated_tuples = OnConflictHandling(table, context, gstate, lstate, insert_chunk);
@@ -669,6 +688,9 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	auto &client_profiler = QueryProfiler::Get(context.client);
 	context.thread.profiler.Flush(*this);
 	client_profiler.Flush(context.thread.profiler);
+	if (gstate.adaptive_sort) {
+		return gstate.adaptive_sort->Combine(context, lstate.adaptive_sort, input.interrupt_state);
+	}
 
 	if (!parallel || !lstate.collection_index.IsValid()) {
 		return SinkCombineResultType::FINISHED;
@@ -711,6 +733,11 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 
 SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
+	auto &gstate = input.global_state.Cast<InsertGlobalState>();
+	if (gstate.adaptive_sort) {
+		gstate.insert_count = gstate.adaptive_sort->TotalCount();
+		return gstate.adaptive_sort->Finalize(pipeline, event, *this, context, input.interrupt_state);
+	}
 	return SinkFinalizeType::READY;
 }
 

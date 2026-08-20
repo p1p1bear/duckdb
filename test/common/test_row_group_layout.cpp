@@ -13,6 +13,7 @@
 #include "duckdb/storage/optimistic_data_writer.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/append_state.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -790,4 +791,61 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	REQUIRE(appended_tree->GetSegmentByIndex(1)->GetRowStart() == 4096);
 	REQUIRE(trailing_gap->GetTotalRows() == first->GetCount() + 1);
 	REQUIRE(trailing_gap->GetNextRowId() == 4097);
+}
+
+TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("adaptive_sorted_write_layout.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS adaptive_layout (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE adaptive_layout"));
+	REQUIRE_NO_FAIL(con.Query("SET threads = 1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (3), (1), (2)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 1);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(!collection->GetRowGroup(0)->IsSealed());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (4095 - i)::INTEGER FROM range(4096) t(i)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 3);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		for (idx_t row_group_idx = 1; row_group_idx < 3; row_group_idx++) {
+			auto row_group = collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+			REQUIRE(row_group->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+			REQUIRE(row_group->IsSealed());
+		}
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (2047 - i)::INTEGER FROM range(2048) t(i)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 4);
+		REQUIRE(collection->GetRowGroup(3)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
+		REQUIRE(collection->GetRowGroup(3)->IsSealed());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (6), (4), (5)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 5);
+		REQUIRE(collection->GetRowGroup(4)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(!collection->GetRowGroup(4)->IsSealed());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+	});
+	DeleteDatabase(path);
 }

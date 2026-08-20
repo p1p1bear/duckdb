@@ -19,6 +19,7 @@
 #include "duckdb/storage/optimistic_data_writer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/row_id_deduplicator.hpp"
+#include "duckdb/execution/operator/persistent/adaptive_sorted_write.hpp"
 
 namespace duckdb {
 
@@ -34,6 +35,7 @@ public:
 	DuckTableEntry &table;
 	idx_t insert_count;
 	ColumnDataCollection return_collection;
+	unique_ptr<AdaptiveSortedWrite> adaptive_sort;
 };
 
 class InsertLocalState : public LocalSinkState {
@@ -62,6 +64,7 @@ public:
 	unique_ptr<TableDeleteState> delete_state;
 	//! The append chunk for ON CONFLICT handling that is rewriting into DELETE + INSERT.
 	DataChunk append_chunk;
+	AdaptiveSortedWriteLocalState adaptive_sort;
 };
 
 //! Physically insert a set of data into a table

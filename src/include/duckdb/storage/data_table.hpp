@@ -18,6 +18,7 @@ namespace duckdb {
 
 class BoundForeignKeyConstraint;
 class AttachedDatabase;
+class AdaptiveSortedWrite;
 class ClientContext;
 class ColumnList;
 class ColumnDataCollection;
@@ -63,6 +64,8 @@ enum class DataTableVersion {
 
 //! DataTable represents a physical table on disk
 class DataTable : public enable_shared_from_this<DataTable> {
+	friend class AdaptiveSortedWrite;
+
 public:
 	//! Constructs a new data table from an (optional) set of persistent segments
 	DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager, vector<Identifier> schema_path,

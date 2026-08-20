@@ -1,0 +1,203 @@
+# name: test/sql/insert/adaptive_sorted_write.test
+# description: Test adaptive direct writes into SORTED BY tables
+# group: [insert]
+
+statement ok
+ATTACH '{TEST_DIR}/adaptive_sorted_write.db' AS adaptive (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE adaptive
+
+statement ok
+SET threads = 1
+
+# An empty statement does not create a sorter or append state.
+statement ok
+CREATE TABLE empty_write(i INTEGER) SORTED BY (i)
+
+query I
+INSERT INTO empty_write SELECT i FROM range(0) t(i)
+----
+0
+
+query I
+SELECT count(*) FROM empty_write
+----
+0
+
+# A statement below one row group preserves its input order.
+statement ok
+CREATE TABLE small_write(i INTEGER) SORTED BY (i)
+
+statement ok
+INSERT INTO small_write VALUES (3), (1), (2)
+
+query I
+SELECT i FROM small_write
+----
+3
+1
+2
+
+# Reaching exactly one row group sorts the complete statement.
+statement ok
+CREATE TABLE exact_write(i BIGINT) SORTED BY (i)
+
+query I
+INSERT INTO exact_write SELECT 2047 - i FROM range(2048) t(i)
+----
+2048
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM exact_write
+)
+WHERE i != expected
+----
+0
+
+# All chunks in a larger statement participate in one sorted run.
+statement ok
+CREATE TABLE large_write(i BIGINT, payload VARCHAR) SORTED BY (i)
+
+query I
+INSERT INTO large_write
+SELECT 4095 - i, 'payload-' || i
+FROM range(4096) t(i)
+----
+4096
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM large_write
+)
+WHERE i != expected
+----
+0
+
+# Parallel streaming INSERT uses one statement-global sorter and one run.
+statement ok
+SET threads = 4
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+PRAGMA verify_parallelism
+
+statement ok
+CREATE TABLE parallel_write(i BIGINT) SORTED BY (i)
+
+query I
+INSERT INTO parallel_write
+SELECT 16383 - i
+FROM range(16384) t(i)
+----
+16384
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM parallel_write
+)
+WHERE i != expected
+----
+0
+
+# A constraint failure after staging began rolls back the complete statement.
+statement ok
+CREATE TABLE constrained_write(i BIGINT CHECK (i >= 0)) SORTED BY (i)
+
+statement error
+INSERT INTO constrained_write
+SELECT CASE WHEN i = 4095 THEN -1 ELSE i END
+FROM range(4096) t(i)
+----
+<REGEX>:Constraint Error: CHECK constraint failed.*
+
+query I
+SELECT count(*) FROM constrained_write
+----
+0
+
+# RETURNING retains the input order even though the storage copy is sorted.
+statement ok
+CREATE TABLE returning_write(i BIGINT) SORTED BY (i)
+
+query I
+WITH inserted AS (
+    INSERT INTO returning_write
+    SELECT 2047 - i
+    FROM range(2048) t(i)
+    RETURNING i
+)
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () AS input_row
+    FROM inserted
+)
+WHERE i != 2048 - input_row
+----
+0
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM returning_write
+)
+WHERE i != expected
+----
+0
+
+# Default-size row groups use the parallel sorted drain. Partitions are merged
+# by their sort partition index and retain one physical run.
+statement ok
+SET auto_recluster = false
+
+statement ok
+ATTACH '{TEST_DIR}/adaptive_sorted_write_default.db' AS adaptive_default (STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE adaptive_default
+
+statement ok
+SET threads = 4
+
+statement ok
+SET preserve_insertion_order = true
+
+statement ok
+CREATE TABLE parallel_drain_source AS
+SELECT 399999 - i AS i, md5(i::VARCHAR) AS payload
+FROM range(400000) t(i)
+
+statement ok
+CREATE TABLE parallel_drain(i BIGINT, payload VARCHAR) SORTED BY (i)
+
+query I
+INSERT INTO parallel_drain SELECT * FROM parallel_drain_source
+----
+400000
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, lag(i) OVER () AS previous_i
+    FROM parallel_drain
+)
+WHERE previous_i IS NOT NULL AND i < previous_i
+----
+0
+
+query I
+SELECT run_count
+FROM duckdb_recluster_status()
+WHERE table_name = 'parallel_drain'
+----
+1
