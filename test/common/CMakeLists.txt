@@ -22,6 +22,7 @@ add_library_unity(
   test_recursive_cte_metrics.cpp
   test_local_storage_alter.cpp
   test_recluster_candidate.cpp
+  test_recluster_delete_journal.cpp
   test_recluster_manager.cpp
   test_recluster_output.cpp
   test_recluster_scan.cpp

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/storage/recluster/recluster_delete_journal.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 
 #include <atomic>
@@ -31,8 +32,10 @@ enum class RangeTaskState : uint8_t {
 
 class RangeTask {
 public:
-	RangeTask(recluster_task_id_t task_id, RowGroupRange range);
-	RangeTask(recluster_task_id_t task_id, unique_ptr<ReclusterTaskContext> task_context);
+	RangeTask(recluster_task_id_t task_id, RowGroupRange range,
+	          ReclusterDeleteJournalLimits delete_journal_limits = {});
+	RangeTask(recluster_task_id_t task_id, unique_ptr<ReclusterTaskContext> task_context,
+	          ReclusterDeleteJournalLimits delete_journal_limits = {});
 	~RangeTask();
 
 	recluster_task_id_t GetTaskId() const {
@@ -51,6 +54,14 @@ public:
 	}
 	ReclusterTaskContext &GetTaskContext();
 	const ReclusterTaskContext &GetTaskContext() const;
+	optional_ptr<ReclusterDeleteSlot> TryReserveDeleteSlot(vector<row_t> old_rowids) noexcept;
+	bool ResolveDeleteSlot(ReclusterDeleteSlot &slot, DeleteSlotState target) noexcept;
+	ReclusterDeleteJournalScan ScanResolvedDeletes(delete_sequence_t after_sequence, idx_t max_slots,
+	                                               idx_t max_rowids) const;
+	delete_sequence_t GetLatestDeleteSequence() const;
+	const ReclusterDeleteJournalLimits &GetDeleteJournalLimits() const {
+		return delete_journal.GetLimits();
+	}
 
 	void RequestCancel() noexcept;
 	void DisablePublishForJournalFailure() noexcept;
@@ -71,6 +82,7 @@ private:
 	recluster_task_id_t task_id;
 	RowGroupRange range;
 	std::atomic<uint16_t> control;
+	ReclusterDeleteJournal delete_journal;
 	unique_ptr<ReclusterTaskContext> task_context;
 };
 

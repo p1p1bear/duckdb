@@ -17,24 +17,38 @@ static RowGroupRange GetTaskContextRange(const unique_ptr<ReclusterTaskContext> 
 	return task_context->GetCandidate().range;
 }
 
-RangeTask::RangeTask(recluster_task_id_t task_id_p, RowGroupRange range_p)
-    : task_id(task_id_p), range(range_p), control(static_cast<uint16_t>(RangeTaskState::STARTING)) {
-	if (task_id == recluster_task_id_t(0, 0)) {
-		throw InternalException("A recluster task requires a non-zero task ID");
-	}
+static ReclusterDeleteJournalLimits NormalizeDeleteJournalLimits(const RowGroupRange &range,
+                                                                 ReclusterDeleteJournalLimits limits) {
 	if (range.start < 0 || range.start >= range.end) {
 		throw InternalException("A recluster task requires a valid row group range");
+	}
+	auto range_size = NumericCast<idx_t>(range.end - range.start);
+	if (limits.max_slots == 0) {
+		limits.max_slots = range_size;
+	}
+	if (limits.max_rowids == 0) {
+		limits.max_rowids = range_size;
+	}
+	return limits;
+}
+
+RangeTask::RangeTask(recluster_task_id_t task_id_p, RowGroupRange range_p,
+                     ReclusterDeleteJournalLimits delete_journal_limits)
+    : task_id(task_id_p), range(range_p), control(static_cast<uint16_t>(RangeTaskState::STARTING)),
+      delete_journal(NormalizeDeleteJournalLimits(range, delete_journal_limits)) {
+	if (task_id == recluster_task_id_t(0, 0)) {
+		throw InternalException("A recluster task requires a non-zero task ID");
 	}
 }
 
-RangeTask::RangeTask(recluster_task_id_t task_id_p, unique_ptr<ReclusterTaskContext> task_context_p)
+RangeTask::RangeTask(recluster_task_id_t task_id_p, unique_ptr<ReclusterTaskContext> task_context_p,
+                     ReclusterDeleteJournalLimits delete_journal_limits)
     : task_id(task_id_p), range(GetTaskContextRange(task_context_p)),
-      control(static_cast<uint16_t>(RangeTaskState::STARTING)), task_context(std::move(task_context_p)) {
+      control(static_cast<uint16_t>(RangeTaskState::STARTING)),
+      delete_journal(NormalizeDeleteJournalLimits(range, delete_journal_limits)),
+      task_context(std::move(task_context_p)) {
 	if (task_id == recluster_task_id_t(0, 0)) {
 		throw InternalException("A recluster task requires a non-zero task ID");
-	}
-	if (range.start < 0 || range.start >= range.end) {
-		throw InternalException("A recluster task requires a valid row group range");
 	}
 }
 
@@ -53,6 +67,28 @@ const ReclusterTaskContext &RangeTask::GetTaskContext() const {
 		throw InternalException("Recluster task has no execution context");
 	}
 	return *task_context;
+}
+
+optional_ptr<ReclusterDeleteSlot> RangeTask::TryReserveDeleteSlot(vector<row_t> old_rowids) noexcept {
+	for (auto row_id : old_rowids) {
+		if (!range.Contains(row_id)) {
+			return nullptr;
+		}
+	}
+	return delete_journal.TryReserve(std::move(old_rowids));
+}
+
+bool RangeTask::ResolveDeleteSlot(ReclusterDeleteSlot &slot, DeleteSlotState target) noexcept {
+	return delete_journal.Resolve(slot, target);
+}
+
+ReclusterDeleteJournalScan RangeTask::ScanResolvedDeletes(delete_sequence_t after_sequence, idx_t max_slots,
+                                                          idx_t max_rowids) const {
+	return delete_journal.ScanResolved(after_sequence, max_slots, max_rowids);
+}
+
+delete_sequence_t RangeTask::GetLatestDeleteSequence() const {
+	return delete_journal.GetLatestSequence();
 }
 
 RangeTaskState RangeTask::DecodeState(uint16_t control) {
