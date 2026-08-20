@@ -105,6 +105,8 @@ public:
 
 	//! Whether or not the storage was dropped
 	bool is_dropped = false;
+	//! Whether transaction-local changes have invalidated all organization labels.
+	bool force_unsorted_on_commit = false;
 
 public:
 	void InitializeScan(CollectionScanState &state, optional_ptr<TableFilterSet> table_filters = nullptr);
@@ -119,6 +121,8 @@ public:
 	ErrorData AppendToIndexes(DuckTransaction &transaction, RowGroupCollection &source, TableIndexList &index_list,
 	                          const vector<LogicalType> &table_types, row_t &start_row);
 	void AppendToDeleteIndexes(Vector &row_ids, DataChunk &delete_chunk);
+	void ForceUnsortedOnCommit();
+	void VerifyUnsortedOnCommit();
 
 	//! Create an optimistic row group collection for this table.
 	//! Returns the index into the optimistic_collections vector for newly created collection.
@@ -191,7 +195,8 @@ public:
 	                      CollectionScanState &scan_state);
 
 	//! Begin appending to the local storage
-	void InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry);
+	void InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry,
+	                      const AppendOrganization &organization);
 	//! Initialize the storage and its indexes, but no row groups.
 	void InitializeStorage(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry);
 

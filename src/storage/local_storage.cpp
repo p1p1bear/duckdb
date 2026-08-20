@@ -113,6 +113,7 @@ void LocalTableStorage::PublishAlter(LocalTableStorage &parent, DuckTableEntry &
 	delete_indexes.Move(parent.delete_indexes);
 	index_append_mode = parent.index_append_mode;
 	is_dropped = parent.is_dropped;
+	force_unsorted_on_commit = parent.force_unsorted_on_commit;
 	table_entry = new_entry;
 	if (has_unpublished_alter_cleanup) {
 		D_ASSERT(alter_cleanup);
@@ -185,6 +186,44 @@ void LocalTableStorage::WriteNewRowGroup(idx_t flushed_row_group_idx) {
 	optimistic_writer.WriteNewRowGroup(*row_groups, flushed_row_group_idx);
 }
 
+void LocalTableStorage::ForceUnsortedOnCommit() {
+	force_unsorted_on_commit = true;
+	auto live_rows = GetCollection().GetTotalRows() - deleted_rows;
+	row_groups->ForceUnsorted(live_rows);
+
+	lock_guard<mutex> guard(collections_lock);
+	for (auto &collection : optimistic_collections) {
+		if (collection) {
+			collection->ForceUnsorted(collection->collection->GetTotalRows());
+		}
+	}
+}
+
+void LocalTableStorage::VerifyUnsortedOnCommit() {
+	auto verify_collection = [](OptimisticWriteCollection &collection, idx_t expected_count) {
+		collection.VerifyAppendSpans(expected_count);
+		for (auto &span : collection.append_spans) {
+			if (span.organization != AppendOrganization::Unsorted()) {
+				throw InternalException("Sorted append span remains after forcing transaction-local storage unsorted");
+			}
+		}
+		for (idx_t row_group_idx = 0; row_group_idx < collection.collection->GetRowGroupCount(); row_group_idx++) {
+			auto row_group = collection.collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+			if (!row_group || row_group->GetSortMetadata().IsSorted() || row_group->IsSealed()) {
+				throw InternalException("Sorted row group remains after forcing transaction-local storage unsorted");
+			}
+		}
+	};
+
+	verify_collection(*row_groups, GetCollection().GetTotalRows() - deleted_rows);
+	lock_guard<mutex> guard(collections_lock);
+	for (auto &collection : optimistic_collections) {
+		if (collection) {
+			verify_collection(*collection, collection->collection->GetTotalRows());
+		}
+	}
+}
+
 void LocalTableStorage::FlushBlocks() {
 	auto &collection = *row_groups->collection;
 	const idx_t row_group_size = collection.GetRowGroupSize();
@@ -237,13 +276,36 @@ ErrorData LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, RowGr
 
 void LocalTableStorage::AppendToTable(DuckTransaction &transaction, TableAppendState &append_state) {
 	auto &table = table_ref.get();
-	table.InitializeAppend(transaction, append_state);
-	auto &collection = *row_groups->collection;
+	auto &source = *row_groups;
+	auto &collection = *source.collection;
+	source.VerifyAppendSpans(collection.GetTotalRows() - deleted_rows);
+	AppendOrganizationSpanCursor span_cursor(source.append_spans);
+	bool append_initialized = false;
 	for (auto &table_chunk : collection.Chunks(transaction)) {
-		// Append to the base table.
-		table.Append(table_chunk, append_state);
+		idx_t chunk_offset = 0;
+		while (chunk_offset < table_chunk.size()) {
+			if (span_cursor.AtSpanStart()) {
+				table.InitializeAppend(transaction, append_state, span_cursor.GetOrganization());
+				append_initialized = true;
+			}
+
+			auto append_count = MinValue<idx_t>(span_cursor.Remaining(), table_chunk.size() - chunk_offset);
+			DataChunk append_chunk;
+			append_chunk.InitializeEmpty(table_chunk.GetTypes());
+			append_chunk.Slice(table_chunk, chunk_offset, chunk_offset + append_count);
+			table.Append(append_chunk, append_state);
+			chunk_offset += append_count;
+
+			if (span_cursor.Advance(append_count)) {
+				table.FinalizeAppend(transaction, append_state);
+				append_initialized = false;
+			}
+		}
 	}
-	table.FinalizeAppend(transaction, append_state);
+	span_cursor.VerifyFinished();
+	if (append_initialized) {
+		throw InternalException("Transaction-local append ended inside an organization span");
+	}
 }
 
 void LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, TableAppendState &append_state) {
@@ -521,11 +583,14 @@ bool LocalStorage::NextParallelScan(ClientContext &context, DataTable &table, Pa
 	return storage->GetCollection().NextParallelScan(context, state, scan_state);
 }
 
-void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
+void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry,
+                                    const AppendOrganization &organization) {
 	state.storage = &table_manager.GetOrCreateStorage(context, table);
 	state.storage->table_entry = &table_entry;
-	state.storage->GetCollection().InitializeAppend(TransactionData(transaction), state.append_state,
-	                                                AppendOrganization::Unsorted());
+	auto effective_organization =
+	    state.storage->force_unsorted_on_commit ? AppendOrganization::Unsorted() : organization;
+	state.storage->GetPrimaryCollection().InitializeAppend(TransactionData(transaction), state.append_state,
+	                                                       effective_organization);
 }
 
 void LocalStorage::InitializeStorage(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
@@ -591,7 +656,7 @@ void LocalStorage::Append(LocalAppendState &state, DuckTableEntry &table_entry, 
 	}
 
 	// Append the chunk to the local storage.
-	auto flushed_row_group_idx = storage->GetCollection().Append(table_chunk, state.append_state);
+	auto flushed_row_group_idx = storage->GetPrimaryCollection().Append(table_chunk, state.append_state);
 
 	// Check if we should pre-emptively flush blocks to disk.
 	if (flushed_row_group_idx.IsValid()) {
@@ -600,12 +665,15 @@ void LocalStorage::Append(LocalAppendState &state, DuckTableEntry &table_entry, 
 }
 
 void LocalStorage::FinalizeAppend(LocalAppendState &state) {
-	state.storage->GetCollection().FinalizeAppend(state.append_state.transaction, state.append_state);
+	state.storage->GetPrimaryCollection().FinalizeAppend(state.append_state.transaction, state.append_state);
 }
 
 void LocalStorage::LocalMerge(DataTable &table, DuckTableEntry &table_entry, OptimisticWriteCollection &collection) {
 	auto &storage = table_manager.GetOrCreateStorage(context, table);
 	storage.table_entry = &table_entry;
+	if (storage.force_unsorted_on_commit) {
+		collection.ForceUnsorted(collection.collection->GetTotalRows());
+	}
 	if (!storage.append_indexes.Empty()) {
 		// append data to indexes if required
 		row_t base_id = MAX_ROW_ID + NumericCast<row_t>(storage.GetCollection().GetNextRowId());
@@ -666,6 +734,9 @@ idx_t LocalStorage::Delete(DataTable &table, DuckTableEntry &table_entry, Vector
 	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	idx_t delete_count = storage->GetCollection().Delete(TransactionData(0, 0), table_entry, ids, count);
 	storage->deleted_rows += delete_count;
+	if (delete_count > 0) {
+		storage->ForceUnsortedOnCommit();
+	}
 	return delete_count;
 }
 
@@ -677,6 +748,7 @@ void LocalStorage::Update(DataTable &table, DuckTableEntry &table_entry, Vector 
 
 	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	storage->GetCollection().Update(TransactionData(0, 0), table_entry, ids, column_ids, updates);
+	storage->ForceUnsortedOnCommit();
 }
 
 void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_ptr<StorageCommitState> commit_state) {
@@ -695,6 +767,12 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 
 	TableAppendState append_state;
 	table.AppendLock(transaction, append_state);
+	auto append_start = append_state.row_start;
+	if (storage.force_unsorted_on_commit) {
+		storage.VerifyUnsortedOnCommit();
+	} else {
+		storage.GetPrimaryCollection().VerifyAppendSpans(storage.GetCollection().GetTotalRows());
+	}
 	if ((append_state.row_start == 0 || storage.GetCollection().GetTotalRows() >= row_group_size) &&
 	    storage.deleted_rows == 0) {
 		// table is currently empty OR we are bulk appending: move over the storage directly
@@ -716,7 +794,7 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 	}
 	// table_entry is set through the append path (InitializeAppend/Append/LocalMerge/Alter)
 	D_ASSERT(storage.table_entry);
-	transaction.PushAppend(*storage.table_entry, NumericCast<idx_t>(append_state.row_start), append_count);
+	transaction.PushAppend(*storage.table_entry, NumericCast<idx_t>(append_start), append_count);
 
 #ifdef DEBUG
 	// Verify that our index memory is stable.

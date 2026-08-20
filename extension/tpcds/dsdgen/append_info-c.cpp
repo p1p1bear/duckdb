@@ -32,9 +32,8 @@ tpcds_append_information::tpcds_append_information(duckdb::ClientContext &contex
 		table_entry = table->Cast<duckdb::DuckTableEntry>();
 		optimistic_writer = duckdb::make_uniq<duckdb::OptimisticDataWriter>(context_p, table_entry->GetStorage());
 		auto collection = optimistic_writer->CreateCollection(table_entry->GetStorage(), types, partial_manager_type);
-		auto &row_collection = *collection->collection;
-		row_collection.InitializeEmpty();
-		row_collection.InitializeAppend(append_state, duckdb::AppendOrganization::Unsorted());
+		collection->collection->InitializeEmpty();
+		collection->InitializeAppend(append_state, duckdb::AppendOrganization::Unsorted());
 		optimistic_collection_index =
 		    table_entry->GetStorage().CreateOptimisticCollection(context, std::move(collection));
 		optimistic_collection = table_entry->GetStorage().GetOptimisticCollection(context, optimistic_collection_index);
@@ -139,8 +138,7 @@ void tpcds_append_information::FlushChunk() {
 	} else {
 		D_ASSERT(optimistic_writer);
 		D_ASSERT(optimistic_collection);
-		auto &row_collection = *optimistic_collection->collection;
-		auto flushed_row_group_idx = row_collection.Append(chunk, append_state);
+		auto flushed_row_group_idx = optimistic_collection->Append(chunk, append_state);
 		if (flushed_row_group_idx.IsValid()) {
 			optimistic_writer->WriteNewRowGroup(*optimistic_collection, flushed_row_group_idx.GetIndex());
 		}
@@ -157,8 +155,7 @@ void tpcds_append_information::FinalizeOptimisticAppend() {
 	}
 	FlushChunk();
 	duckdb::TransactionData transaction_data(0, 0);
-	auto &row_collection = *optimistic_collection->collection;
-	row_collection.FinalizeAppend(transaction_data, append_state);
+	optimistic_collection->FinalizeAppend(transaction_data, append_state);
 	finalized = true;
 }
 
@@ -198,7 +195,8 @@ void tpcds_append_information::FlushOptimistic() {
 		auto binder = duckdb::Binder::CreateBinder(context);
 		auto bound_constraints = binder->BindConstraints(table);
 		duckdb::LocalAppendState local_append_state;
-		storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints);
+		storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints,
+		                              duckdb::AppendOrganization::Unsorted());
 		auto &transaction = duckdb::DuckTransaction::Get(context, table.catalog);
 		for (auto &insert_chunk : row_collection.Chunks(transaction)) {
 			storage.LocalAppend(local_append_state, table, context, insert_chunk, false);

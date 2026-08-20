@@ -56,11 +56,15 @@ struct AppendOrganization {
 		return sort_order_id == other.sort_order_id && run_id == other.run_id &&
 		       seal_last_row_group == other.seal_last_row_group;
 	}
+
+	bool operator!=(const AppendOrganization &other) const {
+		return !(*this == other);
+	}
 };
 
 struct AppendOrganizationSpan {
-	idx_t collection_offset;
-	idx_t physical_count;
+	idx_t collection_offset = 0;
+	idx_t physical_count = 0;
 	AppendOrganization organization;
 };
 

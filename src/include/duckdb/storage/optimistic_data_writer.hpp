@@ -8,11 +8,28 @@
 
 #pragma once
 
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/common/set.hpp"
 
 namespace duckdb {
 class PartialBlockManager;
+
+class AppendOrganizationSpanCursor {
+public:
+	explicit AppendOrganizationSpanCursor(const vector<AppendOrganizationSpan> &spans_p);
+
+	const AppendOrganization &GetOrganization() const;
+	idx_t Remaining() const;
+	bool AtSpanStart() const;
+	bool Advance(idx_t count);
+	void VerifyFinished() const;
+
+private:
+	const vector<AppendOrganizationSpan> &spans;
+	idx_t span_index = 0;
+	idx_t span_offset = 0;
+};
 
 struct OptimisticWriteCollection {
 	~OptimisticWriteCollection();
@@ -23,8 +40,17 @@ struct OptimisticWriteCollection {
 	idx_t unflushed_data_size = 0;
 	idx_t prev_allocated_size = 0;
 	vector<unique_ptr<PartialBlockManager>> partial_block_managers;
+	vector<AppendOrganizationSpan> append_spans;
 
 	void MergeStorage(OptimisticWriteCollection &collection);
+	void InitializeAppend(TransactionData transaction, TableAppendState &state, const AppendOrganization &organization);
+	void InitializeAppend(TableAppendState &state, const AppendOrganization &organization);
+	optional_idx Append(DataChunk &chunk, TableAppendState &state);
+	void FinalizeAppend(TransactionData transaction, TableAppendState &state);
+	void AddAppendSpan(idx_t collection_offset, idx_t physical_count, const AppendOrganization &organization);
+	idx_t GetAppendSpanCount() const;
+	void VerifyAppendSpans(idx_t expected_count) const;
+	void ForceUnsorted(idx_t output_count);
 	void FinalizeFlush();
 };
 

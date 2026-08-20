@@ -289,7 +289,8 @@ static idx_t PerformOnConflictAction(InsertLocalState &lstate, InsertGlobalState
 	if (!op.parallel && op.return_chunk) {
 		gstate.return_collection.Append(append_chunk);
 	}
-	data_table.LocalAppend(table, context.client, append_chunk, op.bound_constraints, row_ids, append_chunk);
+	data_table.LocalAppend(table, context.client, append_chunk, op.bound_constraints, row_ids, append_chunk,
+	                       AppendOrganization::Unsorted());
 	return update_chunk.size();
 }
 
@@ -625,7 +626,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 			gstate.return_collection.Append(insert_chunk);
 		}
 		// When action_type is throw, we already verify constraints in `OnConflictHandling`
-		storage.LocalAppend(table, context.client, insert_chunk, bound_constraints,
+		storage.LocalAppend(table, context.client, insert_chunk, bound_constraints, AppendOrganization::Unsorted(),
 		                    action_type == OnConflictAction::THROW);
 		if (action_type == OnConflictAction::UPDATE && lstate.update_chunk.size() != 0) {
 			(void)HandleInsertConflicts<true>(table, context, lstate, gstate, lstate.update_chunk, *this);
@@ -644,9 +645,8 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 		lstate.optimistic_writer = make_uniq<OptimisticDataWriter>(context.client, data_table);
 		// Create the local row group collection.
 		auto optimistic_collection = lstate.optimistic_writer->CreateCollection(storage, insert_types);
-		auto &collection = *optimistic_collection->collection;
-		collection.InitializeEmpty();
-		collection.InitializeAppend(lstate.local_append_state, AppendOrganization::Unsorted());
+		optimistic_collection->collection->InitializeEmpty();
+		optimistic_collection->InitializeAppend(lstate.local_append_state, AppendOrganization::Unsorted());
 
 		lstate.collection_index =
 		    data_table.CreateOptimisticCollection(context.client, std::move(optimistic_collection));
@@ -656,8 +656,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 	D_ASSERT(action_type != OnConflictAction::UPDATE);
 
 	auto &optimistic_collection = data_table.GetOptimisticCollection(context.client, lstate.collection_index);
-	auto &collection = *optimistic_collection.collection;
-	auto flushed_row_group_idx = collection.Append(insert_chunk, lstate.local_append_state);
+	auto flushed_row_group_idx = optimistic_collection.Append(insert_chunk, lstate.local_append_state);
 	if (flushed_row_group_idx.IsValid()) {
 		lstate.optimistic_writer->WriteNewRowGroup(optimistic_collection, flushed_row_group_idx.GetIndex());
 	}
@@ -684,7 +683,7 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	auto &data_table = gstate.table.GetStorage();
 	auto &optimistic_collection = data_table.GetOptimisticCollection(context.client, lstate.collection_index);
 	auto &collection = *optimistic_collection.collection;
-	collection.FinalizeAppend(tdata, lstate.local_append_state);
+	optimistic_collection.FinalizeAppend(tdata, lstate.local_append_state);
 
 	auto append_count = collection.GetTotalRows();
 
@@ -693,7 +692,8 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	if (append_count < row_group_size) {
 		// we have few rows - append to the local storage directly
 		LocalAppendState append_state;
-		storage.InitializeLocalAppend(append_state, table, context.client, bound_constraints);
+		storage.InitializeLocalAppend(append_state, table, context.client, bound_constraints,
+		                              AppendOrganization::Unsorted());
 		auto &transaction = DuckTransaction::Get(context.client, table.catalog);
 		for (auto &insert_chunk : collection.Chunks(transaction)) {
 			storage.LocalAppend(append_state, table, context.client, insert_chunk, false);

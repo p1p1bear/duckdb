@@ -120,29 +120,31 @@ public:
 
 	//! Initializes appending to transaction-local storage
 	void InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
-	                           const vector<unique_ptr<BoundConstraint>> &bound_constraints);
+	                           const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+	                           const AppendOrganization &organization);
 	//! Initializes only the delete-indexes of the transaction-local storage
 	void InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
 	                            const vector<unique_ptr<BoundConstraint>> &bound_constraints);
 	//! Append a DataChunk to the transaction-local storage of the table.
 	void LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry, ClientContext &context, DataChunk &chunk,
-	                 bool unsafe);
+	                 bool constraints_verified);
 	//! Finalizes a transaction-local append
 	void FinalizeLocalAppend(LocalAppendState &state);
 	//! Append a chunk to the transaction-local storage of this table and update the delete indexes.
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, Vector &row_ids,
-	                 DataChunk &delete_chunk);
+	                 DataChunk &delete_chunk, const AppendOrganization &organization);
 	//! Appends to the transaction-local storage of this table
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
-	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool unsafe = false);
+	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+	                 const AppendOrganization &organization, bool constraints_verified);
 	//! Append a chunk to the transaction-local storage of this table.
 	void LocalWALAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                    const vector<unique_ptr<BoundConstraint>> &bound_constraints);
 	//! Append a column data collection with default values to the transaction-local storage of this table.
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, ColumnDataCollection &collection,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints,
-	                 optional_ptr<const vector<LogicalIndex>> column_ids);
+	                 optional_ptr<const vector<LogicalIndex>> column_ids, const AppendOrganization &organization);
 	//! Merge a row group collection into the transaction-local storage
 	void LocalMerge(ClientContext &context, DuckTableEntry &table_entry, OptimisticWriteCollection &collection);
 	//! Create an optimistic row group collection for this table. Used for optimistically writing parallel appends.
@@ -181,7 +183,8 @@ public:
 	//! Fetches an append lock
 	void AppendLock(DuckTransaction &transaction, TableAppendState &state);
 	//! Begin appending structs to this table, obtaining necessary locks, etc
-	void InitializeAppend(DuckTransaction &transaction, TableAppendState &state);
+	void InitializeAppend(DuckTransaction &transaction, TableAppendState &state,
+	                      const AppendOrganization &organization);
 	//! Append a chunk to the table using the AppendState obtained from InitializeAppend
 	void Append(DataChunk &chunk, TableAppendState &state);
 	//! Finalize an append

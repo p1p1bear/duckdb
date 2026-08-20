@@ -1059,14 +1059,15 @@ string DataTable::TableModification() const {
 }
 
 void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
-                                      const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+                                      const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                                      const AppendOrganization &organization) {
 	if (!IsMainTable()) {
 		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
 		                           "a different transaction",
 		                           GetTableName(), TableModification());
 	}
 	auto &local_storage = LocalStorage::Get(context, db);
-	local_storage.InitializeAppend(state, *this, table);
+	local_storage.InitializeAppend(state, *this, table, organization);
 	state.constraint_state = InitializeConstraintState(table, bound_constraints);
 }
 
@@ -1084,7 +1085,7 @@ void DataTable::InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &
 }
 
 void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry, ClientContext &context,
-                            DataChunk &chunk, bool unsafe) {
+                            DataChunk &chunk, bool constraints_verified) {
 	if (chunk.size() == 0) {
 		return;
 	}
@@ -1097,7 +1098,7 @@ void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry
 
 	// Insert any row ids into the DELETE ART and verify constraints afterward.
 	// This happens only for the global indexes.
-	if (!unsafe) {
+	if (!constraints_verified) {
 		auto &constraint_state = *state.constraint_state;
 		VerifyAppendConstraints(constraint_state, context, chunk, *state.storage, nullptr);
 	}
@@ -1107,10 +1108,11 @@ void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry
 }
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
-                            const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool unsafe) {
+                            const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                            const AppendOrganization &organization, bool constraints_verified) {
 	LocalAppendState append_state;
-	InitializeLocalAppend(append_state, table, context, bound_constraints);
-	LocalAppend(append_state, table, context, chunk, unsafe);
+	InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
+	LocalAppend(append_state, table, context, chunk, constraints_verified);
 	FinalizeLocalAppend(append_state);
 }
 
@@ -1149,7 +1151,7 @@ void DataTable::LocalWALAppend(DuckTableEntry &table, ClientContext &context, Da
                                const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
 	LocalAppendState append_state;
 	auto &storage = table.GetStorage();
-	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
+	storage.InitializeLocalAppend(append_state, table, context, bound_constraints, AppendOrganization::Unsorted());
 
 	storage.LocalAppend(append_state, table, context, chunk, true);
 	append_state.storage->index_append_mode = IndexAppendMode::INSERT_DUPLICATES;
@@ -1158,10 +1160,10 @@ void DataTable::LocalWALAppend(DuckTableEntry &table, ClientContext &context, Da
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
                             const vector<unique_ptr<BoundConstraint>> &bound_constraints, Vector &row_ids,
-                            DataChunk &delete_chunk) {
+                            DataChunk &delete_chunk, const AppendOrganization &organization) {
 	LocalAppendState append_state;
 	auto &storage = table.GetStorage();
-	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
+	storage.InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
 	append_state.storage->AppendToDeleteIndexes(row_ids, delete_chunk);
 
 	storage.LocalAppend(append_state, table, context, chunk, false);
@@ -1170,10 +1172,11 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataC
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, ColumnDataCollection &collection,
                             const vector<unique_ptr<BoundConstraint>> &bound_constraints,
-                            optional_ptr<const vector<LogicalIndex>> column_ids) {
+                            optional_ptr<const vector<LogicalIndex>> column_ids,
+                            const AppendOrganization &organization) {
 	LocalAppendState append_state;
 	auto &storage = table.GetStorage();
-	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
+	storage.InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
 
 	if (!column_ids || column_ids->empty()) {
 		for (auto &chunk : collection.Chunks()) {
@@ -1271,12 +1274,13 @@ optional_idx DataTableInfo::CheckpointRowGroupCount(const CheckpointOptions &opt
 	return checkpoint_row_group_count;
 }
 
-void DataTable::InitializeAppend(DuckTransaction &transaction, TableAppendState &state) {
+void DataTable::InitializeAppend(DuckTransaction &transaction, TableAppendState &state,
+                                 const AppendOrganization &organization) {
 	// obtain the append lock for this table
 	if (!state.append_lock) {
 		throw InternalException("DataTable::AppendLock should be called before DataTable::InitializeAppend");
 	}
-	row_groups->InitializeAppend(transaction, state, AppendOrganization::Unsorted());
+	row_groups->InitializeAppend(transaction, state, organization);
 }
 
 void DataTable::Append(DataChunk &chunk, TableAppendState &state) {

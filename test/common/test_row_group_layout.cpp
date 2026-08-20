@@ -5,16 +5,19 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/optimistic_data_writer.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "test_helpers.hpp"
 
 using namespace duckdb; // NOLINT
@@ -53,6 +56,33 @@ static void AppendLayoutTestValue(RowGroupCollection &collection, int32_t value,
 	chunk.Initialize(collection.GetAllocator(), {LogicalType::INTEGER});
 	chunk.data[0].Append(Value::INTEGER(value));
 	chunk.SetChildCardinality(1);
+	collection.Append(chunk, append_state);
+	collection.FinalizeAppend(TransactionData::Committed(), append_state);
+}
+
+static duckdb::unique_ptr<OptimisticWriteCollection> MakeOptimisticLayoutTestCollection(Connection &con,
+                                                                                        const string &table_name) {
+	duckdb::unique_ptr<OptimisticWriteCollection> result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		OptimisticDataWriter writer(*con.context, entry.GetStorage());
+		result = writer.CreateCollection(entry.GetStorage(), entry.GetTypes());
+		result->collection->InitializeEmpty();
+	});
+	return result;
+}
+
+static void AppendOptimisticLayoutTestValues(OptimisticWriteCollection &collection,
+                                             const duckdb::vector<int32_t> &values,
+                                             const AppendOrganization &organization) {
+	TableAppendState append_state;
+	collection.InitializeAppend(TransactionData::Committed(), append_state, organization);
+	DataChunk chunk;
+	chunk.Initialize(collection.collection->GetAllocator(), {LogicalType::INTEGER});
+	for (auto value : values) {
+		chunk.data[0].Append(Value::INTEGER(value));
+	}
+	chunk.SetChildCardinality(values.size());
 	collection.Append(chunk, append_state);
 	collection.FinalizeAppend(TransactionData::Committed(), append_state);
 }
@@ -149,6 +179,121 @@ TEST_CASE("Row group append organization enforces run boundaries", "[storage][ro
 	AppendLayoutTestValue(*collection, 6, AppendOrganization::Unsorted());
 	REQUIRE(collection->GetRowGroupCount() == 5);
 	REQUIRE(collection->GetRowGroup(4)->count == 1);
+}
+
+TEST_CASE("Optimistic append spans survive ownership transfer and unsorted downgrade", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE optimistic_span_test (i INTEGER)"));
+
+	auto target = MakeOptimisticLayoutTestCollection(con, "optimistic_span_test");
+	auto first_source = MakeOptimisticLayoutTestCollection(con, "optimistic_span_test");
+	auto second_source = MakeOptimisticLayoutTestCollection(con, "optimistic_span_test");
+	AppendOptimisticLayoutTestValues(*target, {1}, AppendOrganization::Unsorted());
+	AppendOptimisticLayoutTestValues(*first_source, {2, 3}, AppendOrganization::Sorted(1, 1));
+	AppendOptimisticLayoutTestValues(*first_source, {4}, AppendOrganization::Sorted(1, 2));
+	AppendOptimisticLayoutTestValues(*second_source, {5, 6}, AppendOrganization::Unsorted());
+
+	target->MergeStorage(*first_source);
+	target->MergeStorage(*second_source);
+	target->VerifyAppendSpans(6);
+	REQUIRE(target->append_spans.size() == 4);
+	REQUIRE(target->append_spans[0].collection_offset == 0);
+	REQUIRE(target->append_spans[1].collection_offset == 1);
+	REQUIRE(target->append_spans[2].collection_offset == 3);
+	REQUIRE(target->append_spans[3].collection_offset == 4);
+	REQUIRE(first_source->append_spans.empty());
+	REQUIRE(second_source->append_spans.empty());
+
+	REQUIRE(target->collection->GetRowGroupCount() == 4);
+	REQUIRE(target->collection->GetRowGroup(1)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+	REQUIRE(target->collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
+
+	AppendOrganizationSpanCursor cursor(target->append_spans);
+	REQUIRE(cursor.Remaining() == 1);
+	REQUIRE(cursor.Advance(1));
+	REQUIRE(cursor.Remaining() == 2);
+	REQUIRE(!cursor.Advance(1));
+	REQUIRE(cursor.Advance(1));
+	REQUIRE(cursor.Advance(1));
+	REQUIRE(cursor.Advance(2));
+	cursor.VerifyFinished();
+
+	target->ForceUnsorted(5);
+	target->VerifyAppendSpans(5);
+	REQUIRE(target->append_spans.size() == 1);
+	REQUIRE(target->append_spans[0].organization == AppendOrganization::Unsorted());
+	for (idx_t row_group_idx = 0; row_group_idx < target->collection->GetRowGroupCount(); row_group_idx++) {
+		auto row_group = target->collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+		REQUIRE(row_group);
+		REQUIRE(!row_group->GetSortMetadata().IsSorted());
+		REQUIRE(!row_group->IsSealed());
+	}
+
+	AppendOptimisticLayoutTestValues(*target, {7}, AppendOrganization::Unsorted());
+	target->VerifyAppendSpans(6);
+	REQUIRE(target->append_spans.size() == 1);
+	REQUIRE(target->append_spans[0].physical_count == 6);
+}
+
+TEST_CASE("Transaction-local deletes make append organization sticky unsorted", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE local_span_delete_test (i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry =
+		    Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("local_span_delete_test")));
+		auto &table = entry.GetStorage();
+		MetaTransaction::Get(*con.context).ModifyDatabase(table.db, DatabaseModificationType());
+		auto binder = Binder::CreateBinder(*con.context);
+		auto bound_constraints = binder->BindConstraints(entry);
+
+		DataChunk first_chunk;
+		first_chunk.Initialize(*con.context, {LogicalType::INTEGER});
+		first_chunk.data[0].Append(Value::INTEGER(1));
+		first_chunk.data[0].Append(Value::INTEGER(2));
+		first_chunk.SetChildCardinality(2);
+		table.LocalAppend(entry, *con.context, first_chunk, bound_constraints, AppendOrganization::Sorted(1, 1), false);
+
+		auto &local_storage = LocalStorage::Get(*con.context, table.db);
+		auto local_table = local_storage.GetStorage(table);
+		REQUIRE(local_table);
+		REQUIRE(local_table->GetPrimaryCollection().append_spans[0].organization == AppendOrganization::Sorted(1, 1));
+
+		Vector row_ids(LogicalType::ROW_TYPE);
+		row_ids.Append(Value::BIGINT(MAX_ROW_ID));
+		REQUIRE(local_storage.Delete(table, entry, row_ids, 1) == 1);
+		REQUIRE(local_table->force_unsorted_on_commit);
+		local_table->GetPrimaryCollection().VerifyAppendSpans(1);
+		REQUIRE(local_table->GetPrimaryCollection().append_spans[0].organization == AppendOrganization::Unsorted());
+
+		DataChunk second_chunk;
+		second_chunk.Initialize(*con.context, {LogicalType::INTEGER});
+		second_chunk.data[0].Append(Value::INTEGER(3));
+		second_chunk.SetChildCardinality(1);
+		table.LocalAppend(entry, *con.context, second_chunk, bound_constraints, AppendOrganization::Sorted(1, 2),
+		                  false);
+		local_table->GetPrimaryCollection().VerifyAppendSpans(2);
+		REQUIRE(local_table->GetPrimaryCollection().append_spans.size() == 1);
+		REQUIRE(local_table->GetPrimaryCollection().append_spans[0].organization == AppendOrganization::Unsorted());
+	});
+
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+	auto result = con.Query("SELECT i FROM local_span_delete_test ORDER BY i");
+	REQUIRE_NO_FAIL(*result);
+	REQUIRE(CHECK_COLUMN(result, 0, {2, 3}));
+
+	duckdb::shared_ptr<RowGroupCollection> collection;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry =
+		    Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("local_span_delete_test")));
+		collection = entry.GetStorage().GetRowGroupCollection();
+	});
+	REQUIRE(collection->GetRowGroupCount() == 1);
+	REQUIRE(!collection->GetRowGroup(0)->GetSortMetadata().IsSorted());
+	REQUIRE(!collection->GetRowGroup(0)->IsSealed());
 }
 
 TEST_CASE("Table layout history cleanup keeps layouts needed by active transactions", "[storage][row_group_layout]") {
