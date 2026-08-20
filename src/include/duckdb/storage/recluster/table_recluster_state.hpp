@@ -38,6 +38,7 @@ public:
 	void ClearLastCheckpoint();
 	bool TryRegisterTask(shared_ptr<RangeTask> task);
 	shared_ptr<RangeTask> GetTask(recluster_task_id_t task_id) const;
+	shared_ptr<RangeTask> GetTaskForRow(row_t row_id) const;
 	vector<shared_ptr<RangeTask>> DisableAndGetTasks();
 	void RemoveTask(recluster_task_id_t task_id);
 	vector<RowGroupRange> GetReservedRanges() const;

@@ -12,6 +12,9 @@
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 #include "duckdb/transaction/undo_buffer.hpp"
 #include "duckdb/common/enums/active_transaction_state.hpp"
 
@@ -24,6 +27,8 @@ class CommitDropState;
 class DuckTableEntry;
 class RowGroupCollection;
 class RowVersionManager;
+class RangeTask;
+class ReclusterDeleteSlot;
 class DuckTransactionManager;
 class StorageLockKey;
 class StorageCommitState;
@@ -86,6 +91,9 @@ public:
 
 	void PushDelete(DuckTableEntry &table_entry, RowVersionManager &info, idx_t vector_idx, row_t rows[], idx_t count,
 	                idx_t base_row);
+	void RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[], idx_t count) noexcept;
+	ErrorData PrepareReclusterCommit() noexcept;
+	void ResolveReclusterDeletes(bool committed) noexcept;
 	void PushSequenceUsage(SequenceCatalogEntry &entry, const SequenceData &data);
 	void PushAppend(DuckTableEntry &table_entry, idx_t row_start, idx_t row_count);
 	UndoBufferReference CreateUpdateInfo(DuckTableEntry &table_entry, idx_t type_size, idx_t entries,
@@ -109,7 +117,9 @@ public:
 
 	void SetIsCheckpointTransaction() {
 		is_checkpoint_transaction = true;
+		SetIsReclusterMaintenanceTransaction();
 	}
+	void SetIsReclusterMaintenanceTransaction();
 
 private:
 	void HoldReclusterWriteLock(DataTableInfo &info, bool exclusive);
@@ -152,6 +162,15 @@ private:
 		std::exception_ptr failure;
 	};
 	reference_map_t<DataTableInfo, shared_ptr<HeldDDLCoordination>> ddl_coordination_locks;
+	enum class ReclusterDeleteTransactionState : uint8_t { RECORDING, PREPARING, PREPARED, RESOLVED };
+	struct PendingTaskDeletes {
+		shared_ptr<RangeTask> task;
+		vector<row_t> old_rowids;
+		optional_ptr<ReclusterDeleteSlot> slot;
+	};
+	ReclusterDeleteTransactionState recluster_delete_state = ReclusterDeleteTransactionState::RECORDING;
+	unordered_map<recluster_task_id_t, PendingTaskDeletes> pending_recluster_deletes;
+	bool is_recluster_maintenance_transaction = false;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };

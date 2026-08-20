@@ -185,6 +185,8 @@ public:
 
 	//! Fetches an append lock
 	void AppendLock(DuckTransaction &transaction, TableAppendState &state);
+	//! Verify commit-time recluster coordination before acquiring database commit locks.
+	void PrepareReclusterCommit(DuckTransaction &transaction);
 	//! Begin appending structs to this table, obtaining necessary locks, etc
 	void InitializeAppend(DuckTransaction &transaction, TableAppendState &state,
 	                      const AppendOrganization &organization);
@@ -324,6 +326,7 @@ public:
 
 private:
 	void HoldReclusterWriteGate(ClientContext &context, const char *operation);
+	void HoldReclusterWriteGate(DuckTransaction &transaction, const char *operation);
 	void VerifyCurrentForDML(DuckTransaction &transaction, const char *operation) const;
 
 	//! Verify the new added constraints against current persistent&local data

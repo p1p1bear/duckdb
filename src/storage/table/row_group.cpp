@@ -2153,6 +2153,8 @@ void VersionDeleteState::Flush() {
 		// now push the delete into the undo buffer, but only if any deletes were actually performed
 		transaction.transaction->PushDelete(table_entry, info.GetOrCreateVersionInfo(), current_chunk, rows,
 		                                    actual_delete_count, base_row + chunk_row);
+		transaction.transaction->RecordReclusterDeletes(info.GetTableInfo(), NumericCast<row_t>(base_row + chunk_row),
+		                                                rows, actual_delete_count);
 	}
 	count = 0;
 }

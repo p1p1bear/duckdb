@@ -1090,16 +1090,30 @@ void DataTable::VerifyCurrentForDML(DuckTransaction &transaction, const char *op
 
 void DataTable::HoldReclusterWriteGate(ClientContext &context, const char *operation) {
 	auto &transaction = DuckTransaction::Get(context, db);
-	VerifyCurrentForDML(transaction, operation);
-	if (info->HasSortStorage()) {
-		transaction.HoldSharedReclusterWriteLock(*info);
+	HoldReclusterWriteGate(transaction, operation);
+}
+
+void DataTable::HoldReclusterWriteGate(DuckTransaction &transaction, const char *operation) {
+	if (!info->HasSortStorage()) {
+		return;
 	}
 	VerifyCurrentForDML(transaction, operation);
+	transaction.HoldSharedReclusterWriteLock(*info);
+	VerifyCurrentForDML(transaction, operation);
+}
+
+void DataTable::PrepareReclusterCommit(DuckTransaction &transaction) {
+	HoldReclusterWriteGate(transaction, "commit to");
 }
 
 void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
                                       const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                       const AppendOrganization &organization) {
+	if (!IsMainTable()) {
+		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
+		                           "a different transaction",
+		                           GetTableName(), TableModification());
+	}
 	HoldReclusterWriteGate(context, "insert into");
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.InitializeAppend(state, *this, table, organization);
@@ -1108,6 +1122,11 @@ void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &t
 
 void DataTable::InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
                                        const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	if (!IsMainTable()) {
+		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
+		                           "a different transaction",
+		                           GetTableName(), TableModification());
+	}
 	HoldReclusterWriteGate(context, "insert into");
 
 	auto &local_storage = LocalStorage::Get(context, db);

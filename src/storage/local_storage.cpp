@@ -402,6 +402,7 @@ shared_ptr<LocalTableStorage> LocalTableManager::GetStorageShared(DataTable &tab
 
 LocalTableStorage &LocalTableManager::GetOrCreateStorage(ClientContext &context, DataTable &table) {
 	lock_guard<mutex> l(table_storage_lock);
+	has_recluster_storage = has_recluster_storage || table.GetDataTableInfo()->HasSortStorage();
 	auto entry = table_storage.find(table);
 	if (entry == table_storage.end()) {
 		auto new_storage = make_shared_ptr<LocalTableStorage>(context, table);
@@ -434,6 +435,23 @@ reference_map_t<DataTable, shared_ptr<LocalTableStorage>> LocalTableManager::Mov
 	return std::move(table_storage);
 }
 
+vector<shared_ptr<LocalTableStorage>> LocalTableManager::GetStorages() const {
+	lock_guard<mutex> l(table_storage_lock);
+	vector<shared_ptr<LocalTableStorage>> result;
+	result.reserve(table_storage.size());
+	for (auto &entry : table_storage) {
+		if (entry.second) {
+			result.push_back(entry.second);
+		}
+	}
+	return result;
+}
+
+bool LocalTableManager::HasReclusterStorage() const {
+	lock_guard<mutex> l(table_storage_lock);
+	return has_recluster_storage;
+}
+
 idx_t LocalTableManager::EstimatedSize() const {
 	lock_guard<mutex> l(table_storage_lock);
 	idx_t estimated_size = 0;
@@ -449,6 +467,7 @@ idx_t LocalTableManager::EstimatedSize() const {
 void LocalTableManager::InsertEntry(DataTable &table, shared_ptr<LocalTableStorage> entry) {
 	lock_guard<mutex> l(table_storage_lock);
 	D_ASSERT(table_storage.find(table) == table_storage.end());
+	has_recluster_storage = has_recluster_storage || table.GetDataTableInfo()->HasSortStorage();
 	table_storage[table] = std::move(entry);
 }
 
@@ -485,6 +504,7 @@ void LocalTableManager::PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, D
 		prepared_storage->second->table_ref = new_dt;
 		prepared_storage->second->table_entry = new_entry;
 	}
+	has_recluster_storage = has_recluster_storage || new_dt.GetDataTableInfo()->HasSortStorage();
 	table_storage.erase(old_storage);
 }
 
@@ -950,6 +970,14 @@ TableIndexList &LocalStorage::GetIndexes(ClientContext &context, DataTable &tabl
 
 optional_ptr<LocalTableStorage> LocalStorage::GetStorage(DataTable &table) {
 	return table_manager.GetStorage(table);
+}
+
+vector<shared_ptr<LocalTableStorage>> LocalStorage::GetTableStorages() const {
+	return table_manager.GetStorages();
+}
+
+bool LocalStorage::HasReclusterTableStorage() const {
+	return table_manager.HasReclusterStorage();
 }
 
 void LocalStorage::VerifyNewConstraint(DataTable &parent, const BoundConstraint &constraint) {

@@ -32,6 +32,24 @@ static ErrorData BuildAutocheckpointError(AttachedDatabase &db, const std::excep
 	return ErrorData(original.Type(), msg);
 }
 
+class ReclusterCommitPreparationGuard {
+public:
+	explicit ReclusterCommitPreparationGuard(DuckTransaction &transaction_p) : transaction(transaction_p) {
+	}
+	~ReclusterCommitPreparationGuard() {
+		if (active) {
+			transaction.ResolveReclusterDeletes(false);
+		}
+	}
+	void Dismiss() noexcept {
+		active = false;
+	}
+
+private:
+	DuckTransaction &transaction;
+	bool active = true;
+};
+
 void DuckCleanupInfo::Cleanup() {
 	for (auto &transaction : transactions) {
 		if (transaction->awaiting_cleanup) {
@@ -297,6 +315,8 @@ void DuckTransactionManager::CleanupTransactions() {
 
 ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction_p) {
 	auto &transaction = transaction_p.Cast<DuckTransaction>();
+	ReclusterCommitPreparationGuard recluster_preparation_guard(transaction);
+	auto error = transaction.PrepareReclusterCommit();
 	unique_lock<mutex> t_lock(transaction_lock);
 	if (!db.IsSystem() && !db.IsTemporary()) {
 		if (transaction.ChangesMade()) {
@@ -310,8 +330,8 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// check if we can checkpoint
 	unique_ptr<StorageLockKey> lock;
 	auto undo_properties = transaction.GetUndoProperties();
-	auto checkpoint_decision = CanCheckpoint(transaction, lock, undo_properties);
-	ErrorData error;
+	auto checkpoint_decision =
+	    error.HasError() ? CheckpointDecision(error.Message()) : CanCheckpoint(transaction, lock, undo_properties);
 	unique_lock<mutex> held_wal_lock;
 	unique_ptr<StorageCommitState> commit_state;
 	bool skip_wal_write_due_to_checkpoint = false;
@@ -329,7 +349,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 			skip_wal_write_due_to_checkpoint = true;
 		}
 	}
-	bool should_write_to_wal = transaction.ShouldWriteToWAL(db);
+	bool should_write_to_wal = !error.HasError() && transaction.ShouldWriteToWAL(db);
 	if (should_write_to_wal) {
 		auto &storage_manager = db.GetStorageManager().Cast<SingleFileStorageManager>();
 		// if we are committing changes and we are not doing a "checkpoint instead of WAL write"
@@ -369,7 +389,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		}
 	}
 	// in-memory databases don't have a WAL - we estimate how large their changeset is based on the undo properties
-	if (!db.IsSystem()) {
+	if (!error.HasError() && !db.IsSystem()) {
 		auto &storage_manager = db.GetStorageManager();
 		if (storage_manager.InMemory() || db.GetRecoveryMode() == RecoveryMode::NO_WAL_WRITES) {
 			storage_manager.AddWALSize(undo_properties.estimated_size);
@@ -397,12 +417,16 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		transaction.commit_id = 0;
 
 		auto rollback_error = transaction.Rollback();
+		transaction.ResolveReclusterDeletes(false);
+		recluster_preparation_guard.Dismiss();
 		if (rollback_error.HasError()) {
 			throw FatalException(
 			    "Failed to rollback transaction. Cannot continue operation.\nOriginal Error: %s\nRollback Error: %s",
 			    error.Message(), rollback_error.Message());
 		}
 	} else {
+		transaction.ResolveReclusterDeletes(true);
+		recluster_preparation_guard.Dismiss();
 		DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
 		last_commit = info.commit_id;
 
@@ -480,6 +504,7 @@ void DuckTransactionManager::RollbackTransaction(Transaction &transaction_p) {
 		// Obtain the transaction lock and roll back.
 		lock_guard<mutex> t_lock(transaction_lock);
 		error = transaction.Rollback();
+		transaction.ResolveReclusterDeletes(false);
 		transaction.ReleaseReclusterWriteLocks();
 
 		// Remove the transaction from the list of active transactions and gather cleanup information.

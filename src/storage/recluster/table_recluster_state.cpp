@@ -127,6 +127,23 @@ shared_ptr<RangeTask> TableReclusterState::GetTask(recluster_task_id_t task_id) 
 	return entry == tasks.end() ? nullptr : entry->second;
 }
 
+shared_ptr<RangeTask> TableReclusterState::GetTaskForRow(row_t row_id) const {
+	lock_guard<mutex> guard(task_lock);
+	auto range_entry = reserved_ranges.upper_bound(row_id);
+	if (range_entry == reserved_ranges.begin()) {
+		return nullptr;
+	}
+	range_entry--;
+	if (!range_entry->second.range.Contains(row_id)) {
+		return nullptr;
+	}
+	auto task_entry = tasks.find(range_entry->second.task_id);
+	if (task_entry == tasks.end()) {
+		return nullptr;
+	}
+	return task_entry->second;
+}
+
 vector<shared_ptr<RangeTask>> TableReclusterState::DisableAndGetTasks() {
 	lock_guard<mutex> guard(task_lock);
 	vector<shared_ptr<RangeTask>> result;

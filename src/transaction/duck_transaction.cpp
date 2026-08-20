@@ -22,8 +22,12 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/range_task.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -42,6 +46,7 @@ DuckTransaction::DuckTransaction(DuckTransactionManager &manager, ClientContext 
 }
 
 DuckTransaction::~DuckTransaction() {
+	ResolveReclusterDeletes(false);
 	ReleaseReclusterWriteLocks();
 }
 
@@ -124,6 +129,156 @@ void DuckTransaction::PushDelete(DuckTableEntry &table_entry, RowVersionManager 
 			delete_rows[i] = NumericCast<uint16_t>(rows[i]);
 		}
 	}
+}
+
+static void CancelTaskForDeleteJournalFailure(const shared_ptr<RangeTask> &task) noexcept {
+	if (!task) {
+		return;
+	}
+	task->DisablePublishForJournalFailure();
+	task->RequestCancel();
+}
+
+void DuckTransaction::RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[],
+                                             idx_t count) noexcept {
+	if (count == 0 || !info.HasSortStorage()) {
+		return;
+	}
+	auto state = info.GetReclusterState();
+	if (!state) {
+		return;
+	}
+
+	auto first_row_id = vector_base + rows[0];
+	auto task = state->GetTaskForRow(first_row_id);
+	if (!task || task->IsCancelRequested() || task->IsPublishForbidden() || task->IsFinished()) {
+		return;
+	}
+	for (idx_t row_index = 0; row_index < count; row_index++) {
+		if (rows[row_index] < 0 || !task->GetRange().Contains(vector_base + rows[row_index])) {
+			CancelTaskForDeleteJournalFailure(task);
+			return;
+		}
+	}
+
+	bool cancel_task = false;
+	{
+		lock_guard<mutex> guard(recluster_transaction_lock);
+		if (is_recluster_maintenance_transaction) {
+			return;
+		}
+		if (recluster_delete_state != ReclusterDeleteTransactionState::RECORDING) {
+			cancel_task = true;
+		} else {
+			try {
+				auto entry = pending_recluster_deletes.find(task->GetTaskId());
+				if (entry == pending_recluster_deletes.end()) {
+					PendingTaskDeletes pending;
+					pending.task = task;
+					pending.old_rowids.reserve(count);
+					for (idx_t row_index = 0; row_index < count; row_index++) {
+						pending.old_rowids.push_back(vector_base + rows[row_index]);
+					}
+					pending_recluster_deletes.emplace(task->GetTaskId(), std::move(pending));
+				} else if (entry->second.task.get() != task.get() || entry->second.slot ||
+				           count > entry->second.old_rowids.max_size() - entry->second.old_rowids.size()) {
+					cancel_task = true;
+					pending_recluster_deletes.erase(entry);
+				} else {
+					auto &old_rowids = entry->second.old_rowids;
+					old_rowids.reserve(old_rowids.size() + count);
+					for (idx_t row_index = 0; row_index < count; row_index++) {
+						old_rowids.push_back(vector_base + rows[row_index]);
+					}
+				}
+			} catch (...) {
+				pending_recluster_deletes.erase(task->GetTaskId());
+				cancel_task = true;
+			}
+		}
+	}
+	if (cancel_task) {
+		CancelTaskForDeleteJournalFailure(task);
+	}
+}
+
+ErrorData DuckTransaction::PrepareReclusterCommit() noexcept {
+	try {
+		if (storage->HasReclusterTableStorage()) {
+			for (auto &local_table : storage->GetTableStorages()) {
+				if (local_table->is_dropped ||
+				    local_table->GetCollection().GetTotalRows() <= local_table->deleted_rows) {
+					continue;
+				}
+				local_table->table_ref.get().PrepareReclusterCommit(*this);
+			}
+		}
+	} catch (std::exception &ex) {
+		return ErrorData(ex);
+	}
+
+	vector<reference<PendingTaskDeletes>> ordered_deletes;
+	{
+		lock_guard<mutex> guard(recluster_transaction_lock);
+		if (recluster_delete_state != ReclusterDeleteTransactionState::RECORDING) {
+			return ErrorData();
+		}
+		recluster_delete_state = ReclusterDeleteTransactionState::PREPARING;
+		try {
+			ordered_deletes.reserve(pending_recluster_deletes.size());
+			for (auto &entry : pending_recluster_deletes) {
+				ordered_deletes.emplace_back(entry.second);
+			}
+			std::sort(ordered_deletes.begin(), ordered_deletes.end(),
+			          [](const reference<PendingTaskDeletes> &left, const reference<PendingTaskDeletes> &right) {
+				          return left.get().task->GetTaskId() < right.get().task->GetTaskId();
+			          });
+		} catch (...) {
+			for (auto &entry : pending_recluster_deletes) {
+				CancelTaskForDeleteJournalFailure(entry.second.task);
+			}
+			recluster_delete_state = ReclusterDeleteTransactionState::PREPARED;
+			return ErrorData();
+		}
+	}
+
+	for (auto &pending_ref : ordered_deletes) {
+		auto &pending = pending_ref.get();
+		if (pending.task->IsCancelRequested() || pending.task->IsPublishForbidden() || pending.task->IsFinished()) {
+			continue;
+		}
+		auto slot = pending.task->TryReserveDeleteSlot(std::move(pending.old_rowids));
+		if (!slot) {
+			CancelTaskForDeleteJournalFailure(pending.task);
+			continue;
+		}
+		pending.slot = slot;
+	}
+
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	D_ASSERT(recluster_delete_state == ReclusterDeleteTransactionState::PREPARING);
+	recluster_delete_state = ReclusterDeleteTransactionState::PREPARED;
+	return ErrorData();
+}
+
+void DuckTransaction::ResolveReclusterDeletes(bool committed) noexcept {
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	auto target = committed ? DeleteSlotState::COMMITTED : DeleteSlotState::ABORTED;
+	for (auto &entry : pending_recluster_deletes) {
+		auto &pending = entry.second;
+		if (pending.slot && !pending.task->ResolveDeleteSlot(*pending.slot, target)) {
+			CancelTaskForDeleteJournalFailure(pending.task);
+		}
+	}
+	pending_recluster_deletes.clear();
+	recluster_delete_state = ReclusterDeleteTransactionState::RESOLVED;
+}
+
+void DuckTransaction::SetIsReclusterMaintenanceTransaction() {
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	D_ASSERT(recluster_delete_state == ReclusterDeleteTransactionState::RECORDING);
+	D_ASSERT(pending_recluster_deletes.empty());
+	is_recluster_maintenance_transaction = true;
 }
 
 void DuckTransaction::PushAppend(DuckTableEntry &table_entry, idx_t start_row, idx_t row_count) {

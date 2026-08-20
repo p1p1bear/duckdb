@@ -151,6 +151,8 @@ class LocalTableManager {
 public:
 	shared_ptr<LocalTableStorage> MoveEntry(DataTable &table);
 	reference_map_t<DataTable, shared_ptr<LocalTableStorage>> MoveEntries();
+	vector<shared_ptr<LocalTableStorage>> GetStorages() const;
+	bool HasReclusterStorage() const;
 	optional_ptr<LocalTableStorage> GetStorage(DataTable &table) const;
 	shared_ptr<LocalTableStorage> GetStorageShared(DataTable &table) const;
 	LocalTableStorage &GetOrCreateStorage(ClientContext &context, DataTable &table);
@@ -166,6 +168,7 @@ public:
 private:
 	mutable mutex table_storage_lock;
 	reference_map_t<DataTable, shared_ptr<LocalTableStorage>> table_storage;
+	bool has_recluster_storage = false;
 };
 
 //! The LocalStorage class holds appends that have not been committed yet
@@ -254,6 +257,8 @@ public:
 	bool CanFetch(DataTable &table, const row_t row_id);
 	TableIndexList &GetIndexes(ClientContext &context, DataTable &table);
 	optional_ptr<LocalTableStorage> GetStorage(DataTable &table);
+	vector<shared_ptr<LocalTableStorage>> GetTableStorages() const;
+	bool HasReclusterTableStorage() const;
 
 	void VerifyNewConstraint(DataTable &parent, const BoundConstraint &constraint);
 
