@@ -95,3 +95,30 @@ TEST_CASE("Table recluster state reserves non-overlapping ranges", "[storage][re
 	REQUIRE(!state.AcceptsNewTasks());
 	REQUIRE(!state.TryRegisterTask(MakeRangeTask(4, 20, 30)));
 }
+
+TEST_CASE("Table recluster state installs snapshots for the active catalog generation", "[storage][recluster_state]") {
+	TableReclusterState state(99);
+	auto table_id = hugeint_t(7, 11);
+	state.SynchronizeCatalog(table_id, 3, 17, true);
+	REQUIRE(state.AcceptsNewTasks());
+	REQUIRE(state.GetTableId() == table_id);
+	REQUIRE(state.GetCurrentSortOrderId() == 3);
+	REQUIRE(state.GetCurrentStorageGenerationId() == 17);
+	REQUIRE(!state.GetLastCheckpoint());
+
+	CheckpointLayoutSnapshot snapshot;
+	snapshot.checkpoint_number = 8;
+	snapshot.storage_generation_id = 17;
+	REQUIRE(!state.TryInstallCheckpointSnapshot(4, 17, snapshot));
+	REQUIRE(!state.TryInstallCheckpointSnapshot(3, 18, snapshot));
+	REQUIRE(state.TryInstallCheckpointSnapshot(3, 17, snapshot));
+	REQUIRE(state.GetLastCheckpoint() == snapshot);
+
+	state.SynchronizeCatalog(table_id, 3, 17, true);
+	REQUIRE(state.GetLastCheckpoint() == snapshot);
+	state.SynchronizeCatalog(table_id, 3, 18, true);
+	REQUIRE(!state.GetLastCheckpoint());
+	state.SynchronizeCatalog(table_id, INVALID_SORT_ORDER_ID, 18, true);
+	REQUIRE(!state.AcceptsNewTasks());
+	REQUIRE_THROWS_AS(state.SynchronizeCatalog(hugeint_t(8, 11), 3, 18, true), InternalException);
+}

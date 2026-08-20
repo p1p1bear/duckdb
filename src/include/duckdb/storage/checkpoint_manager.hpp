@@ -10,6 +10,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 
 namespace duckdb {
 
@@ -171,6 +172,8 @@ private:
 	CheckpointOptions options;
 	//! Block usage count for verification purposes
 	unordered_map<block_id_t, idx_t> verify_block_usage_count;
+	uint64_t recluster_checkpoint_number = 0;
+	vector<PendingCheckpointTableState> pending_recluster_states;
 };
 
 } // namespace duckdb

@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/delete_state.hpp"
@@ -81,6 +82,19 @@ const TableSortStorageState &DataTableInfo::GetSortStorage() const {
 		throw InternalException("Table does not have sort storage state");
 	}
 	return *sort_storage;
+}
+
+shared_ptr<TableReclusterState> DataTableInfo::GetOrCreateReclusterState(uint64_t initialization_token) {
+	lock_guard<mutex> guard(recluster_state_lock);
+	if (!recluster_state) {
+		recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
+	}
+	return recluster_state;
+}
+
+shared_ptr<TableReclusterState> DataTableInfo::GetReclusterState() const {
+	lock_guard<mutex> guard(recluster_state_lock);
+	return recluster_state;
 }
 
 bool DataTableInfo::IsTemporary() const {

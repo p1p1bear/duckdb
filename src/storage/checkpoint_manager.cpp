@@ -30,6 +30,7 @@
 #include "duckdb/storage/checkpoint/table_data_reader.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -199,6 +200,10 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		// don't checkpoint invalidated databases
 		return;
 	}
+	auto &recluster_manager = db.GetReclusterManager();
+	auto layout_publish_lock = recluster_manager.GetExclusiveLayoutPublishLock();
+	recluster_checkpoint_number = recluster_manager.BeginCheckpoint();
+	pending_recluster_states.clear();
 	// assert that the checkpoint manager hasn't been used before
 	D_ASSERT(!metadata_writer);
 
@@ -367,6 +372,7 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		index_list.MergeCheckpointDeltas(options.transaction_id);
 	}
 	active_checkpoint.Commit();
+	recluster_manager.OnCheckpointSuccess(std::move(pending_recluster_states));
 }
 
 void CheckpointReader::LoadCheckpoint(CatalogTransaction transaction, MetadataReader &reader) {
@@ -404,6 +410,9 @@ void SingleFileCheckpointReader::LoadFromStorage() {
 	MetadataReader reader(metadata_manager, meta_block);
 	auto transaction = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
 	LoadCheckpoint(transaction, reader);
+	if (storage.GetAttached().HasReclusterManager()) {
+		storage.GetAttached().GetReclusterManager().InitializeCheckpointTables();
+	}
 }
 
 void CheckpointWriter::WriteEntry(CatalogEntry &entry, Serializer &serializer) {
@@ -703,6 +712,13 @@ void SingleFileCheckpointWriter::WriteTable(TableCatalogEntry &table, Serializer
 	auto writer = GetTableDataWriter(table);
 	if (writer) {
 		writer->WriteTableData(serializer, *table_lock);
+	}
+	if (table.IsDuckTable()) {
+		auto pending =
+		    db.GetReclusterManager().PrepareCheckpoint(table.Cast<DuckTableEntry>(), recluster_checkpoint_number);
+		if (pending) {
+			pending_recluster_states.push_back(std::move(*pending));
+		}
 	}
 }
 

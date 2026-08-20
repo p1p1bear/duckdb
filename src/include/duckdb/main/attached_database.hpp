@@ -21,6 +21,7 @@ class StorageManager;
 class TransactionManager;
 class StorageExtension;
 class DatabaseManager;
+class ReclusterManager;
 
 struct AttachInfo;
 struct StoredDatabasePath;
@@ -119,6 +120,10 @@ public:
 	const StorageManager &GetStorageManager() const;
 	Catalog &GetCatalog();
 	TransactionManager &GetTransactionManager();
+	bool HasReclusterManager() const {
+		return recluster_manager != nullptr;
+	}
+	ReclusterManager &GetReclusterManager();
 	DatabaseInstance &GetDatabase() {
 		return db;
 	}
@@ -180,6 +185,7 @@ private:
 	unique_ptr<StorageManager> storage;
 	unique_ptr<Catalog> catalog;
 	unique_ptr<TransactionManager> transaction_manager;
+	unique_ptr<ReclusterManager> recluster_manager;
 	AttachedDatabaseType type;
 	optional_ptr<Catalog> parent_catalog;
 	optional_ptr<StorageExtension> storage_extension;

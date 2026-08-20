@@ -7,6 +7,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/storage_compatibility.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 
@@ -106,7 +107,8 @@ optional<RowGroupPhysicalIdentity> ComputeRowGroupPhysicalIdentityV1(const RowGr
 	RowGroupPhysicalIdentity result;
 	result.start = row_start;
 	result.count = row_group.count.load();
-	result.sealed = row_group.IsSealed();
+	// A checkpointed row group in a table with sort history will not accept more rows, even without a sort label.
+	result.sealed = row_group.IsSealed() || row_group.GetTableInfo().HasSortStorage();
 	result.sort_metadata = row_group.GetSortMetadata();
 	result.columns.reserve(columns.size());
 	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {

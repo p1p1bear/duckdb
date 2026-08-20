@@ -21,6 +21,61 @@ void TableReclusterState::SetAcceptNewTasks(bool accept) {
 	accept_new_tasks = accept;
 }
 
+void TableReclusterState::SynchronizeCatalog(persistent_table_id_t table_id_p, sort_order_id_t sort_order_id,
+                                             uint64_t storage_generation_id, bool accept_new_tasks_p) {
+	lock_guard<mutex> guard(task_lock);
+	if (table_id_p == hugeint_t(0, 0)) {
+		throw InternalException("A table recluster state requires a non-zero persistent table ID");
+	}
+	if (table_id != hugeint_t(0, 0) && table_id != table_id_p) {
+		throw InternalException("A table recluster state cannot change its persistent table ID");
+	}
+	table_id = table_id_p;
+	if (current_sort_order_id != sort_order_id || current_storage_generation_id != storage_generation_id) {
+		last_checkpoint.reset();
+	}
+	current_sort_order_id = sort_order_id;
+	current_storage_generation_id = storage_generation_id;
+	accept_new_tasks = accept_new_tasks_p && sort_order_id != INVALID_SORT_ORDER_ID;
+}
+
+persistent_table_id_t TableReclusterState::GetTableId() const {
+	lock_guard<mutex> guard(task_lock);
+	return table_id;
+}
+
+sort_order_id_t TableReclusterState::GetCurrentSortOrderId() const {
+	lock_guard<mutex> guard(task_lock);
+	return current_sort_order_id;
+}
+
+uint64_t TableReclusterState::GetCurrentStorageGenerationId() const {
+	lock_guard<mutex> guard(task_lock);
+	return current_storage_generation_id;
+}
+
+bool TableReclusterState::TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
+                                                       CheckpointLayoutSnapshot snapshot) noexcept {
+	lock_guard<mutex> guard(task_lock);
+	if (!accept_new_tasks || current_sort_order_id != sort_order_id ||
+	    current_storage_generation_id != storage_generation_id ||
+	    snapshot.storage_generation_id != storage_generation_id) {
+		return false;
+	}
+	last_checkpoint = std::move(snapshot);
+	return true;
+}
+
+optional<CheckpointLayoutSnapshot> TableReclusterState::GetLastCheckpoint() const {
+	lock_guard<mutex> guard(task_lock);
+	return last_checkpoint;
+}
+
+void TableReclusterState::ClearLastCheckpoint() {
+	lock_guard<mutex> guard(task_lock);
+	last_checkpoint.reset();
+}
+
 bool TableReclusterState::RangeIsAvailable(const RowGroupRange &range) const {
 	auto next = reserved_ranges.lower_bound(range.start);
 	if (next != reserved_ranges.end() && next->second.range.Overlaps(range)) {

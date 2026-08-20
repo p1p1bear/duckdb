@@ -12,6 +12,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/main/database_path_and_type.hpp"
 #include "duckdb/main/valid_checker.hpp"
@@ -155,6 +156,9 @@ AttachedDatabase::AttachedDatabase(DatabaseInstance &db, Catalog &catalog_p, Ide
 	stored_database_path = std::move(options.stored_database_path);
 	storage = make_uniq<SingleFileStorageManager>(*this, std::move(file_path_p), options);
 	transaction_manager = make_uniq<DuckTransactionManager>(*this);
+	if (!storage->InMemory()) {
+		recluster_manager = make_uniq<ReclusterManager>(*this);
+	}
 	attach_options = options.options;
 	internal = true;
 }
@@ -188,6 +192,9 @@ AttachedDatabase::AttachedDatabase(DatabaseInstance &db, Catalog &catalog_p, Sto
 	if (!transaction_manager) {
 		throw InternalException(
 		    "AttachedDatabase - create_transaction_manager function did not return a transaction manager");
+	}
+	if (storage && !storage->InMemory()) {
+		recluster_manager = make_uniq<ReclusterManager>(*this);
 	}
 	attach_options = options.options;
 	internal = true;
@@ -297,6 +304,9 @@ void AttachedDatabase::Initialize(optional_ptr<ClientContext> context) {
 
 void AttachedDatabase::FinalizeLoad(optional_ptr<ClientContext> context) {
 	catalog->FinalizeLoad(context);
+	if (recluster_manager) {
+		recluster_manager->SynchronizeLoadedCatalog();
+	}
 }
 
 bool AttachedDatabase::HasStorageManager() const {
@@ -323,6 +333,13 @@ Catalog &AttachedDatabase::GetCatalog() {
 
 TransactionManager &AttachedDatabase::GetTransactionManager() {
 	return *transaction_manager;
+}
+
+ReclusterManager &AttachedDatabase::GetReclusterManager() {
+	if (!recluster_manager) {
+		throw InternalException("Attached database does not have persistent recluster state");
+	}
+	return *recluster_manager;
 }
 
 Catalog &AttachedDatabase::ParentCatalog() {
@@ -411,6 +428,7 @@ void AttachedDatabase::Close(const DatabaseCloseAction action) {
 }
 
 void AttachedDatabase::Cleanup() {
+	recluster_manager.reset();
 	transaction_manager.reset();
 	catalog.reset();
 	storage.reset();

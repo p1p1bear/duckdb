@@ -18,6 +18,7 @@ class DatabaseInstance;
 struct CheckpointOptions;
 class TableIOManager;
 class RowGroupCollection;
+class TableReclusterState;
 
 struct DataTableInfo {
 	friend class DataTable;
@@ -72,6 +73,8 @@ public:
 	bool HasSortStorage() const;
 	TableSortStorageState &GetSortStorage();
 	const TableSortStorageState &GetSortStorage() const;
+	shared_ptr<TableReclusterState> GetOrCreateReclusterState(uint64_t initialization_token);
+	shared_ptr<TableReclusterState> GetReclusterState() const;
 
 	Identifier GetSchemaName();
 	//! The full (possibly nested) schema path of the table
@@ -107,6 +110,9 @@ private:
 	//! Physical counters for tables that have SORTED BY history
 	unique_ptr<TableSortStorageState> sort_storage;
 	atomic<bool> sort_storage_initialized = false;
+	//! Optional runtime state for tables that have SORTED BY history
+	mutable mutex recluster_state_lock;
+	shared_ptr<TableReclusterState> recluster_state;
 };
 
 } // namespace duckdb
