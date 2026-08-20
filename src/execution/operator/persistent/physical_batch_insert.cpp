@@ -83,7 +83,7 @@ public:
 			// Merge all collections into one result collection.
 			auto &types = result_collection.GetTypes();
 			TableAppendState append_state;
-			result_collection.InitializeAppend(append_state);
+			result_collection.InitializeAppend(append_state, AppendOrganization::Unsorted());
 
 			DataChunk scan_chunk;
 			scan_chunk.Initialize(context, types);
@@ -206,7 +206,7 @@ public:
 		auto collection = optimistic_writer->CreateCollection(table_entry.GetStorage(), insert_types);
 		auto &row_collection = *collection->collection;
 		row_collection.InitializeEmpty();
-		row_collection.InitializeAppend(current_append_state);
+		row_collection.InitializeAppend(current_append_state, AppendOrganization::Unsorted());
 
 		auto &data_table = table_entry.GetStorage();
 		collection_index = data_table.CreateOptimisticCollection(context, std::move(collection));

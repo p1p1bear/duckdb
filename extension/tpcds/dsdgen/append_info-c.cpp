@@ -34,7 +34,7 @@ tpcds_append_information::tpcds_append_information(duckdb::ClientContext &contex
 		auto collection = optimistic_writer->CreateCollection(table_entry->GetStorage(), types, partial_manager_type);
 		auto &row_collection = *collection->collection;
 		row_collection.InitializeEmpty();
-		row_collection.InitializeAppend(append_state);
+		row_collection.InitializeAppend(append_state, duckdb::AppendOrganization::Unsorted());
 		optimistic_collection_index =
 		    table_entry->GetStorage().CreateOptimisticCollection(context, std::move(collection));
 		optimistic_collection = table_entry->GetStorage().GetOptimisticCollection(context, optimistic_collection_index);

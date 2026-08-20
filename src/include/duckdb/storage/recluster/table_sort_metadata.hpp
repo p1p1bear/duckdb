@@ -109,6 +109,10 @@ struct RowGroupSortMetadata {
 	bool operator==(const RowGroupSortMetadata &other) const {
 		return sort_order_id == other.sort_order_id && run_id == other.run_id;
 	}
+
+	bool operator!=(const RowGroupSortMetadata &other) const {
+		return !(*this == other);
+	}
 };
 
 } // namespace duckdb

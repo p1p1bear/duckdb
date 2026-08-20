@@ -1218,6 +1218,9 @@ void RowGroup::InitializeAppendInternal(RowGroupAppendState &append_state) {
 	if (!RefersToSameObject(append_state.row_group->GetNode(), *this)) {
 		throw InternalException("RowGroup::InitializeAppend mismatch - call RowGroupAppendState::InitializeAppend");
 	}
+	if (sealed) {
+		throw InternalException("Cannot append to a sealed row group");
+	}
 	append_state.offset_in_row_group = this->count;
 	// for each column, initialize the append state
 	append_state.states = make_unsafe_uniq_array<ColumnAppendState>(GetColumnCount());
@@ -1230,6 +1233,9 @@ void RowGroup::InitializeAppendInternal(RowGroupAppendState &append_state) {
 }
 
 void RowGroup::Append(RowGroupAppendState &state, DataChunk &chunk, idx_t append_count) {
+	if (sealed) {
+		throw InternalException("Cannot append to a sealed row group");
+	}
 	// append to the current row_group
 	D_ASSERT(chunk.ColumnCount() == GetColumnCount());
 	for (idx_t i = 0; i < GetColumnCount(); i++) {

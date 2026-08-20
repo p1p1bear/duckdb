@@ -12,6 +12,7 @@
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/planner/bound_constraint.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/transaction/transaction_data.hpp"
 
@@ -28,6 +29,40 @@ class RowGroupSegmentTree;
 class CheckpointLock;
 
 struct TableAppendState;
+
+struct AppendOrganization {
+	sort_order_id_t sort_order_id = INVALID_SORT_ORDER_ID;
+	sort_run_id_t run_id = INVALID_SORT_RUN_ID;
+	bool seal_last_row_group = false;
+
+	static AppendOrganization Unsorted() {
+		return {};
+	}
+
+	static AppendOrganization Sorted(sort_order_id_t order_id, sort_run_id_t run_id_p) {
+		return {order_id, run_id_p, true};
+	}
+
+	RowGroupSortMetadata GetSortMetadata() const {
+		return {sort_order_id, run_id};
+	}
+
+	bool IsValid() const {
+		auto metadata = GetSortMetadata();
+		return metadata.IsValid() && metadata.IsSorted() == seal_last_row_group;
+	}
+
+	bool operator==(const AppendOrganization &other) const {
+		return sort_order_id == other.sort_order_id && run_id == other.run_id &&
+		       seal_last_row_group == other.seal_last_row_group;
+	}
+};
+
+struct AppendOrganizationSpan {
+	idx_t collection_offset;
+	idx_t physical_count;
+	AppendOrganization organization;
+};
 
 struct SuballocationBlock {
 	//! The current block being allocated from.
@@ -120,6 +155,8 @@ struct TableAppendState {
 	TableStatistics stats;
 	//! Cached hash vector
 	Vector hashes;
+	AppendOrganization organization;
+	bool organization_initialized = false;
 };
 
 struct ConstraintState {

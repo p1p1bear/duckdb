@@ -1276,7 +1276,7 @@ void DataTable::InitializeAppend(DuckTransaction &transaction, TableAppendState 
 	if (!state.append_lock) {
 		throw InternalException("DataTable::AppendLock should be called before DataTable::InitializeAppend");
 	}
-	row_groups->InitializeAppend(transaction, state);
+	row_groups->InitializeAppend(transaction, state, AppendOrganization::Unsorted());
 }
 
 void DataTable::Append(DataChunk &chunk, TableAppendState &state) {

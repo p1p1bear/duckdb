@@ -29,6 +29,7 @@ class TableDataWriter;
 class TableIndexList;
 class TableStatistics;
 struct TableAppendState;
+struct AppendOrganization;
 class DuckTransaction;
 class BoundConstraint;
 class RowGroupSegmentTree;
@@ -93,7 +94,7 @@ public:
 
 	bool IsEmpty() const;
 
-	void AppendRowGroup(SegmentLock &l, idx_t start_row);
+	void AppendRowGroup(SegmentLock &l, idx_t start_row, const AppendOrganization &organization);
 	//! Get the nth row-group, negative numbers start from the back (so -1 is the last row group, etc)
 	optional_ptr<RowGroup> GetRowGroup(int64_t index);
 	//! Overrides a row group - should only be used if you know what you're doing (will likely be removed in the future)
@@ -129,10 +130,10 @@ public:
 	bool CanFetch(TransactionData, const row_t row_id);
 
 	//! Initialize an append of a variable number of rows. FinalizeAppend must be called after appending is done.
-	void InitializeAppend(TableAppendState &state);
+	void InitializeAppend(TableAppendState &state, const AppendOrganization &organization);
 	//! Initialize an append with a variable number of rows. FinalizeAppend should not be called after appending is
 	//! done.
-	void InitializeAppend(TransactionData transaction, TableAppendState &state);
+	void InitializeAppend(TransactionData transaction, TableAppendState &state, const AppendOrganization &organization);
 	//! Appends to the row group collection. Returns the finished row group index if a new row group has been appended
 	//! to
 	optional_idx Append(DataChunk &chunk, TableAppendState &state);

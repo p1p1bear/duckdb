@@ -646,7 +646,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 		auto optimistic_collection = lstate.optimistic_writer->CreateCollection(storage, insert_types);
 		auto &collection = *optimistic_collection->collection;
 		collection.InitializeEmpty();
-		collection.InitializeAppend(lstate.local_append_state);
+		collection.InitializeAppend(lstate.local_append_state, AppendOrganization::Unsorted());
 
 		lstate.collection_index =
 		    data_table.CreateOptimisticCollection(context.client, std::move(optimistic_collection));

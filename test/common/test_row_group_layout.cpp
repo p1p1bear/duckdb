@@ -45,6 +45,18 @@ static duckdb::shared_ptr<RowGroupSegmentTree> MakeLayoutTestTree(RowGroupCollec
 	return tree;
 }
 
+static void AppendLayoutTestValue(RowGroupCollection &collection, int32_t value,
+                                  const AppendOrganization &organization) {
+	TableAppendState append_state;
+	collection.InitializeAppend(TransactionData::Committed(), append_state, organization);
+	DataChunk chunk;
+	chunk.Initialize(collection.GetAllocator(), {LogicalType::INTEGER});
+	chunk.data[0].Append(Value::INTEGER(value));
+	chunk.SetChildCardinality(1);
+	collection.Append(chunk, append_state);
+	collection.FinalizeAppend(TransactionData::Committed(), append_state);
+}
+
 static duckdb::shared_ptr<const LayoutPatch> MakeEmptyReplacementPatch(row_t start, row_t end, uint64_t task_id) {
 	auto patch = make_shared_ptr<LayoutPatch>();
 	patch->task_id = hugeint_t(0, task_id);
@@ -93,6 +105,50 @@ TEST_CASE("Table layout history selects layouts by transaction start time", "[st
 	REQUIRE(history.GetForTransaction(19)->layout_version == 1);
 	REQUIRE(history.GetForTransaction(20)->layout_version == 2);
 	REQUIRE(history.GetCurrent()->layout_version == 2);
+}
+
+TEST_CASE("Row group append organization enforces run boundaries", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "append_organization_test");
+
+	TableAppendState uninitialized;
+	DataChunk chunk;
+	chunk.Initialize(collection->GetAllocator(), {LogicalType::INTEGER});
+	chunk.data[0].Append(Value::INTEGER(0));
+	chunk.SetChildCardinality(1);
+	REQUIRE_THROWS_AS(collection->Append(chunk, uninitialized), InternalException);
+
+	TableAppendState invalid;
+	REQUIRE_THROWS_AS(collection->InitializeAppend(invalid, AppendOrganization::Sorted(1, 0)), InternalException);
+
+	AppendLayoutTestValue(*collection, 1, AppendOrganization::Unsorted());
+	AppendLayoutTestValue(*collection, 2, AppendOrganization::Unsorted());
+	REQUIRE(collection->GetRowGroupCount() == 1);
+	auto unsorted = collection->GetRowGroup(0);
+	REQUIRE(unsorted);
+	REQUIRE(unsorted->count == 2);
+	REQUIRE(unsorted->GetSortMetadata() == RowGroupSortMetadata());
+	REQUIRE(!unsorted->IsSealed());
+
+	AppendLayoutTestValue(*collection, 3, AppendOrganization::Sorted(1, 1));
+	REQUIRE(collection->GetRowGroupCount() == 2);
+	auto first_run = collection->GetRowGroup(1);
+	REQUIRE(first_run);
+	REQUIRE(first_run->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+	REQUIRE(first_run->IsSealed());
+
+	AppendLayoutTestValue(*collection, 4, AppendOrganization::Sorted(1, 2));
+	AppendLayoutTestValue(*collection, 5, AppendOrganization::Unsorted());
+	REQUIRE(collection->GetRowGroupCount() == 4);
+	REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
+	REQUIRE(collection->GetRowGroup(2)->IsSealed());
+	REQUIRE(collection->GetRowGroup(3)->GetSortMetadata() == RowGroupSortMetadata());
+
+	collection->GetRowGroup(3)->SetSortMetadata({}, true);
+	AppendLayoutTestValue(*collection, 6, AppendOrganization::Unsorted());
+	REQUIRE(collection->GetRowGroupCount() == 5);
+	REQUIRE(collection->GetRowGroup(4)->count == 1);
 }
 
 TEST_CASE("Table layout history cleanup keeps layouts needed by active transactions", "[storage][row_group_layout]") {
@@ -577,7 +633,7 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	REQUIRE(trailing_gap->GetNextRowId() == 4096);
 
 	TableAppendState append_state;
-	trailing_gap->InitializeAppend(TransactionData::Committed(), append_state);
+	trailing_gap->InitializeAppend(TransactionData::Committed(), append_state, AppendOrganization::Unsorted());
 	DataChunk append_chunk;
 	append_chunk.Initialize(trailing_gap->GetAllocator(), {LogicalType::INTEGER});
 	append_chunk.data[0].Append(Value::INTEGER(5000));

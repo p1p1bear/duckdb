@@ -408,7 +408,10 @@ ColumnDataType GetColumnDataType(idx_t row_start) {
 	return ColumnDataType::MAIN_TABLE;
 }
 
-void RowGroupCollection::AppendRowGroup(SegmentLock &l, idx_t start_row) {
+void RowGroupCollection::AppendRowGroup(SegmentLock &l, idx_t start_row, const AppendOrganization &organization) {
+	if (!organization.IsValid()) {
+		throw InternalException("Invalid append organization");
+	}
 	auto new_row_group = make_uniq<RowGroup>(*this, 0U);
 	new_row_group->InitializeEmpty(types, GetColumnDataType(start_row));
 	owned_row_groups->AppendSegment(l, std::move(new_row_group), start_row);
@@ -844,7 +847,16 @@ bool RowGroupCollection::IsEmpty() const {
 	return row_groups->IsEmpty(l);
 }
 
-void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state) {
+void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state,
+                                          const AppendOrganization &organization) {
+	if (state.organization_initialized) {
+		throw InternalException("Table append state is already initialized");
+	}
+	if (!organization.IsValid()) {
+		throw InternalException("Invalid append organization");
+	}
+	state.organization = organization;
+	state.organization_initialized = true;
 	auto next_row_id = this->next_row_id.load();
 	D_ASSERT(next_row_id >= total_rows.load());
 	state.row_start = UnsafeNumericCast<row_t>(next_row_id);
@@ -860,18 +872,22 @@ void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppe
 	if (!needs_new_row_group) {
 		auto last_row_group = state.row_groups->GetLastSegment(l);
 		D_ASSERT(last_row_group->GetRowEnd() == state.row_groups->GetBaseRowId() + next_row_id);
-		if (info->GetIndexes().Empty() || GetVacuumIndexStrategy(GetAttached()) != VacuumIndexStrategy::KEEP_ROW_IDS) {
+		auto &last_row_group_node = last_row_group->GetNode();
+		needs_new_row_group =
+		    last_row_group_node.IsSealed() || last_row_group_node.GetSortMetadata() != organization.GetSortMetadata();
+		if (!needs_new_row_group && (info->GetIndexes().Empty() ||
+		                             GetVacuumIndexStrategy(GetAttached()) != VacuumIndexStrategy::KEEP_ROW_IDS)) {
 			// Honor SUGGEST_NEW if vacuum can compact the table later, either because there are no indexes or because
 			// the existing indexes can be rebuilt or remapped after vacuuming.
 			needs_new_row_group = row_group_append_mode == RowGroupAppendMode::SUGGEST_NEW;
-		} else {
+		} else if (!needs_new_row_group) {
 			// If the table has indexes that vacuum cannot rebuild, ignore row_group_append_mode and try to append,
 			// unless the last row group is full already.
-			needs_new_row_group = row_group_size < last_row_group->GetNode().count;
+			needs_new_row_group = row_group_size < last_row_group_node.count;
 		}
 	}
 	if (needs_new_row_group) {
-		AppendRowGroup(l, state.row_groups->GetBaseRowId() + next_row_id);
+		AppendRowGroup(l, state.row_groups->GetBaseRowId() + next_row_id, organization);
 	}
 	state.start_row_group = state.row_groups->GetLastSegment(l);
 	D_ASSERT(state.row_groups->GetBaseRowId() + next_row_id ==
@@ -885,12 +901,15 @@ void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppe
 	state.stats.InitializeEmpty(types);
 }
 
-void RowGroupCollection::InitializeAppend(TableAppendState &state) {
+void RowGroupCollection::InitializeAppend(TableAppendState &state, const AppendOrganization &organization) {
 	TransactionData tdata(0, 0);
-	InitializeAppend(tdata, state);
+	InitializeAppend(tdata, state, organization);
 }
 
 optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &state) {
+	if (!state.organization_initialized) {
+		throw InternalException("Table append state is not initialized");
+	}
 	const idx_t row_group_size = GetRowGroupSize();
 	D_ASSERT(chunk.ColumnCount() == types.size());
 	chunk.Verify(GetDatabase());
@@ -915,6 +934,7 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 		}
 		// finalize the append state for the current row group
 		current_row_group.FinalizeAppend(state.row_group_append_state);
+		current_row_group.SetSortMetadata(state.organization.GetSortMetadata(), state.organization.seal_last_row_group);
 		// we expect max 1 iteration of this loop (i.e. a single chunk should never overflow more than one
 		// row_group)
 		D_ASSERT(chunk.size() == remaining + append_count);
@@ -927,7 +947,7 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 		auto next_start = state.row_group_start + state.row_group_append_state.offset_in_row_group;
 
 		auto l = state.row_groups->Lock();
-		AppendRowGroup(l, next_start);
+		AppendRowGroup(l, next_start, state.organization);
 		// set up the append state for this row_group
 		auto last_row_group = state.row_groups->GetLastSegment(l);
 		RowGroup::InitializeAppend(*last_row_group, state.row_group_append_state);
@@ -946,9 +966,15 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 }
 
 void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppendState &state) {
+	if (!state.organization_initialized) {
+		throw InternalException("Table append state is not initialized");
+	}
 	// first finalize the append of the final row group we appended to
 	auto &last_row_group = state.row_group_append_state.row_group->GetNode();
 	last_row_group.FinalizeAppend(state.row_group_append_state);
+	if (state.total_append_count > 0) {
+		last_row_group.SetSortMetadata(state.organization.GetSortMetadata(), state.organization.seal_last_row_group);
+	}
 
 	// now push version info into all row groups
 	auto remaining = state.total_append_count;
@@ -966,6 +992,7 @@ void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppend
 
 	state.total_append_count = 0;
 	state.start_row_group = nullptr;
+	state.organization_initialized = false;
 
 	auto local_stats_lock = state.stats.GetLock();
 	auto global_stats_lock = stats.GetLock();

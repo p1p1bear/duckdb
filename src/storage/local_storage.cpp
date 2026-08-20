@@ -524,7 +524,8 @@ bool LocalStorage::NextParallelScan(ClientContext &context, DataTable &table, Pa
 void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
 	state.storage = &table_manager.GetOrCreateStorage(context, table);
 	state.storage->table_entry = &table_entry;
-	state.storage->GetCollection().InitializeAppend(TransactionData(transaction), state.append_state);
+	state.storage->GetCollection().InitializeAppend(TransactionData(transaction), state.append_state,
+	                                                AppendOrganization::Unsorted());
 }
 
 void LocalStorage::InitializeStorage(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
