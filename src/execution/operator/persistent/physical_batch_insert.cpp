@@ -185,6 +185,7 @@ public:
 	idx_t next_start = 0;
 	atomic<bool> optimistically_written;
 	idx_t minimum_memory_per_thread;
+	unique_ptr<AdaptiveSortedWrite> adaptive_sort;
 
 	bool ReadyToMerge(const idx_t count) const;
 	void ScheduleMergeTasks(ClientContext &context, const idx_t min_batch_index);
@@ -194,6 +195,9 @@ public:
 	                   const PhysicalIndex collection_index, optional_ptr<OptimisticDataWriter> writer = nullptr);
 
 	idx_t MaxThreads(const idx_t source_max_threads) override {
+		if (adaptive_sort) {
+			return source_max_threads;
+		}
 		// try to request 4MB per column per thread
 		memory_manager.SetMemorySize(source_max_threads * minimum_memory_per_thread);
 		// cap the concurrent threads working on this task based on the amount of available memory
@@ -212,6 +216,9 @@ public:
 	PhysicalIndex collection_index;
 	unique_ptr<OptimisticDataWriter> optimistic_writer;
 	unique_ptr<ConstraintState> constraint_state;
+	AdaptiveSortedWriteLocalState adaptive_sort;
+	idx_t adaptive_chunk_index = 0;
+	bool adaptive_batch_initialized = false;
 
 	void CreateNewCollection(ClientContext &context, DuckTableEntry &table_entry,
 	                         const vector<LogicalType> &insert_types) {
@@ -445,6 +452,9 @@ unique_ptr<GlobalSinkState> PhysicalBatchInsert::GetGlobalSinkState(ClientContex
 	static constexpr const idx_t MINIMUM_MEMORY_PER_COLUMN = 4ULL * 1024ULL * 1024ULL;
 	auto minimum_memory_per_thread = table->GetColumns().PhysicalColumnCount() * MINIMUM_MEMORY_PER_COLUMN;
 	auto result = make_uniq<BatchInsertGlobalState>(context, *table, minimum_memory_per_thread);
+	if (table->SortEnabled()) {
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
+	}
 	return std::move(result);
 }
 
@@ -481,6 +491,12 @@ SinkNextBatchType PhysicalBatchInsert::NextBatch(ExecutionContext &context, Oper
 	auto &memory_manager = gstate.memory_manager;
 
 	auto batch_index = lstate.partition_info.batch_index.GetIndex();
+	if (gstate.adaptive_sort) {
+		lstate.current_index = batch_index;
+		lstate.adaptive_chunk_index = 0;
+		lstate.adaptive_batch_initialized = true;
+		return SinkNextBatchType::READY;
+	}
 	if (lstate.collection_index.IsValid()) {
 		if (lstate.current_index == batch_index) {
 			throw InternalException("NextBatch called with the same batch index?");
@@ -515,6 +531,9 @@ SinkNextBatchType PhysicalBatchInsert::NextBatch(ExecutionContext &context, Oper
 SinkNextBatchType PhysicalBatchInsert::UpdateMinBatchIndex(ExecutionContext &,
                                                            OperatorSinkNextBatchInput &input) const {
 	auto &gstate = input.global_state.Cast<BatchInsertGlobalState>();
+	if (gstate.adaptive_sort) {
+		return SinkNextBatchType::READY;
+	}
 	gstate.memory_manager.UpdateMinBatchIndex(input.local_state.partition_info.min_batch_index.GetIndex());
 	return SinkNextBatchType::READY;
 }
@@ -532,6 +551,21 @@ SinkResultType PhysicalBatchInsert::Sink(ExecutionContext &context, DataChunk &i
 	insert_chunk.Flatten();
 
 	auto batch_index = lstate.partition_info.batch_index.GetIndex();
+	if (gstate.adaptive_sort) {
+		if (!lstate.adaptive_batch_initialized || lstate.current_index != batch_index) {
+			throw InternalException("PhysicalBatchInsert sink called before initializing its batch");
+		}
+		if (!lstate.constraint_state) {
+			lstate.constraint_state = table.GetStorage().InitializeConstraintState(table, bound_constraints);
+		}
+		auto &storage = table.GetStorage();
+		auto &local_storage = LocalStorage::Get(context.client, storage.db);
+		auto local_table_storage = local_storage.GetStorage(storage);
+		storage.VerifyAppendConstraints(*lstate.constraint_state, context.client, insert_chunk, local_table_storage,
+		                                nullptr);
+		auto token = InsertOrderToken::BatchOrder(batch_index, lstate.adaptive_chunk_index++);
+		return gstate.adaptive_sort->Sink(context, insert_chunk, lstate.adaptive_sort, token, input.interrupt_state);
+	}
 	// check if we should process this batch
 	if (!memory_manager.IsMinimumBatchIndex(batch_index)) {
 		memory_manager.UpdateMinBatchIndex(lstate.partition_info.min_batch_index.GetIndex());
@@ -590,6 +624,9 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 	auto &client_profiler = QueryProfiler::Get(context.client);
 	context.thread.profiler.Flush(*this);
 	client_profiler.Flush(context.thread.profiler);
+	if (gstate.adaptive_sort) {
+		return gstate.adaptive_sort->Combine(context, lstate.adaptive_sort, input.interrupt_state);
+	}
 
 	memory_manager.UpdateMinBatchIndex(lstate.partition_info.min_batch_index.GetIndex());
 
@@ -624,6 +661,10 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                OperatorSinkFinalizeInput &input) const {
 	auto &g_state = input.global_state.Cast<BatchInsertGlobalState>();
+	if (g_state.adaptive_sort) {
+		g_state.insert_count = g_state.adaptive_sort->TotalCount();
+		return g_state.adaptive_sort->Finalize(pipeline, event, *this, context, input.interrupt_state);
+	}
 	auto &table = g_state.table;
 	auto &data_table = g_state.table.GetStorage();
 	auto &memory_manager = g_state.memory_manager;

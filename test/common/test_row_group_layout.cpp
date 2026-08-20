@@ -847,5 +847,23 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(!collection->GetRowGroup(4)->IsSealed());
 		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
 	});
+
+	REQUIRE_NO_FAIL(con.Query("SET threads = 4"));
+	REQUIRE_NO_FAIL(con.Query("SET preserve_insertion_order = true"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE batch_source AS "
+	                          "SELECT (4095 - i)::INTEGER AS i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE batch_target(i INTEGER) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO batch_target SELECT i FROM batch_source"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("batch_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 2);
+		for (idx_t row_group_idx = 0; row_group_idx < 2; row_group_idx++) {
+			auto row_group = collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+			REQUIRE(row_group->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+			REQUIRE(row_group->IsSealed());
+		}
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+	});
 	DeleteDatabase(path);
 }

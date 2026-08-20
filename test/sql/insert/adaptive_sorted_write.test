@@ -125,6 +125,71 @@ SELECT count(*) FROM constrained_write
 ----
 0
 
+# An ordered parallel table scan selects PhysicalBatchInsert. Small writes retain
+# batch order, while large writes use the shared sorter.
+statement ok
+SET preserve_insertion_order = true
+
+statement ok
+CREATE TABLE batch_small_source AS
+SELECT 1023 - i AS i
+FROM range(1024) t(i)
+
+statement ok
+CREATE TABLE batch_small_write(i BIGINT) SORTED BY (i)
+
+query I
+INSERT INTO batch_small_write SELECT i FROM batch_small_source
+----
+1024
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS input_row
+    FROM batch_small_write
+)
+WHERE i != 1023 - input_row
+----
+0
+
+statement ok
+CREATE TABLE batch_large_source AS
+SELECT 16383 - i AS i
+FROM range(16384) t(i)
+
+statement ok
+CREATE TABLE batch_large_write(i BIGINT) SORTED BY (i)
+
+query I
+INSERT INTO batch_large_write SELECT i FROM batch_large_source
+----
+16384
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM batch_large_write
+)
+WHERE i != expected
+----
+0
+
+statement ok
+CREATE TABLE batch_ctas_write SORTED BY (i) AS
+SELECT i FROM batch_large_source
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM batch_ctas_write
+)
+WHERE i != expected
+----
+0
+
 # RETURNING retains the input order even though the storage copy is sorted.
 statement ok
 CREATE TABLE returning_write(i BIGINT) SORTED BY (i)
