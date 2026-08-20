@@ -14,6 +14,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
+#include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 
 namespace duckdb {
@@ -21,7 +22,15 @@ namespace duckdb {
 class AttachedDatabase;
 class DataTable;
 class DuckTableEntry;
+class RangeTask;
 class TableReclusterState;
+
+enum class ReclusterTaskStartStatus : uint8_t { STARTED, STALE_CANDIDATE, RANGE_UNAVAILABLE, CANCELLED };
+
+struct ReclusterTaskStartResult {
+	ReclusterTaskStartStatus status = ReclusterTaskStartStatus::STALE_CANDIDATE;
+	shared_ptr<RangeTask> task;
+};
 
 struct PendingCheckpointTableState {
 	persistent_table_id_t table_id = hugeint_t(0, 0);
@@ -44,12 +53,16 @@ public:
 	void InitializeCheckpointTables();
 	//! Called after WAL replay to synchronize the final recovered catalog without creating new candidates.
 	void SynchronizeLoadedCatalog();
+	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate);
 
 	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
 		return layout_publish_lock.GetSharedLock();
 	}
 	unique_ptr<StorageLockKey> GetExclusiveLayoutPublishLock() {
 		return layout_publish_lock.GetExclusiveLock();
+	}
+	unique_ptr<StorageLockKey> TryGetSharedLayoutPublishLock() {
+		return layout_publish_lock.TryGetSharedLock();
 	}
 
 private:

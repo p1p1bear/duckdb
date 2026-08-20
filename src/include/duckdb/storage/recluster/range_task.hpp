@@ -7,11 +7,14 @@
 
 #pragma once
 
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 
 #include <atomic>
 
 namespace duckdb {
+
+class ReclusterTaskContext;
 
 enum class RangeTaskState : uint8_t {
 	STARTING,
@@ -29,6 +32,8 @@ enum class RangeTaskState : uint8_t {
 class RangeTask {
 public:
 	RangeTask(recluster_task_id_t task_id, RowGroupRange range);
+	RangeTask(recluster_task_id_t task_id, unique_ptr<ReclusterTaskContext> task_context);
+	~RangeTask();
 
 	recluster_task_id_t GetTaskId() const {
 		return task_id;
@@ -41,6 +46,11 @@ public:
 	bool IsCancelRequested() const;
 	bool IsPublishForbidden() const;
 	bool IsFinished() const;
+	bool HasTaskContext() const {
+		return task_context != nullptr;
+	}
+	ReclusterTaskContext &GetTaskContext();
+	const ReclusterTaskContext &GetTaskContext() const;
 
 	void RequestCancel() noexcept;
 	void DisablePublishForJournalFailure() noexcept;
@@ -61,6 +71,7 @@ private:
 	recluster_task_id_t task_id;
 	RowGroupRange range;
 	std::atomic<uint16_t> control;
+	unique_ptr<ReclusterTaskContext> task_context;
 };
 
 } // namespace duckdb

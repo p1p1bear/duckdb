@@ -57,4 +57,9 @@ ReclusterCandidateSelection SelectReclusterCandidate(RowGroupCollection &collect
                                                      TableReclusterState &state,
                                                      const ReclusterCandidateLimits &limits);
 
+optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &collection,
+                                                          const vector<ColumnDefinition> &columns,
+                                                          TableReclusterState &state,
+                                                          const ReclusterCandidate &candidate);
+
 } // namespace duckdb

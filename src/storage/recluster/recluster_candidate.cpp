@@ -383,4 +383,124 @@ ReclusterCandidateSelection SelectReclusterCandidate(RowGroupCollection &collect
 	        nullopt};
 }
 
+static void ValidateCandidateEnvelope(const ReclusterCandidate &candidate) {
+	if (candidate.range.start < 0 || candidate.range.start >= candidate.range.end ||
+	    candidate.sort_order_id == INVALID_SORT_ORDER_ID || candidate.expected_row_groups.empty()) {
+		throw InternalException("Invalid recluster candidate envelope");
+	}
+	if (candidate.expected_row_groups.front().start != candidate.range.start ||
+	    GetIdentityRange(candidate.expected_row_groups.back()).end != candidate.range.end) {
+		throw InternalException("Recluster candidate range does not match its row groups");
+	}
+
+	idx_t physical_rows = 0;
+	idx_t row_group_count = 0;
+	idx_t run_count = 0;
+	RowGroupSortMetadata previous_metadata;
+	for (auto &identity : candidate.expected_row_groups) {
+		physical_rows = AddCount(physical_rows, identity.count);
+		row_group_count++;
+		if (identity.sort_metadata.sort_order_id == candidate.sort_order_id &&
+		    identity.sort_metadata != previous_metadata) {
+			run_count++;
+		}
+		previous_metadata = identity.sort_metadata;
+	}
+	if (candidate.input_physical_rows != physical_rows || candidate.row_group_count != row_group_count ||
+	    candidate.run_count != run_count || candidate.input_live_rows > candidate.input_physical_rows ||
+	    candidate.input_deleted_rows != candidate.input_physical_rows - candidate.input_live_rows) {
+		throw InternalException("Recluster candidate counters do not match its row groups");
+	}
+}
+
+static optional<idx_t> FindCandidateInCheckpoint(const CheckpointLayoutSnapshot &checkpoint,
+                                                 const ReclusterCandidate &candidate) {
+	for (idx_t checkpoint_index = 0; checkpoint_index < checkpoint.row_groups.size(); checkpoint_index++) {
+		if (checkpoint.row_groups[checkpoint_index].start != candidate.range.start) {
+			continue;
+		}
+		if (candidate.expected_row_groups.size() > checkpoint.row_groups.size() - checkpoint_index) {
+			return nullopt;
+		}
+		for (idx_t candidate_index = 0; candidate_index < candidate.expected_row_groups.size(); candidate_index++) {
+			if (!(checkpoint.row_groups[checkpoint_index + candidate_index] ==
+			      candidate.expected_row_groups[candidate_index])) {
+				return nullopt;
+			}
+		}
+		return checkpoint_index;
+	}
+	return nullopt;
+}
+
+static bool SplitsCurrentRun(const CheckpointLayoutSnapshot &checkpoint, const ReclusterCandidate &candidate,
+                             idx_t checkpoint_begin) {
+	auto checkpoint_end = checkpoint_begin + candidate.expected_row_groups.size();
+	auto &first = candidate.expected_row_groups.front().sort_metadata;
+	if (first.sort_order_id == candidate.sort_order_id && checkpoint_begin > 0 &&
+	    checkpoint.row_groups[checkpoint_begin - 1].sort_metadata == first) {
+		return true;
+	}
+	auto &last = candidate.expected_row_groups.back().sort_metadata;
+	return last.sort_order_id == candidate.sort_order_id && checkpoint_end < checkpoint.row_groups.size() &&
+	       checkpoint.row_groups[checkpoint_end].sort_metadata == last;
+}
+
+optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &collection,
+                                                          const vector<ColumnDefinition> &columns,
+                                                          TableReclusterState &state,
+                                                          const ReclusterCandidate &candidate) {
+	ValidateCandidateEnvelope(candidate);
+	if (!state.AcceptsNewTasks() || state.GetCurrentSortOrderId() != candidate.sort_order_id ||
+	    state.GetCurrentStorageGenerationId() != candidate.storage_generation_id ||
+	    collection.GetStorageGenerationId() != candidate.storage_generation_id) {
+		return nullopt;
+	}
+	auto checkpoint = state.GetLastCheckpoint();
+	if (!checkpoint || checkpoint->checkpoint_number != candidate.checkpoint_number ||
+	    checkpoint->storage_generation_id != candidate.storage_generation_id) {
+		return nullopt;
+	}
+	ValidateCheckpointSnapshot(*checkpoint, candidate.sort_order_id);
+	auto checkpoint_begin = FindCandidateInCheckpoint(*checkpoint, candidate);
+	if (!checkpoint_begin || SplitsCurrentRun(*checkpoint, candidate, *checkpoint_begin)) {
+		return nullopt;
+	}
+
+	auto current = collection.GetCurrentSnapshot();
+	auto layout_version = current.kind == RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT
+	                          ? current.layout->layout_version
+	                          : INITIAL_LAYOUT_VERSION;
+	if (layout_version != candidate.layout_version || IsPatchCovered(current, candidate.range) ||
+	    OverlapsAny(candidate.range, state.GetReservedRanges())) {
+		return nullopt;
+	}
+
+	ReclusterCandidate result = candidate;
+	result.input_live_rows = 0;
+	for (auto &expected : candidate.expected_row_groups) {
+		if (!expected.sealed) {
+			return nullopt;
+		}
+		auto expected_range = GetIdentityRange(expected);
+		LayoutRowGroupEntry current_entry;
+		if (!current.Lookup(expected.start, current_entry) || current_entry.row_start != expected.start ||
+		    current_entry.GetRowEnd() != expected_range.end) {
+			return nullopt;
+		}
+		auto current_identity =
+		    ComputeRowGroupPhysicalIdentityV1(*current_entry.row_group, current_entry.row_start, columns);
+		if (!current_identity || !(*current_identity == expected)) {
+			return nullopt;
+		}
+		auto live_rows = current_entry.row_group->GetCommittedRowCount();
+		if (live_rows > expected.count) {
+			throw InternalException("Recluster candidate has more committed rows than physical rows");
+		}
+		result.input_live_rows = AddCount(result.input_live_rows, live_rows);
+	}
+	result.input_deleted_rows = result.input_physical_rows - result.input_live_rows;
+	return result;
+}
+
 } // namespace duckdb

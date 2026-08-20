@@ -1,6 +1,7 @@
 #include "duckdb/storage/recluster/range_task.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/storage/recluster/recluster_task_context.hpp"
 
 namespace duckdb {
 
@@ -8,6 +9,13 @@ static constexpr uint16_t RANGE_TASK_STATE_MASK = 0x00ff;
 static constexpr uint16_t RANGE_TASK_CANCEL_REQUESTED = 0x0100;
 static constexpr uint16_t RANGE_TASK_PUBLISH_FORBIDDEN = 0x0200;
 static constexpr uint16_t RANGE_TASK_FLAG_MASK = RANGE_TASK_CANCEL_REQUESTED | RANGE_TASK_PUBLISH_FORBIDDEN;
+
+static RowGroupRange GetTaskContextRange(const unique_ptr<ReclusterTaskContext> &task_context) {
+	if (!task_context) {
+		throw InternalException("A recluster task requires a task context");
+	}
+	return task_context->GetCandidate().range;
+}
 
 RangeTask::RangeTask(recluster_task_id_t task_id_p, RowGroupRange range_p)
     : task_id(task_id_p), range(range_p), control(static_cast<uint16_t>(RangeTaskState::STARTING)) {
@@ -17,6 +25,34 @@ RangeTask::RangeTask(recluster_task_id_t task_id_p, RowGroupRange range_p)
 	if (range.start < 0 || range.start >= range.end) {
 		throw InternalException("A recluster task requires a valid row group range");
 	}
+}
+
+RangeTask::RangeTask(recluster_task_id_t task_id_p, unique_ptr<ReclusterTaskContext> task_context_p)
+    : task_id(task_id_p), range(GetTaskContextRange(task_context_p)),
+      control(static_cast<uint16_t>(RangeTaskState::STARTING)), task_context(std::move(task_context_p)) {
+	if (task_id == recluster_task_id_t(0, 0)) {
+		throw InternalException("A recluster task requires a non-zero task ID");
+	}
+	if (range.start < 0 || range.start >= range.end) {
+		throw InternalException("A recluster task requires a valid row group range");
+	}
+}
+
+RangeTask::~RangeTask() {
+}
+
+ReclusterTaskContext &RangeTask::GetTaskContext() {
+	if (!task_context) {
+		throw InternalException("Recluster task has no execution context");
+	}
+	return *task_context;
+}
+
+const ReclusterTaskContext &RangeTask::GetTaskContext() const {
+	if (!task_context) {
+		throw InternalException("Recluster task has no execution context");
+	}
+	return *task_context;
 }
 
 RangeTaskState RangeTask::DecodeState(uint16_t control) {
