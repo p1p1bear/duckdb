@@ -30,6 +30,7 @@ add_library_unity(
   test_recluster_sort.cpp
   test_recluster_start.cpp
   test_recluster_state.cpp
+  test_recluster_wal.cpp
   test_replacement_manifest.cpp
   test_row_group_layout.cpp
   test_table_sort_metadata.cpp

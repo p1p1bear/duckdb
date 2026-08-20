@@ -335,6 +335,54 @@ WALDropView WALDropView::Deserialize(Deserializer &deserializer) {
 	return result;
 }
 
+void WALReclusterDeleteEntry::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<persistent_table_id_t>(101, "table_id", table_id);
+	serializer.WriteProperty<recluster_task_id_t>(102, "task_id", task_id);
+	serializer.WritePropertyWithDefault<uint32_t>(103, "chunk_index", chunk_index);
+	serializer.WritePropertyWithDefault<vector<row_t>>(104, "new_rowids", new_rowids);
+}
+
+WALReclusterDeleteEntry WALReclusterDeleteEntry::Deserialize(Deserializer &deserializer) {
+	WALReclusterDeleteEntry result;
+	deserializer.ReadProperty<persistent_table_id_t>(101, "table_id", result.table_id);
+	deserializer.ReadProperty<recluster_task_id_t>(102, "task_id", result.task_id);
+	deserializer.ReadPropertyWithDefault<uint32_t>(103, "chunk_index", result.chunk_index);
+	deserializer.ReadPropertyWithDefault<vector<row_t>>(104, "new_rowids", result.new_rowids);
+	return result;
+}
+
+void WALReclusterEntry::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<persistent_table_id_t>(101, "table_id", table_id);
+	serializer.WriteProperty<recluster_task_id_t>(102, "task_id", task_id);
+	serializer.WriteProperty<layout_version_t>(103, "expected_layout_version", expected_layout_version);
+	serializer.WriteProperty<layout_version_t>(104, "target_layout_version", target_layout_version);
+	serializer.WriteProperty<row_t>(105, "range_start", range_start);
+	serializer.WriteProperty<row_t>(106, "range_end", range_end);
+	serializer.WriteProperty<MetaBlockPointer>(107, "manifest_pointer", manifest_pointer);
+	serializer.WritePropertyWithDefault<uint64_t>(108, "manifest_size", manifest_size);
+	serializer.WritePropertyWithDefault<uint64_t>(109, "manifest_checksum", manifest_checksum);
+	serializer.WriteProperty<delete_sequence_t>(110, "journal_resolved_through", journal_resolved_through);
+	serializer.WritePropertyWithDefault<uint64_t>(111, "final_delete_row_count", final_delete_row_count);
+	serializer.WritePropertyWithDefault<uint32_t>(112, "delete_chunk_count", delete_chunk_count);
+}
+
+WALReclusterEntry WALReclusterEntry::Deserialize(Deserializer &deserializer) {
+	WALReclusterEntry result;
+	deserializer.ReadProperty<persistent_table_id_t>(101, "table_id", result.table_id);
+	deserializer.ReadProperty<recluster_task_id_t>(102, "task_id", result.task_id);
+	deserializer.ReadProperty<layout_version_t>(103, "expected_layout_version", result.expected_layout_version);
+	deserializer.ReadProperty<layout_version_t>(104, "target_layout_version", result.target_layout_version);
+	deserializer.ReadProperty<row_t>(105, "range_start", result.range_start);
+	deserializer.ReadProperty<row_t>(106, "range_end", result.range_end);
+	deserializer.ReadProperty<MetaBlockPointer>(107, "manifest_pointer", result.manifest_pointer);
+	deserializer.ReadPropertyWithDefault<uint64_t>(108, "manifest_size", result.manifest_size);
+	deserializer.ReadPropertyWithDefault<uint64_t>(109, "manifest_checksum", result.manifest_checksum);
+	deserializer.ReadProperty<delete_sequence_t>(110, "journal_resolved_through", result.journal_resolved_through);
+	deserializer.ReadPropertyWithDefault<uint64_t>(111, "final_delete_row_count", result.final_delete_row_count);
+	deserializer.ReadPropertyWithDefault<uint32_t>(112, "delete_chunk_count", result.delete_chunk_count);
+	return result;
+}
+
 void WALSequenceValue::Serialize(Serializer &serializer) const {
 	if (!serializer.ShouldSerialize(StorageVersion::V2_0_0)) {
 		serializer.WritePropertyWithDefault<Identifier>(101, "schema", LegacySchema());

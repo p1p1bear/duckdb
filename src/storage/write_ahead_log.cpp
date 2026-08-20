@@ -294,6 +294,20 @@ void WriteAheadLog::WriteCheckpoint(MetaBlockPointer meta_block) {
 	serializer.End();
 }
 
+void WriteAheadLog::WriteRecluster(const WALReclusterEntry &entry) {
+	entry.Validate();
+	WriteAheadLogSerializer serializer(*this, WALType::RECLUSTER);
+	serializer.WriteEntry(entry);
+	serializer.End();
+}
+
+void WriteAheadLog::WriteReclusterDelete(const WALReclusterDeleteEntry &entry) {
+	entry.Validate();
+	WriteAheadLogSerializer serializer(*this, WALType::RECLUSTER_DELETE);
+	serializer.WriteEntry(entry);
+	serializer.End();
+}
+
 //===--------------------------------------------------------------------===//
 // CREATE TABLE
 //===--------------------------------------------------------------------===//
