@@ -494,6 +494,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);
 		}
 		auto &transaction = DuckTransaction::Get(context, storage->db);
+		transaction.HoldReclusterDDLCoordinationLock(*storage->GetDataTableInfo());
 		transaction.HoldExclusiveReclusterWriteLock(*storage->GetDataTableInfo());
 		if (!storage->IsMainTable()) {
 			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);

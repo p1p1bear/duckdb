@@ -390,8 +390,64 @@ void DuckTransaction::HoldExclusiveReclusterWriteLock(DataTableInfo &info) {
 	HoldReclusterWriteLock(info, true);
 }
 
+void DuckTransaction::HoldReclusterDDLCoordinationLock(DataTableInfo &info) {
+	shared_ptr<HeldDDLCoordination> coordination;
+	bool try_only = false;
+	{
+		unique_lock<mutex> guard(recluster_transaction_lock);
+		auto entry = ddl_coordination_locks.find(info);
+		if (entry != ddl_coordination_locks.end()) {
+			coordination = entry->second;
+			while (coordination->state == HeldDDLCoordinationState::ACQUIRING) {
+				coordination->ready.wait(guard);
+			}
+			if (coordination->state == HeldDDLCoordinationState::FAILED) {
+				std::rethrow_exception(coordination->failure);
+			}
+			return;
+		}
+		for (auto &held_entry : ddl_coordination_locks) {
+			if (held_entry.second->state != HeldDDLCoordinationState::HELD) {
+				throw TransactionException(
+				    "Transaction conflict: cannot concurrently coordinate sorted-table DDL for multiple tables");
+			}
+			try_only = true;
+		}
+		coordination = make_shared_ptr<HeldDDLCoordination>();
+		coordination->state = HeldDDLCoordinationState::ACQUIRING;
+		ddl_coordination_locks.emplace(std::ref(info), coordination);
+	}
+
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+	try {
+		handle = try_only ? info.TryGetReclusterDDLCoordinationLock() : info.GetReclusterDDLCoordinationLock();
+		if (!handle) {
+			throw TransactionException(
+			    "Transaction conflict: cannot immediately coordinate sorted-table DDL for another table");
+		}
+	} catch (...) {
+		failure = std::current_exception();
+	}
+	{
+		lock_guard<mutex> guard(recluster_transaction_lock);
+		if (failure) {
+			coordination->failure = failure;
+			coordination->state = HeldDDLCoordinationState::FAILED;
+		} else {
+			coordination->handle = std::move(handle);
+			coordination->state = HeldDDLCoordinationState::HELD;
+		}
+	}
+	coordination->ready.notify_all();
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+}
+
 void DuckTransaction::HoldReclusterWriteLock(DataTableInfo &info, bool exclusive) {
 	shared_ptr<HeldTableGate> gate;
+	bool try_only = false;
 	{
 		unique_lock<mutex> guard(recluster_transaction_lock);
 		auto entry = table_write_locks.find(info);
@@ -413,6 +469,10 @@ void DuckTransaction::HoldReclusterWriteLock(DataTableInfo &info, bool exclusive
 
 		for (auto &held_entry : table_write_locks) {
 			auto mode = held_entry.second->mode;
+			if (exclusive && mode == HeldTableGateMode::EXCLUSIVE) {
+				try_only = true;
+				continue;
+			}
 			if (exclusive || mode == HeldTableGateMode::ACQUIRING_EXCLUSIVE || mode == HeldTableGateMode::EXCLUSIVE) {
 				throw TransactionException("Transaction conflict: cannot acquire sorted-table write gates for multiple "
 				                           "tables around exclusive DDL");
@@ -427,7 +487,15 @@ void DuckTransaction::HoldReclusterWriteLock(DataTableInfo &info, bool exclusive
 	unique_ptr<StorageLockKey> handle;
 	std::exception_ptr failure;
 	try {
-		handle = exclusive ? info.GetExclusiveReclusterWriteLock() : info.GetSharedReclusterWriteLock();
+		if (exclusive) {
+			handle = try_only ? info.TryGetExclusiveReclusterWriteLock() : info.GetExclusiveReclusterWriteLock();
+			if (!handle) {
+				throw TransactionException("Transaction conflict: cannot immediately acquire an exclusive sorted-table "
+				                           "write gate for another table");
+			}
+		} else {
+			handle = info.GetSharedReclusterWriteLock();
+		}
 	} catch (...) {
 		failure = std::current_exception();
 	}
@@ -460,6 +528,7 @@ bool DuckTransaction::HoldsReclusterWriteLock(DataTableInfo &info) {
 void DuckTransaction::ReleaseReclusterWriteLocks() noexcept {
 	lock_guard<mutex> guard(recluster_transaction_lock);
 	table_write_locks.clear();
+	ddl_coordination_locks.clear();
 }
 
 } // namespace duckdb

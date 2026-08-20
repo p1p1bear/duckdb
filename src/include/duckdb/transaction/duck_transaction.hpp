@@ -103,6 +103,7 @@ public:
 	//! Hold a sorted-table write gate until this transaction ends.
 	void HoldSharedReclusterWriteLock(DataTableInfo &info);
 	void HoldExclusiveReclusterWriteLock(DataTableInfo &info);
+	void HoldReclusterDDLCoordinationLock(DataTableInfo &info);
 	bool HoldsReclusterWriteLock(DataTableInfo &info);
 	void ReleaseReclusterWriteLocks() noexcept;
 
@@ -143,6 +144,14 @@ private:
 	};
 	mutex recluster_transaction_lock;
 	reference_map_t<DataTableInfo, shared_ptr<HeldTableGate>> table_write_locks;
+	enum class HeldDDLCoordinationState : uint8_t { ACQUIRING, HELD, FAILED };
+	struct HeldDDLCoordination {
+		HeldDDLCoordinationState state;
+		std::condition_variable ready;
+		unique_ptr<StorageLockKey> handle;
+		std::exception_ptr failure;
+	};
+	reference_map_t<DataTableInfo, shared_ptr<HeldDDLCoordination>> ddl_coordination_locks;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };

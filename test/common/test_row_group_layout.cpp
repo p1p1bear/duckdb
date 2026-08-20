@@ -20,6 +20,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "test_helpers.hpp"
 
 #include <atomic>
@@ -1014,4 +1015,67 @@ TEST_CASE("Sorted table DDL waits for transaction write gates", "[storage][row_g
 	REQUIRE_NO_FAIL(std::move(ddl_result));
 	REQUIRE_NO_FAIL(writer.Query("UPDATE target SET i = 2"));
 	DeleteDatabase(path);
+}
+
+TEST_CASE("Sorted table SET rechecks indexes after DDL coordination", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("sorted_index_gate.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection gate_holder(db);
+	Connection index_writer(db);
+	REQUIRE_NO_FAIL(
+	    gate_holder.Query("ATTACH '" + path + "' AS index_gate (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(gate_holder.Query("USE index_gate"));
+	REQUIRE_NO_FAIL(index_writer.Query("USE index_gate"));
+	REQUIRE_NO_FAIL(index_writer.Query("CREATE TABLE target(i INTEGER)"));
+	REQUIRE_NO_FAIL(index_writer.Query("INSERT INTO target SELECT i::INTEGER FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(gate_holder.Query("BEGIN TRANSACTION"));
+	gate_holder.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*gate_holder.context, QualifiedName(Identifier("target")));
+		auto &transaction = DuckTransaction::Get(*gate_holder.context, entry.GetStorage().db);
+		transaction.HoldReclusterDDLCoordinationLock(*entry.GetStorage().GetDataTableInfo());
+	});
+
+	std::atomic<bool> index_started(false);
+	auto index_future = std::async(std::launch::async, [&]() {
+		index_started = true;
+		return index_writer.Query("CREATE INDEX target_i ON target(i)");
+	});
+	auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!index_started.load() && std::chrono::steady_clock::now() < start_deadline) {
+		std::this_thread::yield();
+	}
+	auto blocked_status = index_future.wait_for(std::chrono::milliseconds(100));
+	auto commit_result = gate_holder.Query("COMMIT");
+	auto finished_status = index_future.wait_for(std::chrono::seconds(5));
+	if (finished_status != std::future_status::ready) {
+		index_writer.Interrupt();
+		index_future.wait();
+	}
+
+	REQUIRE(index_started.load());
+	REQUIRE(blocked_status == std::future_status::timeout);
+	REQUIRE_NO_FAIL(std::move(commit_result));
+	REQUIRE(finished_status == std::future_status::ready);
+	auto index_result = index_future.get();
+	REQUIRE_NO_FAIL(std::move(index_result));
+	auto set_result = index_writer.Query("ALTER TABLE target SET SORTED BY (i)");
+	REQUIRE_FAIL(set_result);
+	REQUIRE(StringUtil::Contains(set_result->GetError(), "SORTED BY tables cannot have indexes"));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Index DDL coordinates multiple ordinary tables in one transaction", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE first(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE second(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO first VALUES (1), (2)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO second VALUES (1), (2)"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(con.Query("CREATE UNIQUE INDEX first_i ON first(i)"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE second ADD PRIMARY KEY(i)"));
+	REQUIRE_NO_FAIL(con.Query("COMMIT"));
+	REQUIRE_FAIL(con.Query("INSERT INTO first VALUES (1)"));
+	REQUIRE_FAIL(con.Query("INSERT INTO second VALUES (1)"));
 }
