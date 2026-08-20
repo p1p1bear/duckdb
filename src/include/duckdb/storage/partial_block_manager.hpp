@@ -84,7 +84,7 @@ struct PartialBlockAllocation {
 	unique_ptr<PartialBlock> partial_block;
 };
 
-enum class PartialBlockType { FULL_CHECKPOINT, APPEND_TO_TABLE, IN_MEMORY_CHECKPOINT };
+enum class PartialBlockType { FULL_CHECKPOINT, APPEND_TO_TABLE, IN_MEMORY_CHECKPOINT, RECLUSTER_TASK };
 
 //! Enables sharing blocks across some scope. Scope is whatever we want to share
 //! blocks across. It may be an entire checkpoint or just a single row group.
@@ -114,6 +114,9 @@ public:
 
 	//! Rollback all data written by this partial block manager
 	void Rollback();
+
+	//! Transfer ownership of blocks allocated by a recluster task to its private output.
+	vector<block_id_t> TakeTaskPrivateBlocks();
 
 	//! Merge this block manager into another one
 	void Merge(PartialBlockManager &other);
@@ -151,6 +154,7 @@ protected:
 	//! The maximum size (in bytes) at which a partial block will be considered a partial block
 	uint32_t max_partial_block_size;
 	uint32_t max_use_count;
+	vector<block_id_t> task_private_blocks;
 
 protected:
 	virtual void AllocateBlock(PartialBlockState &state, uint32_t segment_size);

@@ -21,6 +21,7 @@ class ClientContext;
 class Connection;
 class DataTable;
 class DuckTransaction;
+class ReclusterOutput;
 
 class ReclusterTaskContext {
 public:
@@ -60,6 +61,13 @@ public:
 	ClientContext &GetSnapshotContext();
 	DuckTransaction &GetSnapshotTransaction();
 	void CloseSnapshot();
+	bool HasOutput() const {
+		return output != nullptr;
+	}
+	ReclusterOutput &GetOutput();
+	const ReclusterOutput &GetOutput() const;
+	void SetOutput(unique_ptr<ReclusterOutput> output);
+	unique_ptr<ReclusterOutput> TakeOutput();
 
 private:
 	persistent_table_id_t table_id;
@@ -72,6 +80,7 @@ private:
 	shared_ptr<AttachedDatabase> db;
 	unique_ptr<Connection> snapshot_connection;
 	transaction_t snapshot_start_time;
+	unique_ptr<ReclusterOutput> output;
 };
 
 } // namespace duckdb

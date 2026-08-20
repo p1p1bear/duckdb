@@ -6,6 +6,7 @@ add_library_unity(
   layout_row_group_cursor.cpp
   range_task.cpp
   recluster_manager.cpp
+  recluster_output_writer.cpp
   recluster_range_scanner.cpp
   recluster_sorter.cpp
   recluster_task_context.cpp

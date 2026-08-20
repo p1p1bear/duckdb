@@ -5,6 +5,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_output_writer.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 
 namespace duckdb {
@@ -57,6 +58,34 @@ void ReclusterTaskContext::CloseSnapshot() {
 	if (connection->context->transaction.HasActiveTransaction()) {
 		connection->context->transaction.Rollback(nullptr);
 	}
+}
+
+ReclusterOutput &ReclusterTaskContext::GetOutput() {
+	if (!output) {
+		throw InternalException("Recluster task has no private output");
+	}
+	return *output;
+}
+
+const ReclusterOutput &ReclusterTaskContext::GetOutput() const {
+	if (!output) {
+		throw InternalException("Recluster task has no private output");
+	}
+	return *output;
+}
+
+void ReclusterTaskContext::SetOutput(unique_ptr<ReclusterOutput> output_p) {
+	if (!output_p || output) {
+		throw InternalException("Invalid recluster private output installation");
+	}
+	output = std::move(output_p);
+}
+
+unique_ptr<ReclusterOutput> ReclusterTaskContext::TakeOutput() {
+	if (!output) {
+		throw InternalException("Recluster task has no private output");
+	}
+	return std::move(output);
 }
 
 } // namespace duckdb

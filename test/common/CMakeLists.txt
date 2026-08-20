@@ -23,6 +23,7 @@ add_library_unity(
   test_local_storage_alter.cpp
   test_recluster_candidate.cpp
   test_recluster_manager.cpp
+  test_recluster_output.cpp
   test_recluster_scan.cpp
   test_recluster_sort.cpp
   test_recluster_start.cpp
