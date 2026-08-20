@@ -15,7 +15,8 @@ ReclusterTaskContext::ReclusterTaskContext(persistent_table_id_t table_id_p, uin
                                            AttachedDatabase &db_p)
     : table_id(table_id_p), initialization_token(initialization_token_p), candidate(std::move(candidate_p)),
       sort_definition(std::move(sort_definition_p)), physical_sort_indexes(std::move(physical_sort_indexes_p)),
-      storage(std::move(storage_p)), db(db_p.shared_from_this()), snapshot_start_time(0) {
+      storage(std::move(storage_p)), row_id_remap(candidate.expected_row_groups), db(db_p.shared_from_this()),
+      snapshot_start_time(0) {
 	if (table_id == hugeint_t(0, 0) || initialization_token == 0 || !storage || sort_definition.columns.empty() ||
 	    sort_definition.sort_order_id != candidate.sort_order_id ||
 	    physical_sort_indexes.size() != sort_definition.columns.size()) {
