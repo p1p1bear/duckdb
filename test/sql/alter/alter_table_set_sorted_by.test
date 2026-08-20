@@ -117,15 +117,18 @@ SELECT * FROM reset_index_tbl
 ----
 1
 
-# Metadata-only wrappers keep transaction-local data attached to the latest entry.
+# An exclusive DDL gate can be reused by later DML and DDL on the same table.
 statement ok
 BEGIN TRANSACTION
+
+statement ok
+ALTER TABLE tbl SET SORTED BY (j)
 
 statement ok
 INSERT INTO tbl(i, j) VALUES (3, 'c')
 
 statement ok
-ALTER TABLE tbl SET SORTED BY (j)
+ALTER TABLE tbl SET SORTED BY (i)
 
 statement ok
 INSERT INTO tbl(i, j) VALUES (4, 'd')
@@ -137,6 +140,21 @@ query I
 SELECT count(*) FROM tbl
 ----
 2
+
+# A shared DML gate cannot be upgraded to exclusive DDL in the same transaction.
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO tbl(i, j) VALUES (3, 'c')
+
+statement error
+ALTER TABLE tbl SET SORTED BY (j)
+----
+<REGEX>:.*cannot acquire an exclusive sorted-table write gate after writing to the table.*
+
+statement ok
+ROLLBACK
 
 query T
 SELECT sql FROM duckdb_tables() WHERE table_name = 'tbl'

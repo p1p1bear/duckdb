@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/transaction/commit_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
@@ -27,6 +28,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/catalog/catalog_entry/trigger_catalog_entry.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -487,6 +489,22 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, SetSortedByInfo &info) {
 	auto create_info = GetInfo();
 	auto &table_info = create_info->Cast<CreateTableInfo>();
+	auto hold_write_gate = [&]() {
+		if (!storage->IsMainTable()) {
+			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);
+		}
+		auto &transaction = DuckTransaction::Get(context, storage->db);
+		transaction.HoldExclusiveReclusterWriteLock(*storage->GetDataTableInfo());
+		if (!storage->IsMainTable()) {
+			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);
+		}
+		auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+		if (current_layout && transaction.start_time < current_layout->visible_from) {
+			throw TransactionException(
+			    "Transaction conflict: cannot alter table \"%s\" from before its current storage layout was published",
+			    name);
+		}
+	};
 
 	if (info.bind_mode == AlterBindMode::SKIP_BINDING) {
 		if (!info.sort_post_image) {
@@ -497,6 +515,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 		if (!table_info.sort_metadata || !table_info.sort_metadata->IsEnabled()) {
 			return nullptr;
 		}
+		hold_write_gate();
 		table_info.sort_metadata->current_sort_order_id = INVALID_SORT_ORDER_ID;
 		info.sort_post_image = BuildTableSortPostImage(*table_info.sort_metadata, table_info.columns);
 	} else {
@@ -513,6 +532,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 		if (metadata.next_sort_order_id == NumericLimits<sort_order_id_t>::Maximum()) {
 			throw InvalidInputException("SORTED BY sort order ID space is exhausted");
 		}
+		hold_write_gate();
+		VerifySortedAlterCapabilities(*this);
 		metadata.current_sort_order_id = metadata.next_sort_order_id++;
 		metadata.definitions.push_back(std::move(definition));
 		ValidateTableSortCatalogMetadata(metadata, table_info.columns);

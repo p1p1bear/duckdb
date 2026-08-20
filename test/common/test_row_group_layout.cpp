@@ -22,6 +22,11 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "test_helpers.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
+
 using namespace duckdb; // NOLINT
 
 static duckdb::shared_ptr<RowGroupCollection> GetLayoutTestCollection(Connection &con,
@@ -967,5 +972,46 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 		}
 		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
 	});
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Sorted table DDL waits for transaction write gates", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("sorted_write_gate.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection writer(db);
+	Connection ddl(db);
+	REQUIRE_NO_FAIL(
+	    writer.Query("ATTACH '" + path + "' AS write_gate (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(writer.Query("USE write_gate"));
+	REQUIRE_NO_FAIL(ddl.Query("USE write_gate"));
+	REQUIRE_NO_FAIL(writer.Query("CREATE TABLE target(i INTEGER) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(writer.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(writer.Query("INSERT INTO target VALUES (1)"));
+
+	std::atomic<bool> ddl_started(false);
+	auto ddl_future = std::async(std::launch::async, [&]() {
+		ddl_started = true;
+		return ddl.Query("ALTER TABLE target RESET SORTED BY");
+	});
+	auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ddl_started.load() && std::chrono::steady_clock::now() < start_deadline) {
+		std::this_thread::yield();
+	}
+	auto blocked_status = ddl_future.wait_for(std::chrono::milliseconds(100));
+	auto commit_result = writer.Query("COMMIT");
+	auto finished_status = ddl_future.wait_for(std::chrono::seconds(5));
+	if (finished_status != std::future_status::ready) {
+		ddl.Interrupt();
+		ddl_future.wait();
+	}
+
+	REQUIRE(ddl_started.load());
+	REQUIRE(blocked_status == std::future_status::timeout);
+	REQUIRE_NO_FAIL(std::move(commit_result));
+	REQUIRE(finished_status == std::future_status::ready);
+	auto ddl_result = ddl_future.get();
+	REQUIRE_NO_FAIL(std::move(ddl_result));
+	REQUIRE_NO_FAIL(writer.Query("UPDATE target SET i = 2"));
 	DeleteDatabase(path);
 }
