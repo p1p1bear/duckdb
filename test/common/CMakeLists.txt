@@ -21,6 +21,7 @@ add_library_unity(
   test_parse_logical_type.cpp
   test_recursive_cte_metrics.cpp
   test_local_storage_alter.cpp
+  test_recluster_candidate.cpp
   test_recluster_manager.cpp
   test_recluster_state.cpp
   test_row_group_layout.cpp
