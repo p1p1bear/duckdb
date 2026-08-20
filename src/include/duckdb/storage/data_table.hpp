@@ -323,6 +323,9 @@ public:
 	vector<PartitionStatistics> GetPartitionStats(ClientContext &context);
 
 private:
+	void HoldReclusterWriteGate(ClientContext &context, const char *operation);
+	void VerifyCurrentForDML(DuckTransaction &transaction, const char *operation) const;
+
 	//! Verify the new added constraints against current persistent&local data
 	void VerifyNewConstraint(LocalStorage &local_storage, DataTable &parent, const BoundConstraint &constraint);
 

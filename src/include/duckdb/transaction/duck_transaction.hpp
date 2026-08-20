@@ -15,6 +15,9 @@
 #include "duckdb/transaction/undo_buffer.hpp"
 #include "duckdb/common/enums/active_transaction_state.hpp"
 
+#include <condition_variable>
+#include <exception>
+
 namespace duckdb {
 class CheckpointLock;
 class CommitDropState;
@@ -97,12 +100,19 @@ public:
 
 	//! Get a shared lock on a table
 	shared_ptr<CheckpointLock> SharedLockTable(DataTableInfo &info);
+	//! Hold a sorted-table write gate until this transaction ends.
+	void HoldSharedReclusterWriteLock(DataTableInfo &info);
+	void HoldExclusiveReclusterWriteLock(DataTableInfo &info);
+	bool HoldsReclusterWriteLock(DataTableInfo &info);
+	void ReleaseReclusterWriteLocks() noexcept;
 
 	void SetIsCheckpointTransaction() {
 		is_checkpoint_transaction = true;
 	}
 
 private:
+	void HoldReclusterWriteLock(DataTableInfo &info, bool exclusive);
+
 	//! The undo buffer is used to store old versions of rows that are updated
 	//! or deleted
 	UndoBuffer undo_buffer;
@@ -124,6 +134,15 @@ private:
 	};
 	//! Active locks on tables
 	reference_map_t<DataTableInfo, unique_ptr<ActiveTableLock>> active_locks;
+	enum class HeldTableGateMode : uint8_t { ACQUIRING_SHARED, ACQUIRING_EXCLUSIVE, SHARED, EXCLUSIVE, FAILED };
+	struct HeldTableGate {
+		HeldTableGateMode mode;
+		std::condition_variable ready;
+		unique_ptr<StorageLockKey> handle;
+		std::exception_ptr failure;
+	};
+	mutex recluster_transaction_lock;
+	reference_map_t<DataTableInfo, shared_ptr<HeldTableGate>> table_write_locks;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };

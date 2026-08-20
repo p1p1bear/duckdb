@@ -53,18 +53,20 @@ void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) 
 }
 
 void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata) {
-	if (sort_storage) {
+	if (sort_storage_initialized.load()) {
 		throw InternalException("Sort storage state has already been initialized");
 	}
 	sort_storage = make_uniq<TableSortStorageState>(metadata);
+	sort_storage_initialized.store(true);
 }
 
 void DataTableInfo::ResetSortStorage() {
+	sort_storage_initialized.store(false);
 	sort_storage.reset();
 }
 
 bool DataTableInfo::HasSortStorage() const {
-	return sort_storage != nullptr;
+	return sort_storage_initialized.load();
 }
 
 TableSortStorageState &DataTableInfo::GetSortStorage() {
@@ -1058,14 +1060,33 @@ string DataTable::TableModification() const {
 	}
 }
 
+void DataTable::VerifyCurrentForDML(DuckTransaction &transaction, const char *operation) const {
+	if (!IsMainTable()) {
+		throw TransactionException("Transaction conflict: attempting to %s table \"%s\" but it has been %s by a "
+		                           "different transaction",
+		                           operation, GetTableName(), TableModification());
+	}
+	auto current_layout = row_groups->GetCurrentLayout();
+	if (current_layout && transaction.start_time < current_layout->visible_from) {
+		throw TransactionException("Transaction conflict: attempting to %s table \"%s\" from before its current "
+		                           "storage layout was published",
+		                           operation, GetTableName());
+	}
+}
+
+void DataTable::HoldReclusterWriteGate(ClientContext &context, const char *operation) {
+	auto &transaction = DuckTransaction::Get(context, db);
+	VerifyCurrentForDML(transaction, operation);
+	if (info->HasSortStorage()) {
+		transaction.HoldSharedReclusterWriteLock(*info);
+	}
+	VerifyCurrentForDML(transaction, operation);
+}
+
 void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
                                       const vector<unique_ptr<BoundConstraint>> &bound_constraints,
                                       const AppendOrganization &organization) {
-	if (!IsMainTable()) {
-		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
-		                           "a different transaction",
-		                           GetTableName(), TableModification());
-	}
+	HoldReclusterWriteGate(context, "insert into");
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.InitializeAppend(state, *this, table, organization);
 	state.constraint_state = InitializeConstraintState(table, bound_constraints);
@@ -1073,11 +1094,7 @@ void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &t
 
 void DataTable::InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
                                        const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
-	if (!IsMainTable()) {
-		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
-		                           "a different transaction",
-		                           GetTableName(), TableModification());
-	}
+	HoldReclusterWriteGate(context, "insert into");
 
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.InitializeStorage(state, *this, table);
@@ -1143,6 +1160,7 @@ OptimisticDataWriter &DataTable::GetOptimisticWriter(ClientContext &context) {
 }
 
 void DataTable::LocalMerge(ClientContext &context, DuckTableEntry &table_entry, OptimisticWriteCollection &collection) {
+	HoldReclusterWriteGate(context, "insert into");
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.LocalMerge(*this, table_entry, collection);
 }
@@ -1235,6 +1253,9 @@ void DataTable::AppendLock(DuckTransaction &transaction, TableAppendState &state
 		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
 		                           "a different transaction",
 		                           GetTableName(), TableModification());
+	}
+	if (info->HasSortStorage() && !transaction.HoldsReclusterWriteLock(*info)) {
+		throw InternalException("Sorted table append reached commit without holding its transaction write gate");
 	}
 	state.table_lock = transaction.SharedLockTable(*info);
 	state.row_start = NumericCast<row_t>(row_groups->GetNextRowId());
@@ -1629,6 +1650,7 @@ void DataTable::VerifyDeleteConstraints(optional_ptr<LocalTableStorage> storage,
 
 unique_ptr<TableDeleteState> DataTable::InitializeDelete(TableCatalogEntry &table, ClientContext &context,
                                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	HoldReclusterWriteGate(context, "delete from");
 	auto &transaction = DuckTransaction::Get(context, db);
 	// Bind all indexes.
 	info->BindIndexes(context);
@@ -1795,6 +1817,7 @@ void DataTable::VerifyUpdateConstraints(ConstraintState &state, ClientContext &c
 
 unique_ptr<TableUpdateState> DataTable::InitializeUpdate(TableCatalogEntry &table, ClientContext &context,
                                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	HoldReclusterWriteGate(context, "update");
 	// Bind all indexes.
 	info->BindIndexes(context);
 	auto result = make_uniq<TableUpdateState>();
@@ -1864,6 +1887,7 @@ void DataTable::UpdateColumn(DuckTableEntry &table, ClientContext &context, Vect
 	if (updates.size() == 0) {
 		return;
 	}
+	HoldReclusterWriteGate(context, "update");
 
 	if (!IsMainTable()) {
 		throw TransactionException(

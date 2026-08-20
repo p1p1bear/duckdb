@@ -42,6 +42,7 @@ DuckTransaction::DuckTransaction(DuckTransactionManager &manager, ClientContext 
 }
 
 DuckTransaction::~DuckTransaction() {
+	ReleaseReclusterWriteLocks();
 }
 
 DuckTransaction &DuckTransaction::Get(ClientContext &context, AttachedDatabase &db) {
@@ -379,6 +380,86 @@ shared_ptr<CheckpointLock> DuckTransaction::SharedLockTable(DataTableInfo &info)
 	// store it for future reference
 	active_table_lock.checkpoint_lock = checkpoint_lock;
 	return checkpoint_lock;
+}
+
+void DuckTransaction::HoldSharedReclusterWriteLock(DataTableInfo &info) {
+	HoldReclusterWriteLock(info, false);
+}
+
+void DuckTransaction::HoldExclusiveReclusterWriteLock(DataTableInfo &info) {
+	HoldReclusterWriteLock(info, true);
+}
+
+void DuckTransaction::HoldReclusterWriteLock(DataTableInfo &info, bool exclusive) {
+	shared_ptr<HeldTableGate> gate;
+	{
+		unique_lock<mutex> guard(recluster_transaction_lock);
+		auto entry = table_write_locks.find(info);
+		if (entry != table_write_locks.end()) {
+			gate = entry->second;
+			while (gate->mode == HeldTableGateMode::ACQUIRING_SHARED ||
+			       gate->mode == HeldTableGateMode::ACQUIRING_EXCLUSIVE) {
+				gate->ready.wait(guard);
+			}
+			if (gate->mode == HeldTableGateMode::FAILED) {
+				std::rethrow_exception(gate->failure);
+			}
+			if (exclusive && gate->mode == HeldTableGateMode::SHARED) {
+				throw TransactionException("Transaction conflict: cannot acquire an exclusive sorted-table write gate "
+				                           "after writing to the table");
+			}
+			return;
+		}
+
+		for (auto &held_entry : table_write_locks) {
+			auto mode = held_entry.second->mode;
+			if (exclusive || mode == HeldTableGateMode::ACQUIRING_EXCLUSIVE || mode == HeldTableGateMode::EXCLUSIVE) {
+				throw TransactionException("Transaction conflict: cannot acquire sorted-table write gates for multiple "
+				                           "tables around exclusive DDL");
+			}
+		}
+
+		gate = make_shared_ptr<HeldTableGate>();
+		gate->mode = exclusive ? HeldTableGateMode::ACQUIRING_EXCLUSIVE : HeldTableGateMode::ACQUIRING_SHARED;
+		table_write_locks.emplace(std::ref(info), gate);
+	}
+
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+	try {
+		handle = exclusive ? info.GetExclusiveReclusterWriteLock() : info.GetSharedReclusterWriteLock();
+	} catch (...) {
+		failure = std::current_exception();
+	}
+
+	{
+		lock_guard<mutex> guard(recluster_transaction_lock);
+		if (failure) {
+			gate->failure = failure;
+			gate->mode = HeldTableGateMode::FAILED;
+		} else {
+			gate->handle = std::move(handle);
+			gate->mode = exclusive ? HeldTableGateMode::EXCLUSIVE : HeldTableGateMode::SHARED;
+		}
+	}
+	gate->ready.notify_all();
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+}
+
+bool DuckTransaction::HoldsReclusterWriteLock(DataTableInfo &info) {
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	auto entry = table_write_locks.find(info);
+	if (entry == table_write_locks.end()) {
+		return false;
+	}
+	return entry->second->mode == HeldTableGateMode::SHARED || entry->second->mode == HeldTableGateMode::EXCLUSIVE;
+}
+
+void DuckTransaction::ReleaseReclusterWriteLocks() noexcept {
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	table_write_locks.clear();
 }
 
 } // namespace duckdb

@@ -49,6 +49,12 @@ public:
 	unique_ptr<StorageLockKey> GetSharedLock() {
 		return checkpoint_lock.GetSharedLock();
 	}
+	unique_ptr<StorageLockKey> GetSharedReclusterWriteLock() {
+		return recluster_write_gate.GetSharedLock();
+	}
+	unique_ptr<StorageLockKey> GetExclusiveReclusterWriteLock() {
+		return recluster_write_gate.GetExclusiveLock();
+	}
 	bool AppendRequiresNewRowGroup(RowGroupCollection &collection, transaction_t checkpoint_id);
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
@@ -81,12 +87,15 @@ private:
 	vector<IndexStorageInfo> index_storage_infos;
 	//! Lock held while checkpointing
 	StorageLock checkpoint_lock;
+	//! Lock coordinating sorted-table writers and layout or catalog publication
+	StorageLock recluster_write_gate;
 	//! The last seen checkpoint while doing a concurrent operation, if any
 	optional_idx last_seen_checkpoint;
 	//! The amount of row groups the checkpoint is processing
 	optional_idx checkpoint_row_group_count;
 	//! Physical counters for tables that have SORTED BY history
 	unique_ptr<TableSortStorageState> sort_storage;
+	atomic<bool> sort_storage_initialized = false;
 };
 
 } // namespace duckdb

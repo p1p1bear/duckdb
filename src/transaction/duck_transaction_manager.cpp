@@ -423,6 +423,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// potentially resulting in garbage collection
 	bool store_transaction = undo_properties.has_updates || undo_properties.has_index_deletes ||
 	                         undo_properties.has_catalog_changes || error.HasError();
+	transaction.ReleaseReclusterWriteLocks();
 
 	// Remove the transaction from the list of active transactions and gather cleanup information.
 	auto cleanup_info = RemoveTransaction(transaction, store_transaction);
@@ -479,6 +480,7 @@ void DuckTransactionManager::RollbackTransaction(Transaction &transaction_p) {
 		// Obtain the transaction lock and roll back.
 		lock_guard<mutex> t_lock(transaction_lock);
 		error = transaction.Rollback();
+		transaction.ReleaseReclusterWriteLocks();
 
 		// Remove the transaction from the list of active transactions and gather cleanup information.
 		auto cleanup_info = RemoveTransaction(transaction);
