@@ -665,7 +665,7 @@ void SingleFileStorageCommitState::RevertCommit() {
 	}
 	if (wal.GetTotalWritten() > initial_written) {
 		// remove any entries written into the WAL by truncating it
-		wal.Truncate(initial_wal_size);
+		wal.TruncateAndSync(initial_wal_size);
 	}
 	state = WALCommitState::TRUNCATED;
 }

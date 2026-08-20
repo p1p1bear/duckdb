@@ -118,6 +118,20 @@ void TableLayoutHistory::Publish(shared_ptr<const RowGroupLayout> new_layout) {
 	current = std::move(new_layout);
 }
 
+void TableLayoutHistory::RevertPublished(const shared_ptr<const RowGroupLayout> &published_layout,
+                                         const shared_ptr<const RowGroupLayout> &previous_layout) {
+	if (!published_layout || !previous_layout) {
+		throw InternalException("Cannot revert a row group layout with a null identity");
+	}
+
+	lock_guard<mutex> guard(lock);
+	if (current.get() != published_layout.get() || previous.empty() || previous.back().get() != previous_layout.get()) {
+		throw InternalException("Cannot revert a row group layout that is no longer current");
+	}
+	current = std::move(previous.back());
+	previous.pop_back();
+}
+
 void TableLayoutHistory::InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree,
                                                shared_ptr<const RowGroupLayout> expected_layout) {
 	if (!tree) {

@@ -332,6 +332,19 @@ void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) 
 	history->Publish(std::move(layout));
 }
 
+void RowGroupCollection::RevertPublishedLayout(const shared_ptr<const RowGroupLayout> &published_layout,
+                                               const shared_ptr<const RowGroupLayout> &previous_layout) {
+	shared_ptr<TableLayoutHistory> history;
+	{
+		lock_guard<mutex> guard(row_group_pointer_lock);
+		history = layout_history;
+	}
+	if (!history) {
+		throw InternalException("Cannot revert a layout without layout history");
+	}
+	history->RevertPublished(published_layout, previous_layout);
+}
+
 bool RowGroupCollection::MaterializeCurrentLayout() {
 	auto layout = GetCurrentLayout();
 	if (!layout || layout->patches.empty()) {

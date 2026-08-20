@@ -245,6 +245,8 @@ public:
 	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
 	                                                    shared_ptr<const LayoutPatch> patch) const;
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
+	void RevertPublishedLayout(const shared_ptr<const RowGroupLayout> &published_layout,
+	                           const shared_ptr<const RowGroupLayout> &previous_layout);
 	bool MaterializeCurrentLayout();
 	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
 	void CleanupLayoutHistory(transaction_t oldest_active_start);

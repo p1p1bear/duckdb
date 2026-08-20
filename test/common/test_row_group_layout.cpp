@@ -145,6 +145,27 @@ TEST_CASE("Table layout history selects layouts by transaction start time", "[st
 	REQUIRE(history.GetCurrent()->layout_version == 2);
 }
 
+TEST_CASE("Table layout history reverts only the current publication", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto tree = GetLayoutTestTree(con, "layout_revert_test");
+
+	auto initial = make_shared_ptr<RowGroupLayout>(INITIAL_LAYOUT_VERSION, 0, tree);
+	TableLayoutHistory history(initial);
+	auto version_one = make_shared_ptr<RowGroupLayout>(1, 10, tree);
+	auto version_two = make_shared_ptr<RowGroupLayout>(2, 20, tree);
+	history.Publish(version_one);
+	history.Publish(version_two);
+
+	REQUIRE_THROWS_AS(history.RevertPublished(version_one, initial), InternalException);
+	REQUIRE(history.GetCurrent().get() == version_two.get());
+	history.RevertPublished(version_two, version_one);
+	REQUIRE(history.GetCurrent().get() == version_one.get());
+	REQUIRE(history.GetForTransaction(9).get() == initial.get());
+	REQUIRE(history.GetForTransaction(20).get() == version_one.get());
+	REQUIRE_THROWS_AS(history.RevertPublished(version_two, version_one), InternalException);
+}
+
 TEST_CASE("Row group append organization enforces run boundaries", "[storage][row_group_layout]") {
 	DuckDB db;
 	Connection con(db);

@@ -92,6 +92,14 @@ void WriteAheadLog::Truncate(idx_t size) {
 	storage_manager.SetWALSize(writer->GetFileSize());
 }
 
+void WriteAheadLog::TruncateAndSync(idx_t size) {
+	Truncate(size);
+	if (writer) {
+		writer->Sync();
+		storage_manager.SetWALSize(writer->GetFileSize());
+	}
+}
+
 bool WriteAheadLog::Initialized() const {
 	return init_state == WALInitState::INITIALIZED;
 }
