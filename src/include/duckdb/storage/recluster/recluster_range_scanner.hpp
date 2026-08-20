@@ -11,6 +11,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 
 namespace duckdb {
 
@@ -21,8 +22,10 @@ class TableScanState;
 class ReclusterRangeScanner {
 public:
 	explicit ReclusterRangeScanner(ReclusterTaskContext &task_context);
+	ReclusterRangeScanner(ReclusterTaskContext &task_context, RowGroupRange range);
 	~ReclusterRangeScanner();
 
+	static vector<LogicalType> GetOutputTypes(const ReclusterTaskContext &task_context);
 	void InitializeChunk(DataChunk &chunk) const;
 	bool Scan(DataChunk &chunk);
 	const vector<LogicalType> &GetOutputTypes() const {
