@@ -288,8 +288,7 @@ shared_ptr<const RowGroupLayout> RowGroupCollection::GetCurrentLayout() const {
 	return history ? history->GetCurrent() : nullptr;
 }
 
-shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transaction_t visible_from,
-                                                                        shared_ptr<const LayoutPatch> patch) const {
+shared_ptr<RowGroupLayout> RowGroupCollection::BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const {
 	if (!patch) {
 		throw InternalException("Cannot build a row group layout with a null patch");
 	}
@@ -316,8 +315,14 @@ shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transact
 		throw InternalException("Cannot publish overlapping row group layout patches");
 	}
 	patches.insert(patches.begin() + NumericCast<int64_t>(insert_position), std::move(patch));
-	return make_shared_ptr<RowGroupLayout>(current->layout_version + 1, visible_from, current->base_tree,
-	                                       std::move(patches));
+	return make_shared_ptr<RowGroupLayout>(current->layout_version + 1, 0, current->base_tree, std::move(patches));
+}
+
+shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transaction_t visible_from,
+                                                                        shared_ptr<const LayoutPatch> patch) const {
+	auto result = BuildPendingPatchedLayout(std::move(patch));
+	result->visible_from = visible_from;
+	return result;
 }
 
 void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) {

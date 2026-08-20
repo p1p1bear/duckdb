@@ -37,6 +37,7 @@ public:
 	optional<CheckpointLayoutSnapshot> GetLastCheckpoint() const;
 	void ClearLastCheckpoint();
 	bool TryRegisterTask(shared_ptr<RangeTask> task);
+	bool OwnsTask(const shared_ptr<RangeTask> &task) const;
 	shared_ptr<RangeTask> GetTask(recluster_task_id_t task_id) const;
 	shared_ptr<RangeTask> GetTaskForRow(row_t row_id) const;
 	vector<shared_ptr<RangeTask>> DisableAndGetTasks();

@@ -44,6 +44,15 @@ static ReclusterTaskStartResult StartOutputTask(Connection &con, const string &t
 	return result;
 }
 
+static void PrepareOutputTask(ReclusterTaskStartResult &start) {
+	ReclusterOutputWriter writer(*start.task);
+	writer.Write();
+	REQUIRE(start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
+	ReclusterDeleteCatchup catchup(*start.task);
+	catchup.Run();
+	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
+}
+
 static void RemoveOutputTask(Connection &con, ReclusterTaskStartResult &start, const string &table_name) {
 	duckdb::shared_ptr<TableReclusterState> state;
 	con.context->RunFunctionInTransaction([&]() {
@@ -578,5 +587,145 @@ TEST_CASE("Recluster committed DELETE metadata spans task-private blocks", "[sto
 		owner->Abort();
 	});
 
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[storage][recluster_finalize]") {
+	auto path = TestCreatePath("recluster_finalize.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE finalize_db"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT ((i * 37) % 4096)::INTEGER, i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+
+	auto start = StartOutputTask(con, "tbl");
+	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
+	REQUIRE(start.task);
+	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
+	PrepareOutputTask(start);
+	auto storage = start.task->GetTaskContext().GetStorage();
+	auto collection = storage->GetRowGroupCollection();
+	auto state = storage->GetDataTableInfo()->GetReclusterState();
+	auto old_layout = collection->GetCurrentLayout();
+	auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load();
+	REQUIRE(old_layout);
+	REQUIRE(old_layout->layout_version == old_layout_version);
+	auto unresolved_slot = start.task->TryReserveDeleteSlot({23});
+	REQUIRE(unresolved_slot);
+	ReclusterTaskFinalizeStatus status = ReclusterTaskFinalizeStatus::STALE_TASK;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		status = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
+	});
+	REQUIRE(status == ReclusterTaskFinalizeStatus::RETRY);
+	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
+	REQUIRE(state->OwnsTask(start.task));
+	REQUIRE(collection->GetCurrentLayout().get() == old_layout.get());
+	REQUIRE(start.task->ResolveDeleteSlot(*unresolved_slot, DeleteSlotState::ABORTED));
+
+	Connection old_reader(db);
+	REQUIRE_NO_FAIL(old_reader.Query("USE finalize_db"));
+	old_reader.BeginTransaction();
+	auto old_count = old_reader.Query("SELECT count(*) FROM tbl");
+	REQUIRE(old_count);
+	REQUIRE(CHECK_COLUMN(old_count, 0, {4096}));
+
+	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload = 19"));
+	REQUIRE(start.task->GetLatestDeleteSequence() == 2);
+	REQUIRE(start.task->GetTaskContext().GetOutput().GetManifest().header.last_applied_delete_sequence == 0);
+
+	status = ReclusterTaskFinalizeStatus::STALE_TASK;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		status = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
+	});
+	REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
+	REQUIRE(start.task->GetState() == RangeTaskState::PUBLISHED);
+	REQUIRE(!state->GetTask(start.task->GetTaskId()));
+
+	auto published_layout = collection->GetCurrentLayout();
+	REQUIRE(published_layout);
+	REQUIRE(published_layout.get() != old_layout.get());
+	REQUIRE(published_layout->layout_version == old_layout_version + 1);
+	REQUIRE(published_layout->patches.size() == 1);
+	REQUIRE(published_layout->patches[0]->task_id == start.task->GetTaskId());
+	REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version + 1);
+
+	auto old_rows = old_reader.Query("SELECT count(*), count(*) FILTER (WHERE payload = 19) FROM tbl");
+	REQUIRE(old_rows);
+	REQUIRE(CHECK_COLUMN(old_rows, 0, {4096}));
+	REQUIRE(CHECK_COLUMN(old_rows, 1, {1}));
+	auto current_rows = con.Query("SELECT count(*), count(*) FILTER (WHERE payload = 19) FROM tbl");
+	REQUIRE(current_rows);
+	REQUIRE(CHECK_COLUMN(current_rows, 0, {4095}));
+	REQUIRE(CHECK_COLUMN(current_rows, 1, {0}));
+	old_reader.Rollback();
+
+	start.task.reset();
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster finalize restores the old layout after commit failure", "[storage][recluster_finalize]") {
+	auto path = TestCreatePath("recluster_finalize_failure.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE finalize_db"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT ((i * 37) % 4096)::INTEGER, i FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+
+		auto start = StartOutputTask(con, "tbl");
+		REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
+		REQUIRE(start.task);
+		OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
+		PrepareOutputTask(start);
+		auto storage = start.task->GetTaskContext().GetStorage();
+		auto collection = storage->GetRowGroupCollection();
+		auto state = storage->GetDataTableInfo()->GetReclusterState();
+		auto old_layout = collection->GetCurrentLayout();
+		auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load();
+
+		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=true"));
+		string error;
+		try {
+			con.context->RunFunctionInTransaction([&]() {
+				auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+				entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
+			});
+		} catch (std::exception &ex) {
+			error = ex.what();
+		}
+		REQUIRE(error.find("Forced commit failure") != string::npos);
+		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=false"));
+		REQUIRE(start.task->GetState() == RangeTaskState::FAILED);
+		REQUIRE(!state->GetTask(start.task->GetTaskId()));
+		REQUIRE(collection->GetCurrentLayout().get() == old_layout.get());
+		REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version);
+		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+		start.task.reset();
+	}
+
+	{
+		DuckDB db(path);
+		Connection con(db);
+		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+	}
 	DeleteDatabase(path);
 }

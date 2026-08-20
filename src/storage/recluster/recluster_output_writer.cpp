@@ -182,16 +182,17 @@ idx_t ReclusterOutput::ApplyCommittedDeletes(const vector<row_t> &new_rowids) {
 		auto vector_start = row_group_start + NumericCast<row_t>(vector_index * STANDARD_VECTOR_SIZE);
 		auto vector_end = MinValue<row_t>(row_group_end, vector_start + NumericCast<row_t>(STANDARD_VECTOR_SIZE));
 
-		vector<row_t> vector_offsets;
+		row_t vector_offsets[STANDARD_VECTOR_SIZE];
+		idx_t vector_count = 0;
 		while (row_index < new_rowids.size() && new_rowids[row_index] < vector_end) {
 			if (new_rowids[row_index] < vector_start) {
 				throw InternalException("Recluster DELETE remap row IDs are not monotonic");
 			}
-			vector_offsets.push_back(new_rowids[row_index] - vector_start);
+			vector_offsets[vector_count++] = new_rowids[row_index] - vector_start;
 			row_index++;
 		}
-		deleted_count += row_group->GetNode().GetOrCreateVersionInfo().DeleteCommittedRows(
-		    vector_index, vector_offsets.data(), vector_offsets.size());
+		deleted_count += row_group->GetNode().GetOrCreateVersionInfo().DeleteCommittedRows(vector_index, vector_offsets,
+		                                                                                   vector_count);
 	}
 	return deleted_count;
 }

@@ -26,6 +26,7 @@ class RangeTask;
 class TableReclusterState;
 
 enum class ReclusterTaskStartStatus : uint8_t { STARTED, STALE_CANDIDATE, RANGE_UNAVAILABLE, CANCELLED };
+enum class ReclusterTaskFinalizeStatus : uint8_t { PUBLISHED, RETRY, STALE_TASK, CANCELLED };
 
 struct ReclusterTaskStartResult {
 	ReclusterTaskStartStatus status = ReclusterTaskStartStatus::STALE_CANDIDATE;
@@ -54,6 +55,7 @@ public:
 	//! Called after WAL replay to synchronize the final recovered catalog without creating new candidates.
 	void SynchronizeLoadedCatalog();
 	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate);
+	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
 
 	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
 		return layout_publish_lock.GetSharedLock();

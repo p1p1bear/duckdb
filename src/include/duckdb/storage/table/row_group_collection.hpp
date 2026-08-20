@@ -242,6 +242,7 @@ public:
 	RowGroupCollectionSnapshot GetSnapshot(DuckTransaction &transaction) const;
 	RowGroupCollectionSnapshot GetCurrentSnapshot() const;
 	shared_ptr<const RowGroupLayout> GetCurrentLayout() const;
+	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const;
 	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
 	                                                    shared_ptr<const LayoutPatch> patch) const;
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);

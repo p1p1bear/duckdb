@@ -66,6 +66,7 @@ blacklist = [
     "ReclusterCandidateType",
     "ReclusterCommitLifecycle",
     "ReclusterDeleteTransactionState",
+    "ReclusterTaskFinalizeStatus",
     "ReclusterTaskStartStatus",
 ]
 

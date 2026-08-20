@@ -131,7 +131,7 @@ bool RangeTask::IsProgressTransition(RangeTaskState expected, RangeTaskState tar
 	case RangeTaskState::PREPARED:
 		return target == RangeTaskState::FINALIZING;
 	case RangeTaskState::FINALIZING:
-		return target == RangeTaskState::CATCHING_UP_DELETES;
+		return target == RangeTaskState::CATCHING_UP_DELETES || target == RangeTaskState::PREPARED;
 	default:
 		return false;
 	}

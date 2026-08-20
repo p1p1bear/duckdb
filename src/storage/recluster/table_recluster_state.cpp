@@ -121,6 +121,23 @@ bool TableReclusterState::TryRegisterTask(shared_ptr<RangeTask> task) {
 	return true;
 }
 
+bool TableReclusterState::OwnsTask(const shared_ptr<RangeTask> &task) const {
+	if (!task) {
+		return false;
+	}
+	lock_guard<mutex> guard(task_lock);
+	auto task_entry = tasks.find(task->GetTaskId());
+	auto reservation_entry = reservation_starts.find(task->GetTaskId());
+	if (task_entry == tasks.end() || task_entry->second.get() != task.get() ||
+	    reservation_entry == reservation_starts.end() || reservation_entry->second != task->GetRange().start) {
+		return false;
+	}
+	auto range_entry = reserved_ranges.find(reservation_entry->second);
+	return range_entry != reserved_ranges.end() && range_entry->second.task_id == task->GetTaskId() &&
+	       range_entry->second.range.start == task->GetRange().start &&
+	       range_entry->second.range.end == task->GetRange().end;
+}
+
 shared_ptr<RangeTask> TableReclusterState::GetTask(recluster_task_id_t task_id) const {
 	lock_guard<mutex> guard(task_lock);
 	auto entry = tasks.find(task_id);
