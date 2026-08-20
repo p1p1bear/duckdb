@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/common/atomic.hpp"
@@ -16,6 +17,7 @@
 
 namespace duckdb {
 class DatabaseInstance;
+class MetadataManager;
 struct MetadataBlockInfo;
 
 struct MetadataBlock {
@@ -52,6 +54,34 @@ struct MetadataHandle {
 	BufferHandle handle;
 };
 
+class TaskPrivateMetadataBlockOwner {
+public:
+	~TaskPrivateMetadataBlockOwner();
+
+	TaskPrivateMetadataBlockOwner(const TaskPrivateMetadataBlockOwner &) = delete;
+	TaskPrivateMetadataBlockOwner &operator=(const TaskPrivateMetadataBlockOwner &) = delete;
+
+	MetadataHandle AllocateHandle();
+	void Flush(QueryContext context = QueryContext());
+	vector<block_id_t> GetBlockIds() const;
+	void MarkPublished();
+	void Abort();
+
+	MetadataManager &GetManager() {
+		return manager;
+	}
+
+private:
+	friend class MetadataManager;
+
+	TaskPrivateMetadataBlockOwner(MetadataManager &manager, uint64_t owner_id);
+
+private:
+	MetadataManager &manager;
+	uint64_t owner_id;
+	bool active = true;
+};
+
 class MetadataManager {
 public:
 	//! The amount of metadata blocks per storage block
@@ -66,6 +96,7 @@ public:
 	}
 
 	MetadataHandle AllocateHandle();
+	unique_ptr<TaskPrivateMetadataBlockOwner> CreateTaskPrivateBlockOwner();
 	MetadataHandle Pin(const MetadataPointer &pointer);
 
 	MetadataHandle Pin(const QueryContext &context, const MetadataPointer &pointer);
@@ -101,16 +132,31 @@ protected:
 	mutable mutex block_lock;
 	unordered_map<block_id_t, MetadataBlock> blocks;
 	unordered_map<block_id_t, idx_t> modified_blocks;
+	unordered_map<block_id_t, uint64_t> task_private_blocks;
+	unordered_map<uint64_t, vector<block_id_t>> task_private_owners;
+	uint64_t next_task_private_owner_id = 1;
 
 protected:
 	block_id_t AllocateNewBlock(unique_lock<mutex> &block_lock);
+	block_id_t AllocateNewTaskPrivateBlock(unique_lock<mutex> &block_lock, uint64_t owner_id);
 	block_id_t PeekNextBlockId() const;
 	block_id_t GetNextBlockId() const;
 
 	void AddBlock(unique_lock<mutex> &block_lock, MetadataBlock new_block, bool if_exists = false);
 	void AddAndRegisterBlock(unique_lock<mutex> &block_lock, MetadataBlock block);
-	void ConvertToTransient(unique_lock<mutex> &block_lock, MetadataBlock &block);
+	void ConvertToTransient(unique_lock<mutex> &block_lock, block_id_t block_id);
 	MetadataPointer FromDiskPointerInternal(unique_lock<mutex> &block_lock, MetaBlockPointer pointer);
+	void FlushBlock(block_id_t block_id, QueryContext context);
+
+private:
+	friend class TaskPrivateMetadataBlockOwner;
+
+	uint64_t RegisterTaskPrivateOwner();
+	MetadataHandle AllocateTaskPrivateHandle(uint64_t owner_id);
+	void FlushTaskPrivateBlocks(uint64_t owner_id, QueryContext context);
+	vector<block_id_t> GetTaskPrivateBlockIds(uint64_t owner_id) const;
+	void PublishTaskPrivateBlocks(uint64_t owner_id);
+	void AbortTaskPrivateBlocks(uint64_t owner_id);
 };
 
 } // namespace duckdb

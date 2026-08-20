@@ -51,6 +51,74 @@ MetadataManager::MetadataManager(BlockManager &block_manager, BufferManager &buf
 MetadataManager::~MetadataManager() {
 }
 
+TaskPrivateMetadataBlockOwner::TaskPrivateMetadataBlockOwner(MetadataManager &manager_p, uint64_t owner_id_p)
+    : manager(manager_p), owner_id(owner_id_p) {
+}
+
+TaskPrivateMetadataBlockOwner::~TaskPrivateMetadataBlockOwner() {
+	if (!active) {
+		return;
+	}
+	try {
+		Abort();
+	} catch (...) { // NOLINT: destructors cannot report asynchronous cleanup failures
+	}
+}
+
+MetadataHandle TaskPrivateMetadataBlockOwner::AllocateHandle() {
+	if (!active) {
+		throw InternalException("Cannot allocate from an inactive task-private metadata owner");
+	}
+	return manager.AllocateTaskPrivateHandle(owner_id);
+}
+
+void TaskPrivateMetadataBlockOwner::Flush(QueryContext context) {
+	if (!active) {
+		throw InternalException("Cannot flush an inactive task-private metadata owner");
+	}
+	manager.FlushTaskPrivateBlocks(owner_id, context);
+}
+
+vector<block_id_t> TaskPrivateMetadataBlockOwner::GetBlockIds() const {
+	if (!active) {
+		throw InternalException("Cannot inspect an inactive task-private metadata owner");
+	}
+	return manager.GetTaskPrivateBlockIds(owner_id);
+}
+
+void TaskPrivateMetadataBlockOwner::MarkPublished() {
+	if (!active) {
+		throw InternalException("Cannot publish an inactive task-private metadata owner");
+	}
+	manager.PublishTaskPrivateBlocks(owner_id);
+	active = false;
+}
+
+void TaskPrivateMetadataBlockOwner::Abort() {
+	if (!active) {
+		return;
+	}
+	manager.AbortTaskPrivateBlocks(owner_id);
+	active = false;
+}
+
+unique_ptr<TaskPrivateMetadataBlockOwner> MetadataManager::CreateTaskPrivateBlockOwner() {
+	return unique_ptr<TaskPrivateMetadataBlockOwner>(
+	    new TaskPrivateMetadataBlockOwner(*this, RegisterTaskPrivateOwner()));
+}
+
+uint64_t MetadataManager::RegisterTaskPrivateOwner() {
+	lock_guard<mutex> guard(block_lock);
+	if (next_task_private_owner_id == 0) {
+		throw InternalException("Task-private metadata owner ID space is exhausted");
+	}
+	auto owner_id = next_task_private_owner_id++;
+	if (!task_private_owners.emplace(owner_id, vector<block_id_t>()).second) {
+		throw InternalException("Task-private metadata owner ID is already registered");
+	}
+	return owner_id;
+}
+
 MetadataHandle MetadataManager::AllocateHandle() {
 	// check if there is any free space left in an existing block
 	// if not allocate a new block
@@ -60,7 +128,7 @@ MetadataHandle MetadataManager::AllocateHandle() {
 	for (auto &kv : blocks) {
 		auto &block = kv.second;
 		D_ASSERT(kv.first == block.block_id);
-		if (!block.free_blocks.empty()) {
+		if (task_private_blocks.find(kv.first) == task_private_blocks.end() && !block.free_blocks.empty()) {
 			free_block = kv.first;
 			break;
 		}
@@ -76,22 +144,65 @@ MetadataHandle MetadataManager::AllocateHandle() {
 
 	// select the first free metadata block we can find
 	pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
-	auto &block = blocks[free_block];
+	auto &block = blocks.at(free_block);
 	// the block is now dirty
 	block.dirty = true;
 	if (block.block->BlockId() < MAXIMUM_BLOCK) {
 		// this block is a disk-backed block, yet we are planning to write to it
 		// we need to convert it into a transient block before we can write to it
-		ConvertToTransient(guard, block);
-		D_ASSERT(block.block->BlockId() >= MAXIMUM_BLOCK);
+		ConvertToTransient(guard, free_block);
 	}
-	D_ASSERT(!block.free_blocks.empty());
-	pointer.index = block.free_blocks.back();
+	auto &writable_block = blocks.at(free_block);
+	D_ASSERT(writable_block.block->BlockId() >= MAXIMUM_BLOCK);
+	D_ASSERT(!writable_block.free_blocks.empty());
+	pointer.index = writable_block.free_blocks.back();
 	// mark the block as used
-	block.free_blocks.pop_back();
+	writable_block.free_blocks.pop_back();
 	D_ASSERT(pointer.index < METADATA_BLOCK_COUNT);
 	guard.unlock();
 	// pin the block
+	return Pin(pointer);
+}
+
+MetadataHandle MetadataManager::AllocateTaskPrivateHandle(uint64_t owner_id) {
+	MetadataPointer pointer;
+	unique_lock<mutex> guard(block_lock);
+	auto owner_entry = task_private_owners.find(owner_id);
+	if (owner_entry == task_private_owners.end()) {
+		throw InternalException("Task-private metadata owner does not exist");
+	}
+
+	block_id_t free_block = INVALID_BLOCK;
+	for (auto block_id : owner_entry->second) {
+		auto block_entry = blocks.find(block_id);
+		auto private_entry = task_private_blocks.find(block_id);
+		if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+		    private_entry->second != owner_id) {
+			throw InternalException("Task-private metadata block ownership is inconsistent");
+		}
+		if (!block_entry->second.free_blocks.empty()) {
+			free_block = block_id;
+			break;
+		}
+	}
+	if (free_block == INVALID_BLOCK) {
+		guard.unlock();
+		free_block = AllocateNewTaskPrivateBlock(guard, owner_id);
+	}
+	D_ASSERT(guard.owns_lock());
+
+	auto &block = blocks.at(free_block);
+	block.dirty = true;
+	if (block.block->BlockId() < MAXIMUM_BLOCK) {
+		ConvertToTransient(guard, free_block);
+	}
+	auto &writable_block = blocks.at(free_block);
+	D_ASSERT(writable_block.block->BlockId() >= MAXIMUM_BLOCK);
+	D_ASSERT(!writable_block.free_blocks.empty());
+	pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
+	pointer.index = writable_block.free_blocks.back();
+	writable_block.free_blocks.pop_back();
+	guard.unlock();
 	return Pin(pointer);
 }
 
@@ -127,9 +238,13 @@ MetadataHandle MetadataManager::Pin(const QueryContext &context, const MetadataP
 	return handle;
 }
 
-void MetadataManager::ConvertToTransient(unique_lock<mutex> &block_lock, MetadataBlock &metadata_block) {
+void MetadataManager::ConvertToTransient(unique_lock<mutex> &block_lock, block_id_t block_id) {
 	D_ASSERT(block_lock.owns_lock());
-	auto old_block = metadata_block.block;
+	auto entry = blocks.find(block_id);
+	if (entry == blocks.end()) {
+		throw InternalException("Cannot convert a missing metadata block to transient storage");
+	}
+	auto old_block = entry->second.block;
 	block_lock.unlock();
 	// pin the old block
 	auto old_buffer = buffer_manager.Pin(old_block);
@@ -142,11 +257,15 @@ void MetadataManager::ConvertToTransient(unique_lock<mutex> &block_lock, Metadat
 	memcpy(new_buffer.GetDataMutable(), old_buffer.Ptr(), block_manager.GetBlockSize());
 
 	// unregister the old block
-	block_manager.UnregisterBlock(metadata_block.block_id);
+	block_manager.UnregisterBlock(block_id);
 
 	block_lock.lock();
-	metadata_block.block = std::move(new_block);
-	metadata_block.dirty = true;
+	entry = blocks.find(block_id);
+	if (entry == blocks.end()) {
+		throw InternalException("Metadata block disappeared while converting it to transient storage");
+	}
+	entry->second.block = std::move(new_block);
+	entry->second.dirty = true;
 }
 
 block_id_t MetadataManager::AllocateNewBlock(unique_lock<mutex> &block_lock) {
@@ -166,6 +285,37 @@ block_id_t MetadataManager::AllocateNewBlock(unique_lock<mutex> &block_lock) {
 
 	block_lock.lock();
 	AddBlock(block_lock, std::move(new_block));
+	return new_block_id;
+}
+
+block_id_t MetadataManager::AllocateNewTaskPrivateBlock(unique_lock<mutex> &block_lock, uint64_t owner_id) {
+	D_ASSERT(!block_lock.owns_lock());
+	auto handle = buffer_manager.Allocate(MemoryTag::METADATA, &block_manager, false);
+	memset(handle.GetDataMutable(), 0, block_manager.GetBlockSize());
+	auto new_block_id = block_manager.GetFreeBlockId();
+
+	MetadataBlock new_block;
+	new_block.block = handle.GetBlockHandle();
+	new_block.block_id = new_block_id;
+	for (idx_t i = 0; i < METADATA_BLOCK_COUNT; i++) {
+		new_block.free_blocks.push_back(NumericCast<uint8_t>(METADATA_BLOCK_COUNT - i - 1));
+	}
+	new_block.dirty = true;
+
+	block_lock.lock();
+	auto owner_entry = task_private_owners.find(owner_id);
+	if (owner_entry == task_private_owners.end()) {
+		block_lock.unlock();
+		new_block.block.reset();
+		handle.Destroy();
+		block_manager.MarkBlockAsModified(new_block_id);
+		throw InternalException("Task-private metadata owner was removed during allocation");
+	}
+	AddBlock(block_lock, std::move(new_block));
+	if (!task_private_blocks.emplace(new_block_id, owner_id).second) {
+		throw InternalException("Task-private metadata block was already owned");
+	}
+	owner_entry->second.push_back(new_block_id);
 	return new_block_id;
 }
 
@@ -271,51 +421,81 @@ MetaBlockPointer MetadataManager::FromBlockPointer(BlockPointer block_pointer, c
 }
 
 idx_t MetadataManager::BlockCount() {
-	return blocks.size();
+	lock_guard<mutex> guard(block_lock);
+	D_ASSERT(blocks.size() >= task_private_blocks.size());
+	return blocks.size() - task_private_blocks.size();
 }
 
 void MetadataManager::Flush(QueryContext context) {
-	// Write the blocks of the metadata manager to disk.
-	const idx_t total_metadata_size = GetMetadataBlockSize() * METADATA_BLOCK_COUNT;
+	vector<block_id_t> block_ids;
+	{
+		lock_guard<mutex> guard(block_lock);
+		block_ids.reserve(blocks.size() - task_private_blocks.size());
+		for (auto &entry : blocks) {
+			if (task_private_blocks.find(entry.first) == task_private_blocks.end()) {
+				block_ids.push_back(entry.first);
+			}
+		}
+	}
+	for (auto block_id : block_ids) {
+		FlushBlock(block_id, context);
+	}
+}
 
-	unique_lock<mutex> guard(block_lock, std::defer_lock);
-	for (auto &kv : blocks) {
-		auto &block = kv.second;
+void MetadataManager::FlushBlock(block_id_t block_id, QueryContext context) {
+	const idx_t total_metadata_size = GetMetadataBlockSize() * METADATA_BLOCK_COUNT;
+	shared_ptr<BlockHandle> block_handle;
+	{
+		lock_guard<mutex> guard(block_lock);
+		auto entry = blocks.find(block_id);
+		if (entry == blocks.end()) {
+			throw InternalException("Cannot flush a missing metadata block");
+		}
+		auto &block = entry->second;
 		if (!block.dirty) {
 			if (block.block->BlockId() >= MAXIMUM_BLOCK) {
 				throw InternalException("Transient blocks must always be marked as dirty");
 			}
-			continue;
+			return;
 		}
-		auto block_handle = block.block;
-		auto handle = buffer_manager.Pin(block_handle);
-		// zero-initialize the few leftover bytes
-		memset(handle.GetDataMutable() + total_metadata_size, 0, block_manager.GetBlockSize() - total_metadata_size);
-		D_ASSERT(kv.first == block.block_id);
-		if (block_handle->BlockId() >= MAXIMUM_BLOCK) {
-			// Convert the temporary block to a persistent block.
-			// we cannot use ConvertToPersistent as another thread might still be reading the block
-			// so we use the safe version of ConvertToPersistent
-			auto new_block = block_manager.ConvertToPersistent(context, kv.first, std::move(block_handle),
-			                                                   std::move(handle), ConvertToPersistentMode::THREAD_SAFE);
+		block_handle = block.block;
+	}
 
-			guard.lock();
-			block.block = std::move(new_block);
-			guard.unlock();
-		} else {
-			// Already a persistent block, so we only need to write it.
-			D_ASSERT(block.block->BlockId() == block.block_id);
-			block_manager.Write(context, handle.GetFileBuffer(), block.block_id);
-		}
-		// the block is no longer dirty
-		block.dirty = false;
+	auto handle = buffer_manager.Pin(block_handle);
+	memset(handle.GetDataMutable() + total_metadata_size, 0, block_manager.GetBlockSize() - total_metadata_size);
+	shared_ptr<BlockHandle> persistent_block;
+	if (block_handle->BlockId() >= MAXIMUM_BLOCK) {
+		persistent_block = block_manager.ConvertToPersistent(context, block_id, std::move(block_handle),
+		                                                     std::move(handle), ConvertToPersistentMode::THREAD_SAFE);
+	} else {
+		D_ASSERT(block_handle->BlockId() == block_id);
+		block_manager.Write(context, handle.GetFileBuffer(), block_id);
+		persistent_block = std::move(block_handle);
+	}
+
+	lock_guard<mutex> guard(block_lock);
+	auto entry = blocks.find(block_id);
+	if (entry == blocks.end()) {
+		throw InternalException("Metadata block disappeared while it was being flushed");
+	}
+	entry->second.block = std::move(persistent_block);
+	entry->second.dirty = false;
+}
+
+void MetadataManager::FlushTaskPrivateBlocks(uint64_t owner_id, QueryContext context) {
+	auto block_ids = GetTaskPrivateBlockIds(owner_id);
+	for (auto block_id : block_ids) {
+		FlushBlock(block_id, context);
 	}
 }
 
 void MetadataManager::Write(WriteStream &sink) {
-	sink.Write<uint64_t>(blocks.size());
+	lock_guard<mutex> guard(block_lock);
+	sink.Write<uint64_t>(blocks.size() - task_private_blocks.size());
 	for (auto &kv : blocks) {
-		kv.second.Write(sink);
+		if (task_private_blocks.find(kv.first) == task_private_blocks.end()) {
+			kv.second.Write(sink);
+		}
 	}
 }
 
@@ -412,6 +592,9 @@ void MetadataManager::MarkBlocksAsModified() {
 
 	for (auto &kv : blocks) {
 		auto &block = kv.second;
+		if (task_private_blocks.find(kv.first) != task_private_blocks.end()) {
+			continue;
+		}
 		idx_t free_list = block.FreeBlocksToInteger();
 		idx_t occupied_list = ~free_list;
 		modified_blocks[block.block_id] = occupied_list;
@@ -463,6 +646,9 @@ vector<MetadataBlockInfo> MetadataManager::GetMetadataInfo() const {
 	vector<MetadataBlockInfo> result;
 	unique_lock<mutex> guard(block_lock);
 	for (auto &block : blocks) {
+		if (task_private_blocks.find(block.first) != task_private_blocks.end()) {
+			continue;
+		}
 		MetadataBlockInfo block_info;
 		block_info.block_id = block.second.block_id;
 		block_info.total_blocks = MetadataManager::METADATA_BLOCK_COUNT;
@@ -481,9 +667,100 @@ vector<shared_ptr<BlockHandle>> MetadataManager::GetBlocks() const {
 	vector<shared_ptr<BlockHandle>> result;
 	unique_lock<mutex> guard(block_lock);
 	for (auto &entry : blocks) {
-		result.push_back(entry.second.block);
+		if (task_private_blocks.find(entry.first) == task_private_blocks.end()) {
+			result.push_back(entry.second.block);
+		}
 	}
 	return result;
+}
+
+vector<block_id_t> MetadataManager::GetTaskPrivateBlockIds(uint64_t owner_id) const {
+	lock_guard<mutex> guard(block_lock);
+	auto entry = task_private_owners.find(owner_id);
+	if (entry == task_private_owners.end()) {
+		throw InternalException("Task-private metadata owner does not exist");
+	}
+	for (auto block_id : entry->second) {
+		auto private_entry = task_private_blocks.find(block_id);
+		if (blocks.find(block_id) == blocks.end() || private_entry == task_private_blocks.end() ||
+		    private_entry->second != owner_id) {
+			throw InternalException("Task-private metadata block ownership is inconsistent");
+		}
+	}
+	auto result = entry->second;
+	std::sort(result.begin(), result.end());
+	return result;
+}
+
+void MetadataManager::PublishTaskPrivateBlocks(uint64_t owner_id) {
+	vector<block_id_t> block_ids;
+	{
+		lock_guard<mutex> guard(block_lock);
+		auto owner_entry = task_private_owners.find(owner_id);
+		if (owner_entry == task_private_owners.end()) {
+			throw InternalException("Task-private metadata owner does not exist");
+		}
+		block_ids = owner_entry->second;
+		for (auto block_id : block_ids) {
+			auto block_entry = blocks.find(block_id);
+			auto private_entry = task_private_blocks.find(block_id);
+			if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+			    private_entry->second != owner_id || block_entry->second.dirty ||
+			    block_entry->second.block->BlockId() >= MAXIMUM_BLOCK ||
+			    modified_blocks.find(block_id) != modified_blocks.end()) {
+				throw InternalException("Cannot publish unflushed task-private metadata blocks");
+			}
+		}
+		modified_blocks.reserve(modified_blocks.size() + block_ids.size());
+		try {
+			for (auto block_id : block_ids) {
+				auto occupied_blocks = ~blocks.find(block_id)->second.FreeBlocksToInteger();
+				modified_blocks.emplace(block_id, occupied_blocks);
+			}
+		} catch (...) {
+			for (auto block_id : block_ids) {
+				modified_blocks.erase(block_id);
+			}
+			throw;
+		}
+		for (auto block_id : block_ids) {
+			task_private_blocks.erase(block_id);
+		}
+		task_private_owners.erase(owner_entry);
+	}
+	for (auto block_id : block_ids) {
+		block_manager.MarkBlockAsCheckpointed(block_id);
+	}
+}
+
+void MetadataManager::AbortTaskPrivateBlocks(uint64_t owner_id) {
+	vector<block_id_t> block_ids;
+	vector<shared_ptr<BlockHandle>> block_handles;
+	{
+		lock_guard<mutex> guard(block_lock);
+		auto owner_entry = task_private_owners.find(owner_id);
+		if (owner_entry == task_private_owners.end()) {
+			throw InternalException("Task-private metadata owner does not exist");
+		}
+		block_ids = owner_entry->second;
+		block_handles.reserve(block_ids.size());
+		for (auto block_id : block_ids) {
+			auto block_entry = blocks.find(block_id);
+			auto private_entry = task_private_blocks.find(block_id);
+			if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+			    private_entry->second != owner_id) {
+				throw InternalException("Task-private metadata block ownership is inconsistent");
+			}
+			block_handles.push_back(block_entry->second.block);
+			blocks.erase(block_entry);
+			task_private_blocks.erase(block_id);
+		}
+		task_private_owners.erase(owner_entry);
+	}
+	block_handles.clear();
+	for (auto block_id : block_ids) {
+		block_manager.MarkBlockAsModified(block_id);
+	}
 }
 
 block_id_t MetadataManager::PeekNextBlockId() const {

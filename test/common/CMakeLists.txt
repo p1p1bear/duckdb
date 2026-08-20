@@ -31,6 +31,7 @@ add_library_unity(
   test_replacement_manifest.cpp
   test_row_group_layout.cpp
   test_table_sort_metadata.cpp
+  test_task_private_metadata.cpp
   test_logical_type_is_complete.cpp
   test_utf.cpp
   test_allocator_debug_info.cpp
