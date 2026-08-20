@@ -5,6 +5,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/appender.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -891,6 +892,80 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
 		REQUIRE(collection->GetRowGroup(2)->IsSealed());
 		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+	});
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("sorted_appender_layout.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS sorted_appender (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE sorted_appender"));
+	REQUIRE_NO_FAIL(con.Query("SET threads = 1"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE public_target(i INTEGER) SORTED BY (i)"));
+
+	Appender appender(con, "public_target");
+	for (idx_t i = 0; i < 1024; i++) {
+		appender.AppendRow(NumericCast<int32_t>(1023 - i));
+	}
+	appender.Flush();
+	for (idx_t i = 0; i < 1024; i++) {
+		appender.AppendRow(NumericCast<int32_t>(2047 - i));
+	}
+	appender.Flush();
+
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("public_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 1);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+	});
+
+	for (idx_t i = 0; i < 2048; i++) {
+		appender.AppendRow(NumericCast<int32_t>(4095 - i));
+	}
+	appender.Flush();
+	for (idx_t i = 0; i < 2048; i++) {
+		appender.AppendRow(NumericCast<int32_t>(6143 - i));
+	}
+	appender.Close();
+
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("public_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 3);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(collection->GetRowGroup(1)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+		REQUIRE(collection->GetRowGroup(1)->IsSealed());
+		REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
+		REQUIRE(collection->GetRowGroup(2)->IsSealed());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE internal_target(i INTEGER) SORTED BY (i)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("internal_target")));
+		MetaTransaction::Get(*con.context).ModifyDatabase(entry.GetStorage().db, DatabaseModificationType());
+		InternalAppender internal_appender(*con.context, entry);
+		for (idx_t i = 0; i < 4096; i++) {
+			internal_appender.AppendRow(NumericCast<int32_t>(4095 - i));
+		}
+		internal_appender.Close();
+	});
+
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("internal_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 2);
+		for (idx_t row_group_idx = 0; row_group_idx < 2; row_group_idx++) {
+			REQUIRE(collection->GetRowGroup(NumericCast<int64_t>(row_group_idx))->GetSortMetadata() ==
+			        RowGroupSortMetadata());
+		}
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
 	});
 	DeleteDatabase(path);
 }

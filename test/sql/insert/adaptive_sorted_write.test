@@ -190,6 +190,33 @@ WHERE i != expected
 ----
 0
 
+# COPY FROM shares the adaptive INSERT sink.
+statement ok
+CREATE TABLE copy_source AS
+SELECT 4095 - i AS i
+FROM range(4096) t(i)
+
+statement ok
+COPY copy_source TO '{TEST_DIR}/adaptive_sorted_write.csv' (FORMAT CSV)
+
+statement ok
+CREATE TABLE copy_write(i BIGINT) SORTED BY (i)
+
+query I
+COPY copy_write FROM '{TEST_DIR}/adaptive_sorted_write.csv' (FORMAT CSV)
+----
+4096
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS expected
+    FROM copy_write
+)
+WHERE i != expected
+----
+0
+
 # Trigger body INSERTs are deliberately not direct-sorted.
 statement ok
 CREATE TABLE trigger_target(i BIGINT) SORTED BY (i)
