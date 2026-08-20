@@ -133,6 +133,17 @@ optional<LoadedSegment<RowGroup>> RowGroupSegmentTree::LoadSegment() const {
 //===--------------------------------------------------------------------===//
 // Row Group Collection
 //===--------------------------------------------------------------------===//
+static uint64_t AllocateStorageGenerationId() {
+	static atomic<uint64_t> next_generation_id {1};
+	auto current = next_generation_id.load();
+	while (current != NumericLimits<uint64_t>::Maximum()) {
+		if (next_generation_id.compare_exchange_weak(current, current + 1)) {
+			return current;
+		}
+	}
+	throw InternalException("Row group collection storage generation ID space is exhausted");
+}
+
 RowGroupCollection::RowGroupCollection(shared_ptr<DataTableInfo> info_p, TableIOManager &io_manager,
                                        vector<LogicalType> types_p, idx_t row_start, idx_t total_rows)
     : RowGroupCollection(std::move(info_p), io_manager.GetBlockManagerForRowData(), std::move(types_p), row_start,
@@ -142,10 +153,10 @@ RowGroupCollection::RowGroupCollection(shared_ptr<DataTableInfo> info_p, TableIO
 RowGroupCollection::RowGroupCollection(shared_ptr<DataTableInfo> info_p, BlockManager &block_manager,
                                        vector<LogicalType> types_p, idx_t row_start, idx_t total_rows_p,
                                        idx_t row_group_size_p)
-    : block_manager(block_manager), row_group_size(row_group_size_p), total_rows(total_rows_p),
-      next_row_id(total_rows_p), info(std::move(info_p)), types(std::move(types_p)),
-      owned_row_groups(make_shared_ptr<RowGroupSegmentTree>(*this, row_start)), allocation_size(0),
-      row_group_append_mode(RowGroupAppendMode::APPEND_TO_EXISTING) {
+    : storage_generation_id(AllocateStorageGenerationId()), block_manager(block_manager),
+      row_group_size(row_group_size_p), total_rows(total_rows_p), next_row_id(total_rows_p), info(std::move(info_p)),
+      types(std::move(types_p)), owned_row_groups(make_shared_ptr<RowGroupSegmentTree>(*this, row_start)),
+      allocation_size(0), row_group_append_mode(RowGroupAppendMode::APPEND_TO_EXISTING) {
 	// If the table contains shredded types (variant / geometry) then we can't append to an existing row group
 	for (auto &type : types) {
 		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT) ||

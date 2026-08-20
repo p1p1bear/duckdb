@@ -125,6 +125,12 @@ public:
 	const vector<MetaBlockPointer> &GetColumnStartPointers() const;
 
 	vector<MetaBlockPointer> GetExtraMetadataBlockPointers() const;
+	bool HasPerColumnMetadataBlocks() const {
+		return has_per_column_metadata_blocks;
+	}
+	vector<vector<idx_t>> GetPerColumnMetadataBlocks(const vector<idx_t> &columns) const {
+		return per_column_metadata_blocks.GetBlocksForColumns(columns);
+	}
 
 	BlockManager &GetBlockManager() const;
 	DataTableInfo &GetTableInfo() const;

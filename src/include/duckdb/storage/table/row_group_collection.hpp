@@ -84,6 +84,9 @@ public:
 public:
 	idx_t GetTotalRows() const;
 	idx_t GetNextRowId() const;
+	uint64_t GetStorageGenerationId() const {
+		return storage_generation_id;
+	}
 	idx_t GetRowGroupCount() const;
 	Allocator &GetAllocator() const;
 
@@ -256,6 +259,8 @@ private:
 	void SetRowGroups(shared_ptr<RowGroupSegmentTree> row_groups);
 
 private:
+	//! Process-local identity used to invalidate checkpoint candidates after physical schema replacement.
+	const uint64_t storage_generation_id;
 	//! BlockManager
 	BlockManager &block_manager;
 	//! The row group size of the row group collection

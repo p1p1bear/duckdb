@@ -1874,8 +1874,11 @@ bool RowGroup::HasChanges() const {
 }
 
 bool RowGroup::IsPersistent() const {
-	for (auto &column : columns) {
-		if (!column->IsPersistent()) {
+	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+		if (!ColumnIsLoaded(column_index)) {
+			continue;
+		}
+		if (!columns[column_index]->IsPersistent()) {
 			// column is not persistent
 			return false;
 		}
