@@ -1,4 +1,6 @@
 #include "duckdb/storage/table/row_version_manager.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/transaction/transaction_data.hpp"
 #include "duckdb/storage/metadata/metadata_manager.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
@@ -196,6 +198,21 @@ idx_t RowVersionManager::DeleteRows(idx_t vector_idx, transaction_t transaction_
 	return GetVectorInfo(vector_idx).Delete(transaction_id, rows, count);
 }
 
+idx_t RowVersionManager::DeleteCommittedRows(idx_t vector_idx, row_t rows[], idx_t count) {
+	for (idx_t row_index = 0; row_index < count; row_index++) {
+		if (rows[row_index] < 0 || rows[row_index] >= NumericCast<row_t>(STANDARD_VECTOR_SIZE)) {
+			throw InternalException("Committed DELETE row offset is out of range");
+		}
+	}
+	lock_guard<mutex> lock(version_lock);
+	auto deleted_count = GetVectorInfo(vector_idx).Delete(0, rows, count);
+	if (deleted_count > 0) {
+		needs_compression_check = true;
+		uncheckpointed_delete_commit = optional_idx(0);
+	}
+	return deleted_count;
+}
+
 void RowVersionManager::CommitDelete(idx_t vector_idx, transaction_t commit_id, const DeleteInfo &info) {
 	lock_guard<mutex> lock(version_lock);
 	needs_compression_check = true;
@@ -277,6 +294,51 @@ vector<MetaBlockPointer> RowVersionManager::Checkpoint(RowGroupWriter &writer) {
 	if (uncheckpointed_delete_commit.IsValid() && uncheckpointed_delete_commit.GetIndex() <= options.transaction_id) {
 		// the last checkpointed id was either before or on the transaction we are checkpointing
 		// nothing to checkpoint in future commits until more deletes appear
+		uncheckpointed_delete_commit = optional_idx();
+	}
+	return storage_pointers;
+}
+
+vector<MetaBlockPointer> RowVersionManager::Checkpoint(MetadataWriter &metadata_writer, transaction_t checkpoint_id) {
+	lock_guard<mutex> lock(version_lock);
+	vector<pair<idx_t, reference<ChunkVectorInfo>>> to_serialize;
+	for (idx_t vector_idx = 0; vector_idx < vector_info.size(); vector_idx++) {
+		auto chunk_info = vector_info[vector_idx].get();
+		if (chunk_info && chunk_info->HasDeletes(checkpoint_id)) {
+			to_serialize.emplace_back(vector_idx, *chunk_info);
+		}
+	}
+
+	vector<MetaBlockPointer> new_storage_pointers;
+	if (!to_serialize.empty()) {
+		auto root_pointer = metadata_writer.GetMetaBlockPointer();
+		vector<MetaBlockPointer> written_pointers;
+		metadata_writer.SetWrittenPointers(written_pointers);
+		try {
+			metadata_writer.Write<idx_t>(to_serialize.size());
+			for (auto &entry : to_serialize) {
+				metadata_writer.Write<idx_t>(entry.first);
+				entry.second.get().Write(metadata_writer, checkpoint_id);
+			}
+		} catch (...) {
+			metadata_writer.SetWrittenPointers(nullptr);
+			throw;
+		}
+		metadata_writer.SetWrittenPointers(nullptr);
+
+		new_storage_pointers.push_back(root_pointer);
+		for (auto &pointer : written_pointers) {
+			if (pointer.block_pointer == root_pointer.block_pointer) {
+				continue;
+			}
+			if (new_storage_pointers.back().block_pointer != pointer.block_pointer) {
+				new_storage_pointers.push_back(pointer);
+			}
+		}
+	}
+
+	storage_pointers = std::move(new_storage_pointers);
+	if (uncheckpointed_delete_commit.IsValid() && uncheckpointed_delete_commit.GetIndex() <= checkpoint_id) {
 		uncheckpointed_delete_commit = optional_idx();
 	}
 	return storage_pointers;

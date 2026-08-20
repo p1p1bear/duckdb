@@ -2,6 +2,7 @@
 
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
+#include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/transaction/transaction_data.hpp"
 
@@ -134,16 +136,134 @@ void ReclusterOutput::AdoptTaskPrivateBlocks(vector<block_id_t> block_ids_p) {
 	data_block_ids = std::move(block_ids_p);
 	owns_blocks = true;
 
-	block_ids = data_block_ids;
-	auto replacement_metadata_blocks = replacement_metadata_owner->GetBlockIds();
-	block_ids.insert(block_ids.end(), replacement_metadata_blocks.begin(), replacement_metadata_blocks.end());
-	auto expected_referenced_blocks = UniqueSortedBlocks(block_ids);
+	auto expected_referenced_blocks = GetReferencedBlockIds();
 	if (expected_referenced_blocks != manifest.all_referenced_blocks) {
 		throw InternalException("Recluster replacement block ownership does not match its manifest");
 	}
+	RefreshBlockIds();
+}
+
+vector<block_id_t> ReclusterOutput::GetReferencedBlockIds() const {
+	vector<block_id_t> result = data_block_ids;
+	auto replacement_metadata_blocks = replacement_metadata_owner->GetBlockIds();
+	result.insert(result.end(), replacement_metadata_blocks.begin(), replacement_metadata_blocks.end());
+	if (delete_metadata_owner) {
+		auto delete_metadata_blocks = delete_metadata_owner->GetBlockIds();
+		result.insert(result.end(), delete_metadata_blocks.begin(), delete_metadata_blocks.end());
+	}
+	return UniqueSortedBlocks(std::move(result));
+}
+
+void ReclusterOutput::RefreshBlockIds() {
+	block_ids = GetReferencedBlockIds();
 	auto manifest_blocks = manifest_owner->GetBlockIds();
 	block_ids.insert(block_ids.end(), manifest_blocks.begin(), manifest_blocks.end());
 	block_ids = UniqueSortedBlocks(std::move(block_ids));
+}
+
+idx_t ReclusterOutput::ApplyDeleteCatchup(vector<row_t> new_rowids, delete_sequence_t resolved_through) {
+	if (!owns_blocks || resolved_through <= manifest.header.last_applied_delete_sequence) {
+		throw InternalException("Invalid recluster DELETE catch-up sequence");
+	}
+	if (manifest.header.manifest_revision == NumericLimits<uint64_t>::Maximum()) {
+		throw InternalException("Recluster replacement manifest revision space is exhausted");
+	}
+
+	std::sort(new_rowids.begin(), new_rowids.end());
+	new_rowids.erase(std::unique(new_rowids.begin(), new_rowids.end()), new_rowids.end());
+	auto replacement_start = manifest.header.input_range.start;
+	auto replacement_end = replacement_start + NumericCast<row_t>(row_count);
+	auto row_groups = collection->GetRowGroups();
+	idx_t deleted_count = 0;
+	idx_t row_index = 0;
+	while (row_index < new_rowids.size()) {
+		auto new_rowid = new_rowids[row_index];
+		if (new_rowid < replacement_start || new_rowid >= replacement_end) {
+			throw InternalException("Recluster DELETE remap points outside the replacement output");
+		}
+		auto row_group = row_groups->GetSegment(NumericCast<idx_t>(new_rowid));
+		if (!row_group) {
+			throw InternalException("Recluster DELETE remap points to a missing replacement row group");
+		}
+		auto row_group_start = NumericCast<row_t>(row_group->GetRowStart());
+		auto row_group_end = NumericCast<row_t>(row_group->GetRowEnd());
+		auto vector_index = NumericCast<idx_t>((new_rowid - row_group_start) / STANDARD_VECTOR_SIZE);
+		auto vector_start = row_group_start + NumericCast<row_t>(vector_index * STANDARD_VECTOR_SIZE);
+		auto vector_end = MinValue<row_t>(row_group_end, vector_start + NumericCast<row_t>(STANDARD_VECTOR_SIZE));
+
+		vector<row_t> vector_offsets;
+		while (row_index < new_rowids.size() && new_rowids[row_index] < vector_end) {
+			if (new_rowids[row_index] < vector_start) {
+				throw InternalException("Recluster DELETE remap row IDs are not monotonic");
+			}
+			vector_offsets.push_back(new_rowids[row_index] - vector_start);
+			row_index++;
+		}
+		deleted_count += row_group->GetNode().GetOrCreateVersionInfo().DeleteCommittedRows(
+		    vector_index, vector_offsets.data(), vector_offsets.size());
+	}
+
+	auto &metadata_manager = block_manager.GetMetadataManager();
+	auto next_delete_owner = metadata_manager.CreateTaskPrivateBlockOwner();
+	ReplacementManifest next_manifest = manifest;
+	{
+		ReclusterTaskMetadataWriter delete_writer(*next_delete_owner);
+		if (next_manifest.replacement_groups.size() != collection->GetRowGroupCount()) {
+			throw InternalException("Recluster replacement manifest row groups changed during DELETE catch-up");
+		}
+		for (idx_t row_group_index = 0; row_group_index < collection->GetRowGroupCount(); row_group_index++) {
+			auto row_group = collection->GetRowGroup(NumericCast<int64_t>(row_group_index));
+			if (!row_group) {
+				throw InternalException("Missing recluster replacement row group during DELETE catch-up");
+			}
+			next_manifest.replacement_groups[row_group_index].deletes_pointers =
+			    row_group->GetOrCreateVersionInfo().Checkpoint(delete_writer, 0);
+		}
+		delete_writer.Flush();
+	}
+	next_delete_owner->Flush();
+	if (next_delete_owner->GetBlockIds().empty()) {
+		next_delete_owner->Abort();
+		next_delete_owner.reset();
+	}
+
+	next_manifest.header.last_applied_delete_sequence = resolved_through;
+	next_manifest.header.manifest_revision++;
+	next_manifest.all_referenced_blocks = data_block_ids;
+	auto replacement_metadata_blocks = replacement_metadata_owner->GetBlockIds();
+	next_manifest.all_referenced_blocks.insert(next_manifest.all_referenced_blocks.end(),
+	                                           replacement_metadata_blocks.begin(), replacement_metadata_blocks.end());
+	if (next_delete_owner) {
+		auto delete_metadata_blocks = next_delete_owner->GetBlockIds();
+		next_manifest.all_referenced_blocks.insert(next_manifest.all_referenced_blocks.end(),
+		                                           delete_metadata_blocks.begin(), delete_metadata_blocks.end());
+	}
+	next_manifest.all_referenced_blocks = UniqueSortedBlocks(std::move(next_manifest.all_referenced_blocks));
+	next_manifest.Seal();
+
+	auto next_manifest_owner = metadata_manager.CreateTaskPrivateBlockOwner();
+	MetaBlockPointer next_manifest_pointer;
+	{
+		ReclusterTaskMetadataWriter manifest_writer(*next_manifest_owner);
+		next_manifest_pointer = manifest_writer.GetMetaBlockPointer();
+		next_manifest.Write(manifest_writer);
+		manifest_writer.Flush();
+	}
+	next_manifest_owner->Flush();
+	block_manager.FileSync();
+
+	auto previous_delete_owner = std::move(delete_metadata_owner);
+	auto previous_manifest_owner = std::move(manifest_owner);
+	delete_metadata_owner = std::move(next_delete_owner);
+	manifest_owner = std::move(next_manifest_owner);
+	manifest = std::move(next_manifest);
+	manifest_pointer = next_manifest_pointer;
+	RefreshBlockIds();
+	if (previous_delete_owner) {
+		previous_delete_owner->Abort();
+	}
+	previous_manifest_owner->Abort();
+	return deleted_count;
 }
 
 void ReclusterOutput::MarkPublished() {
@@ -154,6 +274,9 @@ void ReclusterOutput::MarkPublished() {
 		block_manager.MarkBlockAsCheckpointed(block_id);
 	}
 	replacement_metadata_owner->MarkPublished();
+	if (delete_metadata_owner) {
+		delete_metadata_owner->MarkPublished();
+	}
 	manifest_owner->MarkPublished();
 	owns_blocks = false;
 }
@@ -166,6 +289,9 @@ void ReclusterOutput::Abort() {
 		block_manager.MarkBlockAsModified(block_id);
 	}
 	replacement_metadata_owner->Abort();
+	if (delete_metadata_owner) {
+		delete_metadata_owner->Abort();
+	}
 	manifest_owner->Abort();
 	owns_blocks = false;
 }

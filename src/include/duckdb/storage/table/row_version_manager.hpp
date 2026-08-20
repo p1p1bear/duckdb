@@ -17,6 +17,7 @@ namespace duckdb {
 
 struct DeleteInfo;
 class MetadataManager;
+class MetadataWriter;
 class BufferManager;
 struct MetaBlockPointer;
 
@@ -37,6 +38,8 @@ public:
 	void CleanupAppend(transaction_t lowest_active_transaction, idx_t row_group_start, idx_t count);
 
 	idx_t DeleteRows(idx_t vector_idx, transaction_t transaction_id, row_t rows[], idx_t count);
+	//! Applies deletes that are already committed and visible to every replacement-layout reader.
+	idx_t DeleteCommittedRows(idx_t vector_idx, row_t rows[], idx_t count);
 	void CommitDelete(idx_t vector_idx, transaction_t commit_id, const DeleteInfo &info);
 
 	//! Attempts to compress the per-row insert/delete ids of each vector into constants
@@ -47,6 +50,8 @@ public:
 	void CompressVersionIds(transaction_t lowest_active_start);
 
 	vector<MetaBlockPointer> Checkpoint(RowGroupWriter &writer);
+	//! Serializes the current delete state into a caller-owned metadata stream.
+	vector<MetaBlockPointer> Checkpoint(MetadataWriter &writer, transaction_t checkpoint_id);
 	static shared_ptr<RowVersionManager> Deserialize(MetaBlockPointer delete_pointer, MetadataManager &manager);
 
 	bool HasUnserializedChanges();
