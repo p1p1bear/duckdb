@@ -10,6 +10,7 @@ add_library_unity(
   recluster_range_scanner.cpp
   recluster_sorter.cpp
   recluster_task_context.cpp
+  replacement_manifest.cpp
   row_id_remap_store.cpp
   row_group_layout.cpp
   table_recluster_state.cpp

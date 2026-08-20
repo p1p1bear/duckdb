@@ -3,8 +3,10 @@
 #include "duckdb/common/checksum.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/storage_compatibility.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -12,6 +14,48 @@
 #include "duckdb/storage/table/row_group_collection.hpp"
 
 namespace duckdb {
+
+void RowGroupColumnPhysicalIdentity::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<persistent_column_id_t>(100, "column_id", column_id);
+	serializer.WriteProperty<LogicalType>(101, "type", type);
+	serializer.WriteProperty<MetaBlockPointer>(102, "column_data_pointer", column_data_pointer);
+	serializer.WriteProperty<vector<MetaBlockPointer>>(103, "additional_metadata_pointers",
+	                                                   additional_metadata_pointers);
+}
+
+RowGroupColumnPhysicalIdentity RowGroupColumnPhysicalIdentity::Deserialize(Deserializer &deserializer) {
+	RowGroupColumnPhysicalIdentity result;
+	deserializer.ReadProperty<persistent_column_id_t>(100, "column_id", result.column_id);
+	deserializer.ReadProperty<LogicalType>(101, "type", result.type);
+	deserializer.ReadProperty<MetaBlockPointer>(102, "column_data_pointer", result.column_data_pointer);
+	deserializer.ReadProperty<vector<MetaBlockPointer>>(103, "additional_metadata_pointers",
+	                                                    result.additional_metadata_pointers);
+	return result;
+}
+
+void RowGroupPhysicalIdentity::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<uint32_t>(100, "format_version", format_version);
+	serializer.WriteProperty<row_t>(101, "start", start);
+	serializer.WriteProperty<idx_t>(102, "count", count);
+	serializer.WriteProperty<bool>(103, "sealed", sealed);
+	serializer.WriteProperty<vector<RowGroupColumnPhysicalIdentity>>(104, "columns", columns);
+	serializer.WriteProperty<sort_order_id_t>(105, "sort_order_id", sort_metadata.sort_order_id);
+	serializer.WriteProperty<sort_run_id_t>(106, "run_id", sort_metadata.run_id);
+	serializer.WriteProperty<uint64_t>(107, "immutable_data_checksum", immutable_data_checksum);
+}
+
+RowGroupPhysicalIdentity RowGroupPhysicalIdentity::Deserialize(Deserializer &deserializer) {
+	RowGroupPhysicalIdentity result;
+	deserializer.ReadProperty<uint32_t>(100, "format_version", result.format_version);
+	deserializer.ReadProperty<row_t>(101, "start", result.start);
+	deserializer.ReadProperty<idx_t>(102, "count", result.count);
+	deserializer.ReadProperty<bool>(103, "sealed", result.sealed);
+	deserializer.ReadProperty<vector<RowGroupColumnPhysicalIdentity>>(104, "columns", result.columns);
+	deserializer.ReadProperty<sort_order_id_t>(105, "sort_order_id", result.sort_metadata.sort_order_id);
+	deserializer.ReadProperty<sort_run_id_t>(106, "run_id", result.sort_metadata.run_id);
+	deserializer.ReadProperty<uint64_t>(107, "immutable_data_checksum", result.immutable_data_checksum);
+	return result;
+}
 
 bool RowGroupColumnPhysicalIdentity::operator==(const RowGroupColumnPhysicalIdentity &other) const {
 	return column_id == other.column_id && type == other.type && column_data_pointer == other.column_data_pointer &&

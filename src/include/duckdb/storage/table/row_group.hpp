@@ -250,7 +250,7 @@ public:
 	RowVersionManager &GetOrCreateVersionInfo();
 
 	// Serialization
-	static void Serialize(RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes);
+	static void Serialize(const RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes);
 	static RowGroupPointer Deserialize(Deserializer &deserializer);
 
 	idx_t GetRowGroupSize() const;

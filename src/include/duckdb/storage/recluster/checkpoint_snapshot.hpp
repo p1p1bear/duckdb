@@ -16,8 +16,10 @@
 
 namespace duckdb {
 
+class Deserializer;
 class RowGroup;
 class RowGroupCollection;
+class Serializer;
 
 struct RowGroupColumnPhysicalIdentity {
 	persistent_column_id_t column_id = 0;
@@ -25,6 +27,8 @@ struct RowGroupColumnPhysicalIdentity {
 	MetaBlockPointer column_data_pointer;
 	vector<MetaBlockPointer> additional_metadata_pointers;
 
+	void Serialize(Serializer &serializer) const;
+	static RowGroupColumnPhysicalIdentity Deserialize(Deserializer &deserializer);
 	bool operator==(const RowGroupColumnPhysicalIdentity &other) const;
 };
 
@@ -37,6 +41,8 @@ struct RowGroupPhysicalIdentity {
 	RowGroupSortMetadata sort_metadata;
 	uint64_t immutable_data_checksum = 0;
 
+	void Serialize(Serializer &serializer) const;
+	static RowGroupPhysicalIdentity Deserialize(Deserializer &deserializer);
 	bool operator==(const RowGroupPhysicalIdentity &other) const;
 };
 

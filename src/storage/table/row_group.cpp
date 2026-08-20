@@ -1925,7 +1925,7 @@ vector<MetaBlockPointer> RowGroup::CheckpointDeletes(RowGroupWriter &writer) {
 	return vinfo->Checkpoint(writer);
 }
 
-void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes) {
+void RowGroup::Serialize(const RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes) {
 	if (!pointer.sort_metadata.IsValid()) {
 		throw SerializationException("Row group sort order and run identifiers must both be zero or both be non-zero");
 	}
