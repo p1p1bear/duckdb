@@ -321,6 +321,28 @@ void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) 
 	history->Publish(std::move(layout));
 }
 
+bool RowGroupCollection::MaterializeCurrentLayout() {
+	auto layout = GetCurrentLayout();
+	if (!layout || layout->patches.empty()) {
+		return false;
+	}
+
+	auto materialized = make_shared_ptr<RowGroupSegmentTree>(*this, layout->base_tree->GetBaseRowId());
+	LayoutRowGroupCursor cursor {RowGroupCollectionSnapshot(layout)};
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		materialized->AppendSegment(entry.row_group, NumericCast<idx_t>(entry.row_start));
+	}
+
+	lock_guard<mutex> guard(row_group_pointer_lock);
+	if (!layout_history) {
+		throw InternalException("Cannot materialize a row group layout without layout history");
+	}
+	layout_history->InstallCheckpointTree(materialized, std::move(layout));
+	owned_row_groups = std::move(materialized);
+	return true;
+}
+
 void RowGroupCollection::InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree) {
 	if (!tree) {
 		throw InternalException("Cannot install a null checkpoint row group tree");
@@ -2145,7 +2167,8 @@ unique_ptr<CheckpointTask> RowGroupCollection::GetCheckpointTask(CollectionCheck
 	return make_uniq<CheckpointTask>(checkpoint_state, segment_idx);
 }
 
-void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &global_stats) {
+void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &global_stats,
+                                    bool force_table_metadata_rewrite) {
 	auto row_groups = GetRowGroups();
 
 	CollectionCheckpointState checkpoint_state(*this, writer, global_stats, *row_groups);
@@ -2200,7 +2223,8 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 
 	// no errors - finalize the row groups
 	// if the table already exists on disk - check if all row groups have stayed the same
-	if (Settings::Get<ExperimentalMetadataReuseSetting>(writer.GetDatabase()) && metadata_pointer.IsValid()) {
+	if (!force_table_metadata_rewrite && Settings::Get<ExperimentalMetadataReuseSetting>(writer.GetDatabase()) &&
+	    metadata_pointer.IsValid()) {
 		bool table_has_changes = false;
 		for (idx_t segment_idx = 0; segment_idx < checkpoint_state.SegmentCount(); segment_idx++) {
 			if (checkpoint_state.SegmentIsDropped(segment_idx)) {

@@ -156,7 +156,7 @@ public:
 	void UpdateColumn(TransactionData transaction, DuckTableEntry &table_entry, Vector &row_ids,
 	                  const vector<column_t> &column_path, DataChunk &updates);
 
-	void Checkpoint(TableDataWriter &writer, TableStatistics &global_stats);
+	void Checkpoint(TableDataWriter &writer, TableStatistics &global_stats, bool force_table_metadata_rewrite = false);
 
 	//! Decides how vacuum handles this table's indexes.
 	VacuumIndexStrategy
@@ -242,6 +242,7 @@ public:
 	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
 	                                                    shared_ptr<const LayoutPatch> patch) const;
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
+	bool MaterializeCurrentLayout();
 	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
 	void CleanupLayoutHistory(transaction_t oldest_active_start);
 	bool LookupRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t row_id, LayoutRowGroupEntry &result) const;

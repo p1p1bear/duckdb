@@ -68,7 +68,8 @@ public:
 	shared_ptr<const RowGroupLayout> GetForTransaction(transaction_t start_time) const;
 
 	void Publish(shared_ptr<const RowGroupLayout> new_layout);
-	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
+	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree,
+	                           shared_ptr<const RowGroupLayout> expected_layout = nullptr);
 	void Cleanup(transaction_t oldest_active_start);
 
 private:

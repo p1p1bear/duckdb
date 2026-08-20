@@ -352,6 +352,8 @@ TEST_CASE("Checkpoint tree installation preserves the current layout version", "
 	REQUIRE(installed_layout->patches.empty());
 	REQUIRE(pinned_layout->patches.size() == 1);
 	REQUIRE(history.GetForTransaction(10).get() == installed_layout.get());
+	REQUIRE_THROWS_AS(history.InstallCheckpointTree(tree, pinned_layout), InternalException);
+	REQUIRE_THROWS_AS(history.Publish(make_shared_ptr<RowGroupLayout>(2, 20, tree)), InternalException);
 }
 
 TEST_CASE("Row group layouts reject invalid patch sequences", "[storage][row_group_layout]") {
@@ -556,6 +558,63 @@ TEST_CASE("Row group collection selects and installs versioned layouts", "[stora
 	REQUIRE(checkpoint_layout->base_tree.get() == checkpoint_tree.get());
 	REQUIRE(collection->GetRowGroups().get() == checkpoint_tree.get());
 	REQUIRE(collection->GetSnapshot(TransactionData(103, 9)).layout->layout_version == 0);
+}
+
+TEST_CASE("Checkpoint materializes the current row group layout", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("layout_checkpoint_materialization.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS layout_checkpoint (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE layout_checkpoint"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT layout_checkpoint"));
+
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto collection = entry.GetStorage().GetRowGroupCollection();
+			auto tree = collection->GetRowGroups();
+			REQUIRE(tree->GetSegmentCount() == 2);
+			auto first = tree->GetRootSegment();
+			REQUIRE(first);
+			REQUIRE(first->GetRowStart() == 0);
+			collection->PublishLayout(collection->BuildPatchedLayout(
+			    1, MakeEmptyReplacementPatch(0, NumericCast<row_t>(first->GetCount()), 7)));
+			entry.GetStorage().GetDataTableInfo()->GetSortStorage().current_layout_version.store(1);
+		});
+
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (5000)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT layout_checkpoint"));
+		auto result = con.Query("SELECT count(*), min(i), max(i) FROM tbl");
+		REQUIRE_NO_FAIL(*result);
+		CHECK_COLUMN(result, 0, {Value::BIGINT(2049)});
+		CHECK_COLUMN(result, 1, {Value::INTEGER(2048)});
+		CHECK_COLUMN(result, 2, {Value::INTEGER(5000)});
+	}
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS layout_checkpoint"));
+		REQUIRE_NO_FAIL(con.Query("USE layout_checkpoint"));
+		auto result = con.Query("SELECT count(*), min(i), max(i) FROM tbl");
+		REQUIRE_NO_FAIL(*result);
+		CHECK_COLUMN(result, 0, {Value::BIGINT(2049)});
+		CHECK_COLUMN(result, 1, {Value::INTEGER(2048)});
+		CHECK_COLUMN(result, 2, {Value::INTEGER(5000)});
+
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto collection = entry.GetStorage().GetRowGroupCollection();
+			REQUIRE(collection->GetTotalRows() == 2049);
+			REQUIRE(collection->GetNextRowId() == 4097);
+			REQUIRE(collection->GetCurrentLayout()->layout_version == 1);
+			REQUIRE(collection->GetCurrentLayout()->patches.empty());
+		});
+	}
+	DeleteDatabase(path);
 }
 
 TEST_CASE("All row group scan entry points honor transaction layouts", "[storage][row_group_layout]") {

@@ -111,16 +111,23 @@ void TableLayoutHistory::Publish(shared_ptr<const RowGroupLayout> new_layout) {
 	    new_layout->layout_version - current->layout_version != 1) {
 		throw InternalException("A row group layout must advance the layout version by one");
 	}
+	if (new_layout->base_tree.get() != current->base_tree.get()) {
+		throw InternalException("A row group layout cannot publish against a stale checkpoint tree");
+	}
 	previous.push_back(std::move(current));
 	current = std::move(new_layout);
 }
 
-void TableLayoutHistory::InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree) {
+void TableLayoutHistory::InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree,
+                                               shared_ptr<const RowGroupLayout> expected_layout) {
 	if (!tree) {
 		throw InternalException("Cannot install a null checkpoint row group tree");
 	}
 
 	lock_guard<mutex> guard(lock);
+	if (expected_layout && current.get() != expected_layout.get()) {
+		throw InternalException("Cannot install a checkpoint tree for a stale row group layout");
+	}
 	current = make_shared_ptr<RowGroupLayout>(current->layout_version, current->visible_from, std::move(tree));
 }
 

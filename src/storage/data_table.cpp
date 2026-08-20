@@ -1930,10 +1930,11 @@ unique_ptr<StorageLockKey> DataTable::GetCheckpointLock() {
 }
 
 void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer, const StorageLockKey &checkpoint_lock) {
+	auto materialized_layout = row_groups->MaterializeCurrentLayout();
 	writer.SetRowGroupCount(info->CheckpointRowGroupCount(writer.GetCheckpointOptions()));
 	// checkpoint each individual row group
 	TableStatistics global_stats;
-	row_groups->Checkpoint(writer, global_stats);
+	row_groups->Checkpoint(writer, global_stats, materialized_layout);
 	row_groups->SetRowGroupAppendMode(RowGroupAppendMode::SUGGEST_NEW);
 	if (writer.GetRebuildIndexes()) {
 		MetricsTimer timer;
