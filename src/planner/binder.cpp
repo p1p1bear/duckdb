@@ -64,6 +64,7 @@ Binder::Binder(ClientContext &context, shared_ptr<Binder> parent_p, BinderType b
 	if (parent) {
 		entry_retriever.Inherit(parent->entry_retriever);
 		inside_subquery = parent->inside_subquery;
+		allow_direct_sort = parent->allow_direct_sort;
 
 		// We have to inherit macro and lambda parameter bindings and from the parent binder, if there is a parent.
 		macro_binding = parent->macro_binding;
@@ -73,6 +74,14 @@ Binder::Binder(ClientContext &context, shared_ptr<Binder> parent_p, BinderType b
 			active_binders = parent->active_binders;
 		}
 	}
+}
+
+void Binder::SetAllowDirectSort(bool allow) {
+	allow_direct_sort = allow;
+}
+
+bool Binder::AllowDirectSort() const {
+	return allow_direct_sort;
 }
 
 BoundStatement Binder::Bind(SQLStatement &statement) {

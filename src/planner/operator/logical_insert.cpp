@@ -12,13 +12,13 @@ BoundOnConflictInfo::BoundOnConflictInfo()
 }
 
 LogicalInsert::LogicalInsert(TableCatalogEntry &table, TableIndex table_index)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), table(table), table_index(table_index),
-      return_chunk(false) {
+    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), table(table), table_index(table_index), return_chunk(false),
+      allow_direct_sort(true) {
 }
 
 LogicalInsert::LogicalInsert(ClientContext &context, const unique_ptr<CreateInfo> table_info)
     : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT),
-      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->GetQualifiedName())) {
+      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->GetQualifiedName())), allow_direct_sort(true) {
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

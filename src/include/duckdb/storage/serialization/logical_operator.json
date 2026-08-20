@@ -766,6 +766,12 @@
         "type": "bool",
         "default": "false",
         "property": "on_conflict_info.update_is_del_and_insert"
+      },
+      {
+        "id": 219,
+        "name": "allow_direct_sort",
+        "type": "bool",
+        "default": "true"
       }
     ],
     "constructor": [

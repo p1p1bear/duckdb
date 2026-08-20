@@ -104,8 +104,9 @@ BoundStatement Binder::BindNode(QueryNode &node) {
 	return result;
 }
 
-CTEBindState::CTEBindState(Binder &parent_binder_p, QueryNode &cte_def_p, const vector<Identifier> &aliases_p)
-    : parent_binder(parent_binder_p), cte_def(cte_def_p), aliases(aliases_p),
+CTEBindState::CTEBindState(Binder &parent_binder_p, QueryNode &cte_def_p, const vector<Identifier> &aliases_p,
+                           bool allow_direct_sort_p)
+    : parent_binder(parent_binder_p), cte_def(cte_def_p), aliases(aliases_p), allow_direct_sort(allow_direct_sort_p),
       active_binder_count(parent_binder.GetActiveBinders().size()) {
 }
 
@@ -121,6 +122,7 @@ void CTEBindState::Bind(CTEBinding &binding) {
 	// we need to bind it as if we were binding it during PrepareCTE
 	query_binder = Binder::CreateBinder(parent_binder.context, parent_binder);
 	query_binder->SetCanContainNulls(true);
+	query_binder->SetAllowDirectSort(allow_direct_sort);
 
 	// we clear any expression binders that were added in the mean-time, to ensure we are not binding to any newly added
 	// correlated columns
@@ -170,7 +172,8 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 
 	// instead of eagerly binding the CTE here we add the CTE bind state to the list of CTE bindings
 	// the CTE is bound lazily - when referenced for the first time we perform the binding
-	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases);
+	result.cte_bind_state =
+	    make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases, statement.allow_direct_sort);
 
 	result.child_binder = Binder::CreateBinder(context, this);
 

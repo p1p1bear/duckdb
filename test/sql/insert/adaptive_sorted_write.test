@@ -190,6 +190,34 @@ WHERE i != expected
 ----
 0
 
+# Trigger body INSERTs are deliberately not direct-sorted.
+statement ok
+CREATE TABLE trigger_target(i BIGINT) SORTED BY (i)
+
+statement ok
+CREATE TABLE trigger_driver(marker INTEGER)
+
+statement ok
+CREATE TRIGGER sorted_target_writer AFTER INSERT ON trigger_driver FOR EACH STATEMENT
+INSERT INTO trigger_target
+SELECT 4095 - i
+FROM range(4096) t(i)
+
+query I
+INSERT INTO trigger_driver VALUES (1)
+----
+1
+
+query I
+SELECT count(*)
+FROM (
+    SELECT i, row_number() OVER () - 1 AS input_row
+    FROM trigger_target
+)
+WHERE i != 4095 - input_row
+----
+0
+
 # RETURNING retains the input order even though the storage copy is sorted.
 statement ok
 CREATE TABLE returning_write(i BIGINT) SORTED BY (i)

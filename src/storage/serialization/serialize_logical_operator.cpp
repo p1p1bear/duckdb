@@ -640,6 +640,7 @@ void LogicalInsert::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<column_t>>(216, "source_columns", on_conflict_info.source_columns);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(217, "expressions", expressions);
 	serializer.WritePropertyWithDefault<bool>(218, "update_is_del_and_insert", on_conflict_info.update_is_del_and_insert, false);
+	serializer.WritePropertyWithDefault<bool>(219, "allow_direct_sort", allow_direct_sort, true);
 }
 
 unique_ptr<LogicalOperator> LogicalInsert::Deserialize(Deserializer &deserializer) {
@@ -663,6 +664,7 @@ unique_ptr<LogicalOperator> LogicalInsert::Deserialize(Deserializer &deserialize
 	deserializer.ReadPropertyWithDefault<vector<column_t>>(216, "source_columns", result->on_conflict_info.source_columns);
 	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(217, "expressions", result->expressions);
 	deserializer.ReadPropertyWithExplicitDefault<bool>(218, "update_is_del_and_insert", result->on_conflict_info.update_is_del_and_insert, false);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(219, "allow_direct_sort", result->allow_direct_sort, true);
 	return std::move(result);
 }
 

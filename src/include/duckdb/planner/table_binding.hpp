@@ -173,12 +173,13 @@ enum class CTEType { CAN_BE_REFERENCED, CANNOT_BE_REFERENCED };
 struct CTEBinding;
 
 struct CTEBindState {
-	CTEBindState(Binder &parent_binder, QueryNode &cte_def, const vector<Identifier> &aliases);
+	CTEBindState(Binder &parent_binder, QueryNode &cte_def, const vector<Identifier> &aliases, bool allow_direct_sort);
 	~CTEBindState();
 
 	Binder &parent_binder;
 	QueryNode &cte_def;
 	const vector<Identifier> &aliases;
+	bool allow_direct_sort;
 	idx_t active_binder_count;
 	shared_ptr<Binder> query_binder;
 	BoundStatement query;

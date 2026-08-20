@@ -20,7 +20,8 @@ public:
 public:
 	//! INSERT INTO
 	PhysicalBatchInsert(PhysicalPlan &physical_plan, vector<LogicalType> types, DuckTableEntry &table,
-	                    vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality);
+	                    vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
+	                    bool allow_direct_sort);
 	//! CREATE TABLE AS
 	PhysicalBatchInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	                    unique_ptr<BoundCreateTableInfo> info, idx_t estimated_cardinality);
@@ -37,6 +38,8 @@ public:
 	unique_ptr<BoundCreateTableInfo> info;
 	//! Preferred input batch size
 	optional_idx preferred_batch_size;
+	//! Whether this operator may directly sort and label its output
+	bool allow_direct_sort;
 
 public:
 	// Source interface

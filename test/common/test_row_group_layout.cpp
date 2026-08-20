@@ -865,5 +865,32 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		}
 		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
 	});
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE trigger_target(i INTEGER) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE trigger_driver(marker INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TRIGGER sorted_target_writer AFTER INSERT ON trigger_driver FOR EACH STATEMENT "
+	                          "INSERT INTO trigger_target SELECT (4095 - i)::INTEGER FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO trigger_driver VALUES (1)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("trigger_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 2);
+		for (idx_t row_group_idx = 0; row_group_idx < 2; row_group_idx++) {
+			REQUIRE(collection->GetRowGroup(NumericCast<int64_t>(row_group_idx))->GetSortMetadata() ==
+			        RowGroupSortMetadata());
+		}
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO trigger_target "
+	                          "SELECT (2047 - i)::INTEGER FROM range(2048) t(i)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("trigger_target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 3);
+		REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+		REQUIRE(collection->GetRowGroup(2)->IsSealed());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+	});
 	DeleteDatabase(path);
 }

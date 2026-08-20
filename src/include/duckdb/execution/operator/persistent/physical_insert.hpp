@@ -80,7 +80,7 @@ public:
 	               vector<LogicalType> set_types, idx_t estimated_cardinality, bool return_chunk, bool parallel,
 	               OnConflictAction action_type, unique_ptr<Expression> on_conflict_condition,
 	               unique_ptr<Expression> do_update_condition, unordered_set<column_t> on_conflict_filter,
-	               vector<column_t> columns_to_fetch, bool update_is_del_and_insert);
+	               vector<column_t> columns_to_fetch, bool update_is_del_and_insert, bool allow_direct_sort);
 	//! CREATE TABLE AS
 	PhysicalInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	               unique_ptr<BoundCreateTableInfo> info, idx_t estimated_cardinality, bool parallel);
@@ -118,6 +118,8 @@ public:
 	unordered_set<column_t> conflict_target;
 	//! True, if the INSERT OR REPLACE requires delete + insert.
 	bool update_is_del_and_insert;
+	//! Whether this operator may directly sort and label its output
+	bool allow_direct_sort;
 
 	// Column ids from the original table to fetch
 	vector<StorageIndex> columns_to_fetch;

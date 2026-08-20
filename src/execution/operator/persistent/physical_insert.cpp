@@ -32,13 +32,15 @@ PhysicalInsert::PhysicalInsert(PhysicalPlan &physical_plan, vector<LogicalType> 
                                bool parallel, OnConflictAction action_type,
                                unique_ptr<Expression> on_conflict_condition_p,
                                unique_ptr<Expression> do_update_condition_p, unordered_set<column_t> conflict_target_p,
-                               vector<column_t> columns_to_fetch_p, bool update_is_del_and_insert)
+                               vector<column_t> columns_to_fetch_p, bool update_is_del_and_insert,
+                               bool allow_direct_sort_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::INSERT, std::move(types_p), estimated_cardinality),
       insert_table(&table), insert_types(table.GetTypes()), bound_constraints(std::move(bound_constraints_p)),
       return_chunk(return_chunk), parallel(parallel), action_type(action_type),
       set_expressions(std::move(set_expressions)), set_columns(std::move(set_columns)), set_types(std::move(set_types)),
       on_conflict_condition(std::move(on_conflict_condition_p)), do_update_condition(std::move(do_update_condition_p)),
-      conflict_target(std::move(conflict_target_p)), update_is_del_and_insert(update_is_del_and_insert) {
+      conflict_target(std::move(conflict_target_p)), update_is_del_and_insert(update_is_del_and_insert),
+      allow_direct_sort(allow_direct_sort_p) {
 	if (action_type == OnConflictAction::THROW) {
 		return;
 	}
@@ -60,7 +62,7 @@ PhysicalInsert::PhysicalInsert(PhysicalPlan &physical_plan, LogicalOperator &op,
                                unique_ptr<BoundCreateTableInfo> info_p, idx_t estimated_cardinality, bool parallel)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::CREATE_TABLE_AS, op.types, estimated_cardinality),
       insert_table(nullptr), return_chunk(false), schema(&schema), info(std::move(info_p)), parallel(parallel),
-      action_type(OnConflictAction::THROW), update_is_del_and_insert(false) {
+      action_type(OnConflictAction::THROW), update_is_del_and_insert(false), allow_direct_sort(true) {
 	GetInsertInfo(*info, insert_types);
 }
 
@@ -122,7 +124,7 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 		table = insert_table.get_mutable();
 	}
 	auto result = make_uniq<InsertGlobalState>(context, GetTypes(), *table);
-	if (table->SortEnabled()) {
+	if (table->SortEnabled() && allow_direct_sort) {
 		if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
 			throw NotImplementedException(
 			    "UPDATE conflict: table \"%s\" has SORTED BY enabled; use DELETE + INSERT or RESET SORTED BY",

@@ -18,16 +18,17 @@ namespace duckdb {
 
 PhysicalBatchInsert::PhysicalBatchInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                                          DuckTableEntry &table, vector<unique_ptr<BoundConstraint>> bound_constraints_p,
-                                         idx_t estimated_cardinality)
+                                         idx_t estimated_cardinality, bool allow_direct_sort_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::BATCH_INSERT, std::move(types_p), estimated_cardinality),
       insert_table(&table), insert_types(table.GetTypes()), bound_constraints(std::move(bound_constraints_p)),
-      preferred_batch_size(table.GetStorage().GetRowGroupSize()) {
+      preferred_batch_size(table.GetStorage().GetRowGroupSize()), allow_direct_sort(allow_direct_sort_p) {
 }
 
 PhysicalBatchInsert::PhysicalBatchInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
                                          unique_ptr<BoundCreateTableInfo> info_p, idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::BATCH_CREATE_TABLE_AS, op.types, estimated_cardinality),
-      insert_table(nullptr), schema(&schema), info(std::move(info_p)), preferred_batch_size(DEFAULT_ROW_GROUP_SIZE) {
+      insert_table(nullptr), schema(&schema), info(std::move(info_p)), preferred_batch_size(DEFAULT_ROW_GROUP_SIZE),
+      allow_direct_sort(true) {
 	PhysicalInsert::GetInsertInfo(*info, insert_types);
 }
 
@@ -452,7 +453,7 @@ unique_ptr<GlobalSinkState> PhysicalBatchInsert::GetGlobalSinkState(ClientContex
 	static constexpr const idx_t MINIMUM_MEMORY_PER_COLUMN = 4ULL * 1024ULL * 1024ULL;
 	auto minimum_memory_per_thread = table->GetColumns().PhysicalColumnCount() * MINIMUM_MEMORY_PER_COLUMN;
 	auto result = make_uniq<BatchInsertGlobalState>(context, *table, minimum_memory_per_thread);
-	if (table->SortEnabled()) {
+	if (table->SortEnabled() && allow_direct_sort) {
 		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
 	}
 	return std::move(result);
