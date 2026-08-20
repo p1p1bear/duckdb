@@ -22,6 +22,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 
 namespace duckdb {
@@ -40,6 +41,10 @@ void CommitDropState::RemoveIndex(TableIndexList &indexes, Identifier name) {
 	pending_index_removals.push_back(PendingIndexRemoval {indexes, std::move(name)});
 }
 
+void CommitDropState::AddRecluster(ReclusterCommitInfo &info) {
+	pending_reclusters.emplace_back(info);
+}
+
 void CommitDropState::FinalizeCommit() {
 	if (block_manager) {
 		for (auto block_id : dropped_block_ids) {
@@ -52,12 +57,16 @@ void CommitDropState::FinalizeCommit() {
 	for (auto &removal : pending_index_removals) {
 		removal.indexes.get().RemoveIndex(removal.name);
 	}
+	for (auto &recluster : pending_reclusters) {
+		recluster.get().FinalizeCommit();
+	}
 	dropped_block_ids.clear();
 	pending_index_removals.clear();
+	pending_reclusters.clear();
 }
 
 bool CommitDropState::Empty() const {
-	return dropped_block_ids.empty() && pending_index_removals.empty();
+	return dropped_block_ids.empty() && pending_index_removals.empty() && pending_reclusters.empty();
 }
 
 //===--------------------------------------------------------------------===//
@@ -345,6 +354,11 @@ void CommitState::CommitEntry(UndoFlags type, data_ptr_t data, CommitInfo &info)
 		info->version_number = commit_id;
 		break;
 	}
+	case UndoFlags::RECLUSTER: {
+		auto recluster = reinterpret_cast<ReclusterUndoData *>(data);
+		recluster->info->Commit(commit_id, *info.drop_state);
+		break;
+	}
 	case UndoFlags::ATTACHED_DATABASE:
 	case UndoFlags::SEQUENCE_VALUE: {
 		break;
@@ -391,6 +405,11 @@ void CommitState::RevertCommit(UndoFlags type, data_ptr_t data) {
 		// update:
 		auto info = reinterpret_cast<UpdateInfo *>(data);
 		info->version_number = transaction_id;
+		break;
+	}
+	case UndoFlags::RECLUSTER: {
+		auto recluster = reinterpret_cast<ReclusterUndoData *>(data);
+		recluster->info->RevertCommit();
 		break;
 	}
 	case UndoFlags::ATTACHED_DATABASE:

@@ -136,6 +136,9 @@ UndoBufferProperties UndoBuffer::GetProperties() {
 		case UndoFlags::UPDATE_TUPLE:
 			properties.has_updates = true;
 			break;
+		case UndoFlags::RECLUSTER:
+			properties.has_recluster = true;
+			break;
 		case UndoFlags::DELETE_TUPLE: {
 			auto info = reinterpret_cast<DeleteInfo *>(data);
 			if (info->is_consecutive) {

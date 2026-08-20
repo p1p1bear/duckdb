@@ -64,6 +64,7 @@ blacklist = [
     "RangeTaskState",
     "ReclusterCandidateSelectionStatus",
     "ReclusterCandidateType",
+    "ReclusterCommitLifecycle",
     "ReclusterDeleteTransactionState",
     "ReclusterTaskStartStatus",
 ]

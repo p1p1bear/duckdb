@@ -161,16 +161,7 @@ void ReclusterOutput::RefreshBlockIds() {
 	block_ids = UniqueSortedBlocks(std::move(block_ids));
 }
 
-idx_t ReclusterOutput::ApplyDeleteCatchup(vector<row_t> new_rowids, delete_sequence_t resolved_through) {
-	if (!owns_blocks || resolved_through <= manifest.header.last_applied_delete_sequence) {
-		throw InternalException("Invalid recluster DELETE catch-up sequence");
-	}
-	if (manifest.header.manifest_revision == NumericLimits<uint64_t>::Maximum()) {
-		throw InternalException("Recluster replacement manifest revision space is exhausted");
-	}
-
-	std::sort(new_rowids.begin(), new_rowids.end());
-	new_rowids.erase(std::unique(new_rowids.begin(), new_rowids.end()), new_rowids.end());
+idx_t ReclusterOutput::ApplyCommittedDeletes(const vector<row_t> &new_rowids) {
 	auto replacement_start = manifest.header.input_range.start;
 	auto replacement_end = replacement_start + NumericCast<row_t>(row_count);
 	auto row_groups = collection->GetRowGroups();
@@ -202,6 +193,27 @@ idx_t ReclusterOutput::ApplyDeleteCatchup(vector<row_t> new_rowids, delete_seque
 		deleted_count += row_group->GetNode().GetOrCreateVersionInfo().DeleteCommittedRows(
 		    vector_index, vector_offsets.data(), vector_offsets.size());
 	}
+	return deleted_count;
+}
+
+idx_t ReclusterOutput::ApplyFinalDeletes(const vector<row_t> &new_rowids) {
+	if (!owns_blocks) {
+		throw InternalException("Cannot apply final DELETEs without private block ownership");
+	}
+	return ApplyCommittedDeletes(new_rowids);
+}
+
+idx_t ReclusterOutput::ApplyDeleteCatchup(vector<row_t> new_rowids, delete_sequence_t resolved_through) {
+	if (!owns_blocks || resolved_through <= manifest.header.last_applied_delete_sequence) {
+		throw InternalException("Invalid recluster DELETE catch-up sequence");
+	}
+	if (manifest.header.manifest_revision == NumericLimits<uint64_t>::Maximum()) {
+		throw InternalException("Recluster replacement manifest revision space is exhausted");
+	}
+
+	std::sort(new_rowids.begin(), new_rowids.end());
+	new_rowids.erase(std::unique(new_rowids.begin(), new_rowids.end()), new_rowids.end());
+	auto deleted_count = ApplyCommittedDeletes(new_rowids);
 
 	auto &metadata_manager = block_manager.GetMetadataManager();
 	auto next_delete_owner = metadata_manager.CreateTaskPrivateBlockOwner();

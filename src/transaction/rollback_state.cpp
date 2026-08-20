@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_set.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
 #include "duckdb/storage/table/update_segment.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -49,6 +50,13 @@ void RollbackState::RollbackEntry(UndoFlags type, data_ptr_t data) {
 		auto db = Load<AttachedDatabase *>(data);
 		auto &db_manager = DatabaseManager::Get(db->GetDatabase());
 		db_manager.DetachInternal(db->name);
+		break;
+	}
+	case UndoFlags::RECLUSTER: {
+		auto recluster = reinterpret_cast<ReclusterUndoData *>(data);
+		recluster->info->Rollback();
+		delete recluster->info;
+		recluster->info = nullptr;
 		break;
 	}
 	case UndoFlags::SEQUENCE_VALUE:

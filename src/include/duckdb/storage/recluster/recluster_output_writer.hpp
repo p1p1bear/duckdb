@@ -18,6 +18,7 @@ namespace duckdb {
 
 class BlockManager;
 class RangeTask;
+class ReclusterCommitInfo;
 class ReclusterDeleteCatchup;
 class RowGroup;
 class RowGroupCollection;
@@ -58,6 +59,7 @@ public:
 
 private:
 	friend class ReclusterDeleteCatchup;
+	friend class ReclusterCommitInfo;
 	friend class ReclusterOutputWriter;
 
 	ReclusterOutput(BlockManager &block_manager, shared_ptr<RowGroupCollection> collection,
@@ -67,7 +69,9 @@ private:
 	                unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner, ReplacementManifest manifest,
 	                MetaBlockPointer manifest_pointer);
 	void AdoptTaskPrivateBlocks(vector<block_id_t> block_ids);
+	idx_t ApplyFinalDeletes(const vector<row_t> &new_rowids);
 	idx_t ApplyDeleteCatchup(vector<row_t> new_rowids, delete_sequence_t resolved_through);
+	idx_t ApplyCommittedDeletes(const vector<row_t> &new_rowids);
 	vector<block_id_t> GetReferencedBlockIds() const;
 	void RefreshBlockIds();
 

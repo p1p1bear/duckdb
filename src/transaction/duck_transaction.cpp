@@ -23,6 +23,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -281,6 +282,21 @@ void DuckTransaction::SetIsReclusterMaintenanceTransaction() {
 	is_recluster_maintenance_transaction = true;
 }
 
+void DuckTransaction::PushRecluster(unique_ptr<ReclusterCommitInfo> info) {
+	if (!info) {
+		throw InternalException("Cannot push a null recluster commit");
+	}
+	lock_guard<mutex> guard(recluster_transaction_lock);
+	if (!is_recluster_maintenance_transaction || has_recluster_undo || undo_buffer.ChangesMade() ||
+	    storage->ChangesMade()) {
+		throw InternalException("A recluster maintenance transaction must contain exactly one recluster change");
+	}
+	auto undo_entry = undo_buffer.CreateEntry(UndoFlags::RECLUSTER, sizeof(ReclusterUndoData));
+	auto recluster = reinterpret_cast<ReclusterUndoData *>(undo_entry.GetDataMutable());
+	recluster->info = info.release();
+	has_recluster_undo = true;
+}
+
 void DuckTransaction::PushAppend(DuckTableEntry &table_entry, idx_t start_row, idx_t row_count) {
 	auto undo_entry = undo_buffer.CreateEntry(UndoFlags::INSERT_TUPLE, sizeof(AppendInfo));
 	auto append_info = reinterpret_cast<AppendInfo *>(undo_entry.GetDataMutable());
@@ -327,7 +343,7 @@ UndoBufferProperties DuckTransaction::GetUndoProperties() {
 }
 
 bool DuckTransaction::AutomaticCheckpoint(AttachedDatabase &db, const UndoBufferProperties &properties) {
-	if (is_checkpoint_transaction) {
+	if (is_checkpoint_transaction || properties.has_recluster) {
 		return false;
 	}
 	if (!ChangesMade()) {

@@ -22,6 +22,7 @@ class CatalogEntry;
 class TableIndexList;
 class DataChunk;
 class DuckTransaction;
+class ReclusterCommitInfo;
 class WriteAheadLog;
 class ClientContext;
 
@@ -52,6 +53,8 @@ public:
 	//! memory index data and also marks all blocks on disk as free blocks allowing for reclamation. Block marking for
 	//! indexes is handled implicitly along destruction paths for index memory.
 	void RemoveIndex(TableIndexList &indexes, Identifier name);
+	//! Register a recluster ownership transfer to run only after the WAL is durable.
+	void AddRecluster(ReclusterCommitInfo &info);
 	//! Finalize accumulated block marks and index removals.
 	void FinalizeCommit();
 	//! True if no work has been queued.
@@ -61,6 +64,7 @@ private:
 	optional_ptr<BlockManager> block_manager;
 	vector<block_id_t> dropped_block_ids;
 	vector<PendingIndexRemoval> pending_index_removals;
+	vector<reference<ReclusterCommitInfo>> pending_reclusters;
 };
 
 struct IndexDataRemover {

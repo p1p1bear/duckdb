@@ -28,6 +28,7 @@ class DuckTableEntry;
 class RowGroupCollection;
 class RowVersionManager;
 class RangeTask;
+class ReclusterCommitInfo;
 class ReclusterDeleteSlot;
 class DuckTransactionManager;
 class StorageLockKey;
@@ -120,6 +121,7 @@ public:
 		SetIsReclusterMaintenanceTransaction();
 	}
 	void SetIsReclusterMaintenanceTransaction();
+	void PushRecluster(unique_ptr<ReclusterCommitInfo> info);
 
 private:
 	void HoldReclusterWriteLock(DataTableInfo &info, bool exclusive);
@@ -171,6 +173,7 @@ private:
 	ReclusterDeleteTransactionState recluster_delete_state = ReclusterDeleteTransactionState::RECORDING;
 	unordered_map<recluster_task_id_t, PendingTaskDeletes> pending_recluster_deletes;
 	bool is_recluster_maintenance_transaction = false;
+	bool has_recluster_undo = false;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };
