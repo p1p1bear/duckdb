@@ -153,6 +153,17 @@ TEST_CASE("Table sort storage state snapshots persistent counters", "[storage][s
 	REQUIRE_THROWS_AS(TableSortStorageState(invalid), SerializationException);
 }
 
+TEST_CASE("Table sort storage state allocates run IDs without wrapping", "[storage][sort_metadata]") {
+	TableSortStorageState state({7, INITIAL_LAYOUT_VERSION});
+	REQUIRE(state.AllocateRunId() == 7);
+	REQUIRE(state.AllocateRunId() == 8);
+	REQUIRE(state.next_run_id.load() == 9);
+
+	TableSortStorageState exhausted({NumericLimits<sort_run_id_t>::Maximum(), INITIAL_LAYOUT_VERSION});
+	REQUIRE_THROWS_AS(exhausted.AllocateRunId(), InvalidInputException);
+	REQUIRE(exhausted.next_run_id.load() == NumericLimits<sort_run_id_t>::Maximum());
+}
+
 TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loading", "[storage][sort_metadata]") {
 	auto path = TestCreatePath("table_sort_layout_state.db");
 	DeleteDatabase(path);

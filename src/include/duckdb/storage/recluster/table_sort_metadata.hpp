@@ -66,6 +66,7 @@ struct PersistentTableSortStorageMetadata {
 struct TableSortStorageState {
 	explicit TableSortStorageState(const PersistentTableSortStorageMetadata &metadata);
 
+	sort_run_id_t AllocateRunId();
 	PersistentTableSortStorageMetadata GetPersistentSnapshot(const StorageLockKey &checkpoint_or_finalize_lock) const;
 
 	std::atomic<sort_run_id_t> next_run_id;

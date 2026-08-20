@@ -1,5 +1,7 @@
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/storage/storage_lock.hpp"
@@ -93,6 +95,16 @@ TableSortStorageState::TableSortStorageState(const PersistentTableSortStorageMet
 	if (metadata.next_run_id == INVALID_SORT_RUN_ID) {
 		throw SerializationException("SORTED BY storage state has an invalid next run ID");
 	}
+}
+
+sort_run_id_t TableSortStorageState::AllocateRunId() {
+	auto current = next_run_id.load();
+	while (current != NumericLimits<sort_run_id_t>::Maximum()) {
+		if (next_run_id.compare_exchange_weak(current, current + 1)) {
+			return current;
+		}
+	}
+	throw InvalidInputException("SORTED BY run ID space is exhausted");
 }
 
 PersistentTableSortStorageMetadata
