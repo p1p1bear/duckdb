@@ -13,6 +13,7 @@
 #include "duckdb/storage/checkpoint_manager.hpp"
 #include "duckdb/storage/in_memory_block_manager.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/table/column_data.hpp"
@@ -302,7 +303,9 @@ bool StorageManager::WALStartCheckpoint(MetaBlockPointer meta_block, CheckpointO
 	return true;
 }
 
-void StorageManager::WALFinishCheckpoint(unique_lock<mutex> &) {
+void StorageManager::WALFinishCheckpoint(unique_lock<mutex> &wal_guard) {
+	D_ASSERT(wal_guard.owns_lock());
+	D_ASSERT(wal_guard.mutex() == &wal_lock);
 	D_ASSERT(wal.get());
 
 	// "wal" points to the checkpoint WAL
@@ -315,6 +318,9 @@ void StorageManager::WALFinishCheckpoint(unique_lock<mutex> &) {
 		fs.TryRemoveFile(wal_path);
 		ResetWALEntriesCount();
 		wal = make_uniq<WriteAheadLog>(*this, wal_path);
+		auto checkpoint_iteration = GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+		db.GetReclusterManager().GetWALBlockRetention().ReleaseNoLongerReplayable(
+		    {checkpoint_iteration, 0, GetWALSize()});
 		return;
 	}
 
@@ -329,6 +335,8 @@ void StorageManager::WALFinishCheckpoint(unique_lock<mutex> &) {
 	// open what is now the main WAL again
 	wal = make_uniq<WriteAheadLog>(*this, wal_path);
 	wal->Initialize();
+	auto checkpoint_iteration = GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+	db.GetReclusterManager().GetWALBlockRetention().ReleaseNoLongerReplayable({checkpoint_iteration, 0, GetWALSize()});
 
 	DUCKDB_LOG(db.GetDatabase(), TransactionLogType, db, "Finish Checkpoint");
 }

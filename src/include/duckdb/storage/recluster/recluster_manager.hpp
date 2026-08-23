@@ -15,6 +15,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
+#include "duckdb/storage/recluster/recluster_wal_retention.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 
 namespace duckdb {
@@ -56,6 +57,9 @@ public:
 	void SynchronizeLoadedCatalog();
 	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate);
 	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
+	ReclusterWALBlockRetention &GetWALBlockRetention() {
+		return wal_block_retention;
+	}
 
 	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
 		return layout_publish_lock.GetSharedLock();
@@ -73,6 +77,7 @@ private:
 
 private:
 	AttachedDatabase &db;
+	ReclusterWALBlockRetention wal_block_retention;
 	mutex queue_lock;
 	StorageLock layout_publish_lock;
 	unordered_map<persistent_table_id_t, weak_ptr<TableReclusterState>> tables;

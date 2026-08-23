@@ -23,7 +23,7 @@
 
 namespace duckdb {
 
-ReclusterManager::ReclusterManager(AttachedDatabase &db_p) : db(db_p) {
+ReclusterManager::ReclusterManager(AttachedDatabase &db_p) : db(db_p), wal_block_retention(db_p) {
 }
 
 uint64_t ReclusterManager::AllocateInitializationToken() {
