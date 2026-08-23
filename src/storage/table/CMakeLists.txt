@@ -4,6 +4,7 @@ add_library_unity(
   duckdb_storage_table
   OBJECT
   chunk_info.cpp
+  column_drop_ownership_bundle.cpp
   column_checkpoint_state.cpp
   column_data_checkpointer.cpp
   column_data.cpp
