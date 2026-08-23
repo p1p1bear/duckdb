@@ -219,13 +219,6 @@ public:
 		auto wal_type = deserializer.ReadProperty<WALType>(100, "wal_type");
 		if (wal_type == WALType::WAL_FLUSH) {
 			deserializer.End();
-			if (state.recluster_replay) {
-				if (deserialize_only) {
-					state.recluster_replay->FinishTransaction();
-				} else {
-					state.recluster_replay->FinishTransaction(context);
-				}
-			}
 			return true;
 		}
 		if (state.recluster_replay) {
@@ -497,6 +490,9 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 			checkpoint_state.current_position = reader.CurrentOffset();
 			auto deserializer = WriteAheadLogDeserializer::GetEntryDeserializer(checkpoint_state, reader, true);
 			auto is_wal_flush = deserializer.ReplayEntry();
+			if (is_wal_flush) {
+				recluster_replay->FinishTransaction(reader.CurrentOffset());
+			}
 			if (checkpoint_state.checkpoint_position.IsValid() && !checkpoint_state.checkpoint_end_position.IsValid()) {
 				checkpoint_state.checkpoint_end_position = reader.CurrentOffset();
 				checkpoint_truncate_offset = last_wal_flush_end;
@@ -522,6 +518,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 			error.Throw("Failure while replaying WAL file \"" + wal_path + "\": ");
 		}
 	} // LCOV_EXCL_STOP
+	auto has_uncommitted_recluster_transaction = recluster_replay->HasUncommittedReclusterTransaction();
 	unique_ptr<FileHandle> checkpoint_handle;
 	bool truncate_failed_checkpoint_marker = false;
 	// A serialization error can leave a partially deserialized checkpoint marker in the replay state. Only reconcile
@@ -602,16 +599,20 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 		WriteAheadLogDeserializer::ThrowVersionError(expected_id - 1, expected_id);
 	}
 	unique_ptr<BufferedFileReader> truncated_wal_reader;
-	if (truncate_failed_checkpoint_marker) {
-		// The failed checkpoint marker is the logical end of the WAL and must not become writable again. Truncate to
-		// the preceding commit boundary, which is zero if the WAL only contained its header before the marker.
+	auto truncate_recluster_tail = has_uncommitted_recluster_transaction && !database.IsReadOnly();
+	if (truncate_failed_checkpoint_marker || truncate_recluster_tail) {
+		// A failed checkpoint marker and an uncommitted maintenance tail must not become writable again.
+		auto truncate_offset = truncate_failed_checkpoint_marker ? checkpoint_truncate_offset : last_wal_flush_end;
 		reader.handle.reset();
 		auto truncate_handle = fs.OpenFile(wal_path, FileFlags::FILE_FLAGS_WRITE);
-		fs.Truncate(*truncate_handle, NumericCast<int64_t>(checkpoint_truncate_offset));
+		fs.Truncate(*truncate_handle, NumericCast<int64_t>(truncate_offset));
 		truncate_handle->Sync();
 		truncate_handle.reset();
+		if (truncate_recluster_tail) {
+			recluster_replay->ReleaseUncommittedReservations();
+		}
 
-		if (checkpoint_truncate_offset == 0) {
+		if (truncate_offset == 0) {
 			return make_uniq<WriteAheadLog>(storage_manager, wal_path);
 		}
 		auto main_handle = fs.OpenFile(wal_path, FileFlags::FILE_FLAGS_READ);
@@ -635,6 +636,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 			// read the current entry
 			auto deserializer = WriteAheadLogDeserializer::GetEntryDeserializer(state, wal_reader);
 			if (deserializer.ReplayEntry()) {
+				recluster_replay->FinishTransaction(wal_reader.CurrentOffset(), *con.context);
 				con.Commit();
 				recluster_replay->OnTransactionCommitted();
 
@@ -671,6 +673,9 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 		throw;
 	} // LCOV_EXCL_STOP
 	recluster_replay->VerifyReplayComplete(all_succeeded);
+	if (!all_succeeded && has_uncommitted_recluster_transaction && database.IsReadOnly()) {
+		recluster_replay->RetainUncommittedReservationsUntilShutdown();
+	}
 	if (all_succeeded && checkpoint_handle) {
 		// we have successfully replayed the main WAL - but there is still a checkpoint WAL remaining
 		// this can only happen in read-only mode
@@ -813,6 +818,9 @@ void WriteAheadLogDeserializer::ReplayVersion() {
 	}
 
 	auto wal_checkpoint_iteration = checkpoint_iteration.GetIndex();
+	if (state.recluster_replay) {
+		state.recluster_replay->SetWALCheckpointIteration(wal_checkpoint_iteration);
+	}
 	auto expected_checkpoint_iteration = single_file_block_manager.GetCheckpointIteration();
 	if (expected_checkpoint_iteration != wal_checkpoint_iteration) {
 		if (wal_checkpoint_iteration + 1 == expected_checkpoint_iteration) {

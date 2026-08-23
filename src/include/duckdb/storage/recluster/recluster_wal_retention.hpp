@@ -63,6 +63,8 @@ public:
 	                                         vector<block_id_t> replay_required_blocks);
 	//! Commit only links a node that was fully allocated by Reserve.
 	void Commit(ReclusterWALRetentionReservation &&reservation, ReclusterWALPosition transaction_end) noexcept;
+	//! Retain an uncommitted recovery reservation for the lifetime of a read-only attachment.
+	void RetainUntilShutdown(ReclusterWALRetentionReservation &&reservation) noexcept;
 	//! Release only entries from generations older than the remaining WAL.
 	void ReleaseNoLongerReplayable(const WALReplayRange &remaining_wal) noexcept;
 

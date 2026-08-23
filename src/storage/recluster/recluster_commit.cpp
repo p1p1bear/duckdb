@@ -4,12 +4,15 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/vector_size.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/wal_entry.hpp"
 #include "duckdb/storage/write_ahead_log.hpp"
 #include "duckdb/transaction/commit_state.hpp"
@@ -44,9 +47,10 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_pt
 }
 
 ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
-                                         shared_ptr<RowGroupLayout> pending_layout_p, sort_run_id_t recovered_run_id_p)
+                                         shared_ptr<RowGroupLayout> pending_layout_p, sort_run_id_t recovered_run_id_p,
+                                         vector<block_id_t> recovered_blocks_p)
     : storage(std::move(storage_p)), old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
-      recovered_run_id(recovered_run_id_p), is_recovery(true) {
+      recovered_run_id(recovered_run_id_p), recovered_blocks(std::move(recovered_blocks_p)), is_recovery(true) {
 	if (!storage || !old_layout || !pending_layout || pending_layout->visible_from != 0 ||
 	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
 	    pending_layout->layout_version != old_layout->layout_version + 1 ||
@@ -54,9 +58,46 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared
 	    recovered_run_id == NumericLimits<sort_run_id_t>::Maximum()) {
 		throw InternalException("Invalid recovered recluster commit state");
 	}
+	for (idx_t block_index = 0; block_index < recovered_blocks.size(); block_index++) {
+		if (recovered_blocks[block_index] < 0 ||
+		    (block_index > 0 && recovered_blocks[block_index - 1] >= recovered_blocks[block_index])) {
+			throw InternalException("Invalid recovered recluster block ownership");
+		}
+	}
+	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
+	try {
+		for (auto block_id : recovered_blocks) {
+			block_manager.MarkBlockAsUsed(block_id);
+			recovered_owned_block_count++;
+		}
+	} catch (...) {
+		ReleaseRecoveredBlocksNoThrow();
+		throw;
+	}
 }
 
 ReclusterCommitInfo::~ReclusterCommitInfo() {
+	ReleaseRecoveredBlocksNoThrow();
+}
+
+void ReclusterCommitInfo::ReleaseRecoveredBlocks() {
+	if (!storage) {
+		return;
+	}
+	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
+	while (recovered_owned_block_count > 0) {
+		auto block_index = recovered_owned_block_count - 1;
+		block_manager.MarkBlockAsModified(recovered_blocks[block_index]);
+		recovered_owned_block_count = block_index;
+	}
+	recovered_blocks.clear();
+}
+
+void ReclusterCommitInfo::ReleaseRecoveredBlocksNoThrow() noexcept {
+	try {
+		ReleaseRecoveredBlocks();
+	} catch (...) { // NOLINT: destructors cannot report allocator cleanup failures
+	}
 }
 
 void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) const {
@@ -163,6 +204,8 @@ void ReclusterCommitInfo::FinalizeCommit() {
 	}
 	if (is_recovery) {
 		storage->GetDataTableInfo()->GetSortStorage().AdvancePastRunId(recovered_run_id);
+		recovered_owned_block_count = 0;
+		recovered_blocks.clear();
 		state = ReclusterCommitLifecycle::FINALIZED;
 		return;
 	}
@@ -182,6 +225,7 @@ void ReclusterCommitInfo::Rollback() {
 		RevertLayout();
 	}
 	if (is_recovery) {
+		ReleaseRecoveredBlocks();
 		state = ReclusterCommitLifecycle::ROLLED_BACK;
 		return;
 	}

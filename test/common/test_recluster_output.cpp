@@ -3,6 +3,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -18,6 +20,7 @@
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
@@ -734,7 +737,21 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 	DeleteDatabase(path);
 }
 
-static WALReclusterEntry CreateCommittedReclusterWAL(const string &path, bool add_final_delete) {
+struct CommittedReclusterWAL {
+	WALReclusterEntry header;
+	duckdb::vector<block_id_t> retained_blocks;
+	duckdb::vector<block_id_t> replacement_blocks;
+	idx_t previous_flush_end = 0;
+};
+
+static AttachedDatabase &GetReclusterDatabase(DuckDB &db, Connection &con) {
+	auto database_name = DatabaseManager::GetDefaultDatabase(*con.context);
+	auto attached = db.instance->GetDatabaseManager().GetDatabase(database_name);
+	REQUIRE(attached);
+	return *attached;
+}
+
+static CommittedReclusterWAL CreateCommittedReclusterWAL(const string &path, bool add_final_delete) {
 	DeleteDatabase(path);
 	{
 		DuckDB db;
@@ -755,24 +772,11 @@ static WALReclusterEntry CreateCommittedReclusterWAL(const string &path, bool ad
 		OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
 		PrepareOutputTask(start);
 
-		WALReclusterEntry header;
-		if (!add_final_delete) {
-			auto &output = start.task->GetTaskContext().GetOutput();
-			auto &manifest = output.GetManifest();
-			header.table_id = manifest.header.table_id;
-			header.task_id = manifest.header.task_id;
-			header.expected_layout_version = manifest.header.prepared_layout_version;
-			header.target_layout_version = header.expected_layout_version + 1;
-			header.range_start = manifest.header.input_range.start;
-			header.range_end = manifest.header.input_range.end;
-			header.manifest_pointer = output.GetManifestPointer();
-			header.manifest_size = manifest.payload_size;
-			header.manifest_checksum = manifest.checksum;
-			header.journal_resolved_through = manifest.header.last_applied_delete_sequence;
-		}
+		CommittedReclusterWAL result;
 		if (add_final_delete) {
 			REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload = 19"));
 		}
+		result.previous_flush_end = GetReclusterDatabase(db, con).GetStorageManager().GetWALSize();
 
 		ReclusterTaskFinalizeStatus status = ReclusterTaskFinalizeStatus::STALE_TASK;
 		con.context->RunFunctionInTransaction([&]() {
@@ -781,8 +785,24 @@ static WALReclusterEntry CreateCommittedReclusterWAL(const string &path, bool ad
 			    entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
 		});
 		REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
+		auto &output = start.task->GetTaskContext().GetOutput();
+		auto &manifest = output.GetManifest();
+		result.header.table_id = manifest.header.table_id;
+		result.header.task_id = manifest.header.task_id;
+		result.header.expected_layout_version = manifest.header.prepared_layout_version;
+		result.header.target_layout_version = result.header.expected_layout_version + 1;
+		result.header.range_start = manifest.header.input_range.start;
+		result.header.range_end = manifest.header.input_range.end;
+		result.header.manifest_pointer = output.GetManifestPointer();
+		result.header.manifest_size = manifest.payload_size;
+		result.header.manifest_checksum = manifest.checksum;
+		result.header.journal_resolved_through = manifest.header.last_applied_delete_sequence;
+		result.retained_blocks = output.GetBlockIds();
+		result.replacement_blocks = manifest.all_referenced_blocks;
+		REQUIRE(!result.retained_blocks.empty());
+		REQUIRE(!result.replacement_blocks.empty());
 		start.task.reset();
-		return header;
+		return result;
 	}
 	return {};
 }
@@ -824,17 +844,24 @@ static void CheckRecoveredRecluster(const string &path, bool payload_deleted, la
 	CheckRecoveredRecluster(con, payload_deleted, expected_version, expected_patch_count);
 }
 
-static void TruncateReclusterWALTail(const string &path) {
+static idx_t GetReclusterWALFileSize(const string &path) {
+	LocalFileSystem fs;
+	auto handle = fs.OpenFile(path + ".wal", FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+	return handle ? NumericCast<idx_t>(handle->GetFileSize()) : 0;
+}
+
+static idx_t TruncateReclusterWALTail(const string &path) {
 	LocalFileSystem fs;
 	auto handle = fs.OpenFile(path + ".wal", FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
 	auto file_size = handle->GetFileSize();
 	REQUIRE(file_size > 0);
 	handle->Truncate(NumericCast<int64_t>(file_size - 1));
 	handle->Sync();
+	return NumericCast<idx_t>(file_size - 1);
 }
 
-static void AppendReclusterWAL(const string &path, const WALReclusterEntry &header, bool checkpoint_before,
-                               bool commit) {
+static idx_t AppendReclusterWAL(const string &path, const WALReclusterEntry &header, bool checkpoint_before,
+                                bool commit) {
 	DuckDB db(path);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
@@ -842,22 +869,92 @@ static void AppendReclusterWAL(const string &path, const WALReclusterEntry &head
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
 	}
 
-	auto database_name = DatabaseManager::GetDefaultDatabase(*con.context);
-	auto attached = db.instance->GetDatabaseManager().GetDatabase(database_name);
-	REQUIRE(attached);
-	auto wal_lock = attached->GetStorageManager().GetWALLock();
-	auto wal = attached->GetStorageManager().GetWAL();
+	auto &storage_manager = GetReclusterDatabase(db, con).GetStorageManager();
+	auto previous_flush_end = storage_manager.GetWALSize();
+	auto wal_lock = storage_manager.GetWALLock();
+	auto wal = storage_manager.GetWAL();
 	REQUIRE(wal);
 	wal->WriteRecluster(header);
 	if (commit) {
 		wal->Flush();
 	}
+	return previous_flush_end;
 }
+
+static void CheckReclusterBlocksReserved(AttachedDatabase &db, const CommittedReclusterWAL &wal, bool expected) {
+	auto &block_manager = db.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>();
+	for (auto block_id : wal.retained_blocks) {
+		REQUIRE(block_manager.IsBlockReserved(block_id) == expected);
+	}
+}
+
+enum class ReclusterRecoveryFault : uint8_t { TRUNCATE, SYNC };
+
+struct ReclusterRecoveryFaultState {
+	bool truncate_seen = false;
+	bool sync_seen = false;
+};
+
+class ReclusterRecoveryFaultFileSystem : public LocalFileSystem {
+public:
+	ReclusterRecoveryFaultFileSystem(string wal_path_p, ReclusterRecoveryFault fault_p,
+	                                 ReclusterRecoveryFaultState &state_p)
+	    : wal_path(std::move(wal_path_p)), fault(fault_p), state(state_p) {
+	}
+
+	void Truncate(FileHandle &handle, int64_t new_size) override {
+		if (!IsTargetWAL(handle)) {
+			return LocalFileSystem::Truncate(handle, new_size);
+		}
+		state.truncate_seen = true;
+		if (fault == ReclusterRecoveryFault::TRUNCATE) {
+			throw IOException("Injected recluster WAL truncate failure");
+		}
+		LocalFileSystem::Truncate(handle, new_size);
+		wait_for_sync = true;
+	}
+
+	void FileSync(FileHandle &handle) override {
+		if (IsTargetWAL(handle) && wait_for_sync) {
+			state.sync_seen = true;
+			wait_for_sync = false;
+			if (fault == ReclusterRecoveryFault::SYNC) {
+				throw IOException("Injected recluster WAL sync failure");
+			}
+		}
+		LocalFileSystem::FileSync(handle);
+	}
+
+private:
+	bool IsTargetWAL(FileHandle &handle) const {
+		return handle.GetPath() == wal_path || StringUtil::EndsWith(handle.GetPath(), ".wal");
+	}
+
+private:
+	string wal_path;
+	ReclusterRecoveryFault fault;
+	ReclusterRecoveryFaultState &state;
+	bool wait_for_sync = false;
+};
 
 TEST_CASE("Recluster WAL recovery applies a committed replacement", "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_recovery.db");
-	CreateCommittedReclusterWAL(path, true);
-	CheckRecoveredRecluster(path, true, 1, 1);
+	auto wal = CreateCommittedReclusterWAL(path, true);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		auto &attached = GetReclusterDatabase(db, con);
+		auto &retention = attached.GetReclusterManager().GetWALBlockRetention();
+		REQUIRE(retention.Count() == 1);
+		CheckReclusterBlocksReserved(attached, wal, true);
+		CheckRecoveredRecluster(con, true, 1, 1);
+
+		REQUIRE_NO_FAIL(con.Query("FORCE CHECKPOINT"));
+		REQUIRE(retention.Count() == 0);
+		CheckReclusterBlocksReserved(attached, wal, false);
+	}
+	CheckRecoveredRecluster(path, true, 1, 0);
 	DeleteDatabase(path);
 }
 
@@ -878,35 +975,139 @@ TEST_CASE("Recluster WAL recovery reads protected blocks through MMAP",
 TEST_CASE("Recluster WAL recovery ignores a torn maintenance transaction",
           "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_torn_recovery.db");
-	CreateCommittedReclusterWAL(path, true);
-	TruncateReclusterWALTail(path);
+	auto wal = CreateCommittedReclusterWAL(path, true);
+	auto torn_size = TruncateReclusterWALTail(path);
+	REQUIRE(torn_size > wal.previous_flush_end);
+	{
+		DBConfig config;
+		config.options.access_mode = AccessMode::READ_ONLY;
+		DuckDB db(path, &config);
+		Connection con(db);
+		auto &attached = GetReclusterDatabase(db, con);
+		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 1);
+		CheckReclusterBlocksReserved(attached, wal, true);
+		CheckRecoveredRecluster(con, true, 0, 0);
+		REQUIRE(GetReclusterWALFileSize(path) == torn_size);
+	}
+	REQUIRE(GetReclusterWALFileSize(path) == torn_size);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		auto &attached = GetReclusterDatabase(db, con);
+		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 0);
+		CheckReclusterBlocksReserved(attached, wal, false);
+		CheckRecoveredRecluster(con, true, 0, 0);
+		REQUIRE(GetReclusterWALFileSize(path) == wal.previous_flush_end);
+	}
 	CheckRecoveredRecluster(path, true, 0, 0);
-	CheckRecoveredRecluster(path, true, 0, 0);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery fails if torn tail cleanup is not durable",
+          "[storage][recluster_finalize][recluster_wal]") {
+	for (auto fault : {ReclusterRecoveryFault::TRUNCATE, ReclusterRecoveryFault::SYNC}) {
+		auto suffix = fault == ReclusterRecoveryFault::TRUNCATE ? "truncate" : "sync";
+		auto path = TestCreatePath("recluster_finalize_torn_" + string(suffix) + "_failure.db");
+		auto wal = CreateCommittedReclusterWAL(path, true);
+		auto torn_size = TruncateReclusterWALTail(path);
+
+		ReclusterRecoveryFaultState state;
+		DBConfig config;
+		duckdb::unique_ptr<FileSystem> local_fs =
+		    make_uniq<ReclusterRecoveryFaultFileSystem>(path + ".wal", fault, state);
+		config.file_system = make_uniq<VirtualFileSystem>(std::move(local_fs));
+		string error;
+		try {
+			DuckDB reopened(path, &config);
+		} catch (std::exception &ex) {
+			error = ex.what();
+		}
+		REQUIRE(error.find("Injected recluster WAL") != string::npos);
+		REQUIRE(state.truncate_seen);
+		REQUIRE(state.sync_seen == (fault == ReclusterRecoveryFault::SYNC));
+		REQUIRE(GetReclusterWALFileSize(path) ==
+		        (fault == ReclusterRecoveryFault::TRUNCATE ? torn_size : wal.previous_flush_end));
+
+		{
+			DuckDB db(path);
+			Connection con(db);
+			REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+			CheckRecoveredRecluster(con, true, 0, 0);
+			REQUIRE(GetReclusterWALFileSize(path) == wal.previous_flush_end);
+		}
+		DeleteDatabase(path);
+	}
+}
+
+TEST_CASE("Recluster WAL recovery rolls back replacement ownership after commit failure",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_recovery_commit_failure.db");
+	auto wal = CreateCommittedReclusterWAL(path, true);
+	auto wal_size = GetReclusterWALFileSize(path);
+	DBConfig config;
+	config.SetOptionByName("debug_force_commit_failure", true);
+	string error;
+	try {
+		DuckDB reopened(path, &config);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	REQUIRE(error.find("Forced commit failure") != string::npos);
+	REQUIRE(GetReclusterWALFileSize(path) == wal_size);
+
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		auto &attached = GetReclusterDatabase(db, con);
+		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 1);
+		CheckReclusterBlocksReserved(attached, wal, true);
+		CheckRecoveredRecluster(con, true, 1, 1);
+	}
 	DeleteDatabase(path);
 }
 
 TEST_CASE("Recluster WAL recovery ignores an invalid uncommitted manifest",
           "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_invalid_torn_manifest.db");
-	auto torn_header = CreateCommittedReclusterWAL(path, false);
-	torn_header.manifest_checksum++;
-	AppendReclusterWAL(path, torn_header, false, false);
-	CheckRecoveredRecluster(path, false, 1, 1);
+	auto wal = CreateCommittedReclusterWAL(path, false);
+	wal.header.manifest_checksum++;
+	auto previous_flush_end = AppendReclusterWAL(path, wal.header, false, false);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		CheckRecoveredRecluster(con, false, 1, 1);
+		REQUIRE(GetReclusterWALFileSize(path) == previous_flush_end);
+	}
 	DeleteDatabase(path);
 }
 
 TEST_CASE("Recluster WAL recovery skips a checkpointed replacement", "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_skip_recovery.db");
-	auto stale_header = CreateCommittedReclusterWAL(path, false);
-	AppendReclusterWAL(path, stale_header, true, true);
-	CheckRecoveredRecluster(path, false, 1, 0);
+	auto wal = CreateCommittedReclusterWAL(path, false);
+	AppendReclusterWAL(path, wal.header, true, true);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		auto &attached = GetReclusterDatabase(db, con);
+		auto &retention = attached.GetReclusterManager().GetWALBlockRetention();
+		REQUIRE(retention.Count() == 1);
+		CheckReclusterBlocksReserved(attached, wal, true);
+		CheckRecoveredRecluster(con, false, 1, 0);
+		REQUIRE_NO_FAIL(con.Query("FORCE CHECKPOINT"));
+		REQUIRE(retention.Count() == 0);
+		CheckReclusterBlocksReserved(attached, wal, false);
+	}
 	DeleteDatabase(path);
 }
 
 TEST_CASE("Recluster WAL recovery rejects an unknown persistent table ID",
           "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_unknown_table.db");
-	auto stale_header = CreateCommittedReclusterWAL(path, false);
+	auto committed_wal = CreateCommittedReclusterWAL(path, false);
 	{
 		DuckDB db(path);
 		Connection con(db);
@@ -919,7 +1120,7 @@ TEST_CASE("Recluster WAL recovery rejects an unknown persistent table ID",
 		auto wal_lock = attached->GetStorageManager().GetWALLock();
 		auto wal = attached->GetStorageManager().GetWAL();
 		REQUIRE(wal);
-		wal->WriteRecluster(stale_header);
+		wal->WriteRecluster(committed_wal.header);
 		wal->Flush();
 	}
 	string error;
@@ -935,9 +1136,9 @@ TEST_CASE("Recluster WAL recovery rejects an unknown persistent table ID",
 TEST_CASE("Recluster WAL recovery rejects a mismatched manifest envelope",
           "[storage][recluster_finalize][recluster_wal]") {
 	auto path = TestCreatePath("recluster_finalize_corrupt_manifest.db");
-	auto stale_header = CreateCommittedReclusterWAL(path, false);
-	stale_header.manifest_checksum++;
-	AppendReclusterWAL(path, stale_header, true, true);
+	auto wal = CreateCommittedReclusterWAL(path, false);
+	wal.header.manifest_checksum++;
+	AppendReclusterWAL(path, wal.header, true, true);
 	string error;
 	try {
 		DuckDB reopened(path);

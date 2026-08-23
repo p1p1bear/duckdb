@@ -27,7 +27,8 @@ public:
 	                    shared_ptr<RowGroupLayout> pending_layout, vector<row_t> final_deleted_new_rowids,
 	                    delete_sequence_t journal_resolved_through);
 	ReclusterCommitInfo(shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
-	                    shared_ptr<RowGroupLayout> pending_layout, sort_run_id_t recovered_run_id);
+	                    shared_ptr<RowGroupLayout> pending_layout, sort_run_id_t recovered_run_id,
+	                    vector<block_id_t> recovered_blocks);
 	~ReclusterCommitInfo();
 
 	void WriteToWAL(WriteAheadLog &wal) const;
@@ -39,6 +40,8 @@ public:
 
 private:
 	void RevertLayout();
+	void ReleaseRecoveredBlocks();
+	void ReleaseRecoveredBlocksNoThrow() noexcept;
 
 private:
 	enum class ReclusterCommitLifecycle : uint8_t { PREPARED, APPLIED, FINALIZED, ROLLED_BACK };
@@ -52,6 +55,8 @@ private:
 	vector<row_t> final_deleted_new_rowids;
 	delete_sequence_t journal_resolved_through;
 	sort_run_id_t recovered_run_id = INVALID_SORT_RUN_ID;
+	vector<block_id_t> recovered_blocks;
+	idx_t recovered_owned_block_count = 0;
 	ReclusterCommitLifecycle state = ReclusterCommitLifecycle::PREPARED;
 	bool is_recovery = false;
 	bool layout_published = false;

@@ -13,6 +13,7 @@ struct ReclusterWALRetentionNode {
 	AllocatorBlockReservation block_reservation;
 	ReclusterWALPosition transaction_end;
 	unique_ptr<ReclusterWALRetentionNode> next;
+	bool retain_until_shutdown = false;
 };
 
 ReclusterWALRetentionReservation::ReclusterWALRetentionReservation() {
@@ -77,6 +78,18 @@ void ReclusterWALBlockRetention::Commit(ReclusterWALRetentionReservation &&reser
 	entries = std::move(node);
 }
 
+void ReclusterWALBlockRetention::RetainUntilShutdown(ReclusterWALRetentionReservation &&reservation) noexcept {
+	D_ASSERT(reservation.node);
+	if (!reservation.node) {
+		return;
+	}
+	auto node = std::move(reservation.node);
+	node->retain_until_shutdown = true;
+	lock_guard<mutex> guard(lock);
+	node->next = std::move(entries);
+	entries = std::move(node);
+}
+
 void ReclusterWALBlockRetention::ReleaseNoLongerReplayable(const WALReplayRange &remaining_wal) noexcept {
 	D_ASSERT(remaining_wal.start_offset <= remaining_wal.end_offset);
 	unique_ptr<ReclusterWALRetentionNode> released;
@@ -84,6 +97,10 @@ void ReclusterWALBlockRetention::ReleaseNoLongerReplayable(const WALReplayRange 
 		lock_guard<mutex> guard(lock);
 		auto cursor = &entries;
 		while (*cursor) {
+			if ((*cursor)->retain_until_shutdown) {
+				cursor = &(*cursor)->next;
+				continue;
+			}
 			auto &position = (*cursor)->transaction_end;
 			if (position.checkpoint_iteration < remaining_wal.checkpoint_iteration) {
 				auto removed = std::move(*cursor);

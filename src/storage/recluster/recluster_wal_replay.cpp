@@ -12,6 +12,7 @@
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/allocator_block_reservation.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
@@ -19,6 +20,7 @@
 #include "duckdb/storage/metadata/metadata_manager.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/recluster_commit.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/replacement_manifest.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
@@ -59,19 +61,20 @@ struct ReclusterWALReplayRecord {
 	vector<row_t> final_deleted_new_rowids;
 	vector<block_id_t> manifest_blocks;
 	vector<block_id_t> replacement_blocks;
+	ReclusterWALRetentionReservation wal_reservation;
+	ReclusterWALPosition transaction_end;
 	optional<string> validation_error;
-	idx_t replacement_reference_count = 1;
 	bool committed = false;
 };
 
 class ProtectedManifestReader : public ReadStream {
 public:
 	ProtectedManifestReader(BlockManager &block_manager_p, MetaBlockPointer pointer_p,
-	                        vector<block_id_t> &protected_blocks_p)
+	                        vector<block_id_t> &protected_blocks_p, AllocatorBlockReservation &reservation_p)
 	    : block_manager(block_manager_p),
 	      metadata_block_size(block_manager.GetMetadataManager().GetMetadataBlockSize()), next_pointer(pointer_p),
-	      protected_blocks(protected_blocks_p), has_next_block(true), offset(0), next_offset(pointer_p.offset),
-	      capacity(0) {
+	      protected_blocks(protected_blocks_p), reservation(reservation_p), has_next_block(true), offset(0),
+	      next_offset(pointer_p.offset), capacity(0) {
 	}
 
 	void ReadData(data_ptr_t target, idx_t read_size) override {
@@ -101,13 +104,8 @@ private:
 		if (std::find(protected_blocks.begin(), protected_blocks.end(), block_id) != protected_blocks.end()) {
 			return;
 		}
+		reservation.AddPhysicalBlock(block_id);
 		protected_blocks.push_back(block_id);
-		try {
-			block_manager.MarkBlockAsUsed(block_id);
-		} catch (...) {
-			protected_blocks.pop_back();
-			throw;
-		}
 	}
 
 	void ReadNextBlock(QueryContext context) {
@@ -155,6 +153,7 @@ private:
 	idx_t metadata_block_size;
 	MetaBlockPointer next_pointer;
 	vector<block_id_t> &protected_blocks;
+	AllocatorBlockReservation &reservation;
 	vector<idx_t> visited_pointers;
 	BufferHandle block;
 	uint32_t block_index = 0;
@@ -219,18 +218,6 @@ static vector<row_t> ValidateWALTransaction(const PendingReclusterWALTransaction
 		}
 	}
 	return result;
-}
-
-static void ReleaseBlockReferences(BlockManager &block_manager, const vector<block_id_t> &blocks,
-                                   idx_t reference_count) noexcept {
-	for (auto block_id : blocks) {
-		for (idx_t reference_index = 0; reference_index < reference_count; reference_index++) {
-			try {
-				block_manager.MarkBlockAsModified(block_id);
-			} catch (...) {
-			}
-		}
-	}
 }
 
 static void ValidateManifest(const WALReclusterEntry &header, const ReplacementManifest &manifest,
@@ -397,10 +384,12 @@ public:
 		ReclusterWALReplayRecord record;
 		record.header = header;
 		record.manifest_blocks.reserve(4);
+		auto temporary_reservation = AllocatorBlockReservation::Reserve(block_manager, {});
 		idx_t marked_blocks = 0;
 		try {
 			header.Validate();
-			ProtectedManifestReader reader(block_manager, header.manifest_pointer, record.manifest_blocks);
+			ProtectedManifestReader reader(block_manager, header.manifest_pointer, record.manifest_blocks,
+			                               temporary_reservation);
 			record.manifest = ReplacementManifest::Read(reader);
 			record.replacement_blocks = record.manifest.all_referenced_blocks;
 			for (auto block_id : record.replacement_blocks) {
@@ -408,7 +397,7 @@ public:
 					throw DataCorruptionException("Recluster manifest references block %d outside the database file",
 					                              block_id);
 				}
-				block_manager.MarkBlockAsUsed(block_id);
+				temporary_reservation.AddPhysicalBlock(block_id);
 				marked_blocks++;
 			}
 			ValidateManifest(header, record.manifest, {}, record.manifest_blocks);
@@ -416,30 +405,21 @@ public:
 			ErrorData error(ex);
 			if (error.Type() == ExceptionType::OUT_OF_MEMORY || error.Type() == ExceptionType::INTERRUPT ||
 			    error.Type() == ExceptionType::FATAL || error.Type() == ExceptionType::INTERNAL) {
-				record.replacement_blocks.resize(marked_blocks);
-				ReleaseBlockReferences(block_manager, record.replacement_blocks, 1);
-				ReleaseBlockReferences(block_manager, record.manifest_blocks, 1);
 				throw;
 			}
 			record.replacement_blocks.resize(marked_blocks);
 			record.validation_error = error.RawMessage();
-		} catch (...) {
-			record.replacement_blocks.resize(marked_blocks);
-			ReleaseBlockReferences(block_manager, record.replacement_blocks, 1);
-			ReleaseBlockReferences(block_manager, record.manifest_blocks, 1);
-			throw;
 		}
-		try {
-			records.push_back(std::move(record));
-		} catch (...) {
-			ReleaseBlockReferences(block_manager, record.replacement_blocks, 1);
-			ReleaseBlockReferences(block_manager, record.manifest_blocks, 1);
-			throw;
+		if (!record.manifest_blocks.empty() || !record.replacement_blocks.empty()) {
+			record.wal_reservation = db.GetReclusterManager().GetWALBlockRetention().Reserve(record.manifest_blocks,
+			                                                                                 record.replacement_blocks);
 		}
+		records.push_back(std::move(record));
 		return records.size() - 1;
 	}
 
-	void CommitReservation(idx_t record_index, vector<row_t> final_deleted_new_rowids) {
+	void CommitReservation(idx_t record_index, vector<row_t> final_deleted_new_rowids,
+	                       ReclusterWALPosition transaction_end) {
 		if (record_index >= records.size()) {
 			throw InternalException("Invalid recluster WAL reservation index");
 		}
@@ -451,36 +431,33 @@ public:
 			throw DataCorruptionException("Recluster WAL reservation does not match its transaction");
 		}
 		ValidateManifest(record.header, record.manifest, final_deleted_new_rowids, record.manifest_blocks);
-		committed_record_indexes.reserve(committed_record_indexes.size() + 1);
-
-		auto &block_manager = db.GetStorageManager().GetBlockManager();
-		idx_t marked_blocks = 0;
-		try {
-			for (auto block_id : record.replacement_blocks) {
-				block_manager.MarkBlockAsUsed(block_id);
-				marked_blocks++;
-			}
-		} catch (...) {
-			for (idx_t block_index = 0; block_index < marked_blocks; block_index++) {
-				block_manager.MarkBlockAsModified(record.replacement_blocks[block_index]);
-			}
-			throw;
+		if (!record.wal_reservation.IsActive() || transaction_end.file_offset == 0) {
+			throw InternalException("Invalid recluster WAL retention reservation");
 		}
-		record.replacement_reference_count = 2;
+		committed_record_indexes.reserve(committed_record_indexes.size() + 1);
 		record.final_deleted_new_rowids = std::move(final_deleted_new_rowids);
+		record.transaction_end = transaction_end;
 		record.committed = true;
 		committed_record_indexes.push_back(record_index);
 	}
 
-	void PrepareReplayRecord(ClientContext &context, vector<row_t> final_deleted_new_rowids) {
+	void PrepareReplayRecord(ClientContext &context, vector<row_t> final_deleted_new_rowids,
+	                         ReclusterWALPosition transaction_end) {
 		if (next_record >= committed_record_indexes.size()) {
 			throw DataCorruptionException("Recluster WAL replay contains an unreserved transaction");
 		}
-		auto &record = records[committed_record_indexes[next_record++]];
+		if (pending_replay_commit_record.IsValid()) {
+			throw InternalException("Previous recluster WAL replay transaction was not committed");
+		}
+		auto record_index = committed_record_indexes[next_record++];
+		auto &record = records[record_index];
 		if (!record.committed || !WALHeadersEqual(record.header, *pending.header) ||
-		    record.final_deleted_new_rowids != final_deleted_new_rowids) {
+		    record.final_deleted_new_rowids != final_deleted_new_rowids ||
+		    record.transaction_end.checkpoint_iteration != transaction_end.checkpoint_iteration ||
+		    record.transaction_end.file_offset != transaction_end.file_offset || !record.wal_reservation.IsActive()) {
 			throw DataCorruptionException("Recluster WAL changed between recovery pre-scan and replay");
 		}
+		pending_replay_commit_record = record_index;
 
 		auto table_entry = tables.find(record.header.table_id);
 		if (table_entry == tables.end()) {
@@ -497,7 +474,6 @@ public:
 			if (sort_storage.next_run_id.load() <= record.manifest.header.run_id) {
 				throw DataCorruptionException("Checkpointed SORTED BY run ID is behind skipped recluster WAL");
 			}
-			SkipRecord(record);
 			return;
 		}
 		if (current_version != record.header.expected_layout_version) {
@@ -547,34 +523,58 @@ public:
 		patch->replacement_physical_rows = replacement_rows;
 		patch->replacement_groups = std::move(replacement_groups);
 		auto pending_layout = collection->BuildPendingPatchedLayout(std::move(patch));
-		auto commit_info = make_uniq<ReclusterCommitInfo>(storage, old_layout, std::move(pending_layout),
-		                                                  record.manifest.header.run_id);
+		auto commit_info =
+		    make_uniq<ReclusterCommitInfo>(storage, old_layout, std::move(pending_layout),
+		                                   record.manifest.header.run_id, std::move(record.replacement_blocks));
 		auto &transaction = DuckTransaction::Get(context, db);
 		transaction.SetIsReclusterMaintenanceTransaction();
 		transaction.PushRecluster(std::move(commit_info));
 	}
 
-	void SkipRecord(ReclusterWALReplayRecord &record) {
-		if (record.replacement_reference_count != 2) {
-			throw InternalException("Invalid recluster WAL reservation transition");
+	void CommitPendingRetention() noexcept {
+		if (!pending_replay_commit_record.IsValid()) {
+			return;
 		}
-		auto &block_manager = db.GetStorageManager().GetBlockManager();
-		for (auto block_id : record.replacement_blocks) {
-			block_manager.MarkBlockAsModified(block_id);
-		}
-		record.replacement_reference_count = 1;
+		auto &record = records[pending_replay_commit_record.GetIndex()];
+		db.GetReclusterManager().GetWALBlockRetention().Commit(std::move(record.wal_reservation),
+		                                                       record.transaction_end);
+		pending_replay_commit_record = optional_idx();
 	}
 
 	void ReleaseAllReservations() noexcept {
-		auto &block_manager = db.GetStorageManager().GetBlockManager();
-		for (auto &record : records) {
-			ReleaseBlockReferences(block_manager, record.manifest_blocks, 1);
-			ReleaseBlockReferences(block_manager, record.replacement_blocks, record.replacement_reference_count);
-			record.replacement_reference_count = 0;
-		}
 		records.clear();
 		committed_record_indexes.clear();
 		next_record = 0;
+		pending_replay_commit_record = optional_idx();
+	}
+
+	void ReleaseUncommittedReservations() noexcept {
+		for (auto &record : records) {
+			if (!record.committed) {
+				record.wal_reservation = ReclusterWALRetentionReservation();
+			}
+		}
+	}
+
+	void RetainUncommittedReservationsUntilShutdown() noexcept {
+		auto &retention = db.GetReclusterManager().GetWALBlockRetention();
+		for (auto &record : records) {
+			if (!record.committed && record.wal_reservation.IsActive()) {
+				retention.RetainUntilShutdown(std::move(record.wal_reservation));
+			}
+		}
+	}
+
+	bool HasUncommittedReclusterTransaction() const {
+		if (pending.HasReclusterEntries()) {
+			return true;
+		}
+		for (auto &record : records) {
+			if (!record.committed) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 public:
@@ -584,6 +584,8 @@ public:
 	vector<ReclusterWALReplayRecord> records;
 	vector<idx_t> committed_record_indexes;
 	idx_t next_record = 0;
+	optional_idx wal_checkpoint_iteration;
+	optional_idx pending_replay_commit_record;
 	unordered_map<persistent_table_id_t, optional_ptr<DuckTableEntry>> tables;
 };
 
@@ -592,6 +594,14 @@ ReclusterWALReplayContext::ReclusterWALReplayContext(AttachedDatabase &db)
 }
 
 ReclusterWALReplayContext::~ReclusterWALReplayContext() {
+}
+
+void ReclusterWALReplayContext::SetWALCheckpointIteration(uint64_t checkpoint_iteration) {
+	if (state->wal_checkpoint_iteration.IsValid() &&
+	    state->wal_checkpoint_iteration.GetIndex() != checkpoint_iteration) {
+		throw DataCorruptionException("Recluster WAL checkpoint iteration changed between recovery passes");
+	}
+	state->wal_checkpoint_iteration = checkpoint_iteration;
 }
 
 void ReclusterWALReplayContext::ObserveEntry(WALType type) {
@@ -643,23 +653,27 @@ void ReclusterWALReplayContext::AddDelete(WALReclusterDeleteEntry entry) {
 	pending.deletes.push_back(std::move(entry));
 }
 
-void ReclusterWALReplayContext::FinishTransaction(optional_ptr<ClientContext> context) {
+void ReclusterWALReplayContext::FinishTransaction(optional_idx transaction_end, optional_ptr<ClientContext> context) {
 	auto &pending = state->pending;
 	if (!pending.HasReclusterEntries()) {
 		pending.Reset();
 		return;
 	}
+	if (!state->wal_checkpoint_iteration.IsValid() || !transaction_end.IsValid() || transaction_end.GetIndex() == 0) {
+		throw DataCorruptionException("Recluster WAL transaction is missing its physical WAL position");
+	}
+	ReclusterWALPosition position {state->wal_checkpoint_iteration.GetIndex(), transaction_end.GetIndex()};
 	auto final_deleted_new_rowids = ValidateWALTransaction(pending);
 	if (state->phase == ReclusterWALReplayPhase::PRESCAN) {
 		if (pending.reservation_indexes.size() != 1) {
 			throw InternalException("Recluster WAL transaction has an invalid reservation count");
 		}
-		state->CommitReservation(pending.reservation_indexes[0], std::move(final_deleted_new_rowids));
+		state->CommitReservation(pending.reservation_indexes[0], std::move(final_deleted_new_rowids), position);
 	} else {
 		if (!context) {
 			throw InternalException("Recluster WAL replay requires a client context");
 		}
-		state->PrepareReplayRecord(*context, std::move(final_deleted_new_rowids));
+		state->PrepareReplayRecord(*context, std::move(final_deleted_new_rowids), position);
 	}
 	pending.Reset();
 }
@@ -675,14 +689,27 @@ void ReclusterWALReplayContext::OnTransactionCommitted() {
 	if (state->phase != ReclusterWALReplayPhase::REPLAY) {
 		throw InternalException("Cannot update the recluster table map before WAL replay");
 	}
+	state->CommitPendingRetention();
 	state->RebuildTableMap();
 }
 
 void ReclusterWALReplayContext::VerifyReplayComplete(bool all_succeeded) const {
 	if (state->phase != ReclusterWALReplayPhase::REPLAY || (all_succeeded && state->pending.HasReclusterEntries()) ||
-	    state->next_record != state->committed_record_indexes.size()) {
+	    state->next_record != state->committed_record_indexes.size() || state->pending_replay_commit_record.IsValid()) {
 		throw DataCorruptionException("Recluster WAL recovery did not consume every reserved transaction");
 	}
+}
+
+bool ReclusterWALReplayContext::HasUncommittedReclusterTransaction() const {
+	return state->HasUncommittedReclusterTransaction();
+}
+
+void ReclusterWALReplayContext::ReleaseUncommittedReservations() noexcept {
+	state->ReleaseUncommittedReservations();
+}
+
+void ReclusterWALReplayContext::RetainUncommittedReservationsUntilShutdown() noexcept {
+	state->RetainUncommittedReservationsUntilShutdown();
 }
 
 void ReclusterWALReplayContext::ReleaseAllReservations() noexcept {
