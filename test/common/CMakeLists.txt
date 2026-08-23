@@ -33,6 +33,7 @@ add_library_unity(
   test_recluster_wal.cpp
   test_recluster_wal_retention.cpp
   test_replacement_manifest.cpp
+  test_row_group_column_drop_ownership.cpp
   test_row_group_layout.cpp
   test_table_sort_metadata.cpp
   test_task_private_metadata.cpp
