@@ -33,6 +33,8 @@ public:
 	static AllocatorBlockReservation Reserve(BlockManager &block_manager, const vector<block_id_t> &physical_blocks);
 	void AddPhysicalBlock(block_id_t block_id);
 	bool Covers(const vector<block_id_t> &all_resources) const;
+	bool Covers(const BlockManager &expected_manager, const vector<block_id_t> &all_resources) const;
+	bool IsActiveFor(const BlockManager &expected_manager) const noexcept;
 	void Release() noexcept;
 
 private:

@@ -1,5 +1,6 @@
 #include "duckdb/storage/single_file_block_manager.hpp"
 
+#include "duckdb/storage/allocator_block_reservation.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/checksum.hpp"
@@ -7,6 +8,7 @@
 #include "duckdb/common/encryption_key_manager.hpp"
 #include "duckdb/common/encryption_state.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/enums/checkpoint_abort.hpp"
 #include "duckdb/common/enums/storage_block_prefetch.hpp"
@@ -25,6 +27,15 @@
 #include <cstring>
 
 namespace duckdb {
+
+PreparedCheckpointBlockDropBatch::PreparedCheckpointBlockDropBatch(SingleFileBlockManager &manager_p,
+                                                                   vector<DropDelta> deltas_p,
+                                                                   set<block_id_t> staged_free_nodes_p,
+                                                                   unique_lock<mutex> block_lock_p,
+                                                                   unique_lock<mutex> reservation_lock_p)
+    : manager(manager_p), deltas(std::move(deltas_p)), staged_free_nodes(std::move(staged_free_nodes_p)),
+      block_lock(std::move(block_lock_p)), reservation_lock(std::move(reservation_lock_p)) {
+}
 
 const char MainHeader::MAGIC_BYTES[] = "DUCK";
 const char MainHeader::CANARY[] = "DUCKKEY";
@@ -996,6 +1007,135 @@ void SingleFileBlockManager::MarkBlockAsModified(block_id_t block_id) {
 		// add it to the modified blocks indicating it will be re-usable after the next checkpoint
 		modified_blocks.insert(block_id);
 	}
+}
+
+PreparedCheckpointBlockDropBatch
+SingleFileBlockManager::PrepareBlockDropsForCheckpoint(const vector<CheckpointBlockDropSource> &sources) {
+	idx_t total_actions = 0;
+	for (auto &source : sources) {
+		auto &actions = source.actions.get();
+		auto &protected_resources = source.protected_resources.get();
+		auto &reservation = source.reservation.get();
+		if (!reservation.IsActiveFor(*this)) {
+			throw InternalException("Checkpoint block drop reservation belongs to a different block manager");
+		}
+		for (auto block_id : actions) {
+			if (block_id < 0 || block_id >= MAXIMUM_BLOCK) {
+				throw InternalException("Invalid checkpoint block drop action for block %d", block_id);
+			}
+		}
+		if (!reservation.Covers(*this, actions)) {
+			throw InternalException("Checkpoint block drop reservation does not cover every action");
+		}
+		if (!reservation.Covers(*this, protected_resources)) {
+			throw InternalException("Checkpoint block drop reservation does not cover every protected resource");
+		}
+		if (actions.size() > NumericLimits<idx_t>::Maximum() - total_actions) {
+			throw InternalException("Checkpoint block drop action count overflow");
+		}
+		total_actions += actions.size();
+	}
+
+	vector<block_id_t> sorted_actions;
+	sorted_actions.reserve(total_actions);
+	for (auto &source : sources) {
+		auto &actions = source.actions.get();
+		sorted_actions.insert(sorted_actions.end(), actions.begin(), actions.end());
+	}
+	std::sort(sorted_actions.begin(), sorted_actions.end());
+
+	vector<PreparedCheckpointBlockDropBatch::DropDelta> deltas;
+	deltas.reserve(sorted_actions.size());
+	set<block_id_t> staged_free_nodes;
+	for (idx_t action_index = 0; action_index < sorted_actions.size();) {
+		auto block_id = sorted_actions[action_index];
+		idx_t next_action = action_index + 1;
+		while (next_action < sorted_actions.size() && sorted_actions[next_action] == block_id) {
+			next_action++;
+		}
+		deltas.push_back({block_id, next_action - action_index, 0});
+		staged_free_nodes.insert(block_id);
+		action_index = next_action;
+	}
+
+	unique_lock<mutex> block_lock(single_file_block_lock);
+	unique_lock<mutex> reservation_lock(allocator_reservation_lock);
+	for (auto &source : sources) {
+		auto &reservation = source.reservation.get();
+		if (!reservation.Covers(*this, source.actions.get()) ||
+		    !reservation.Covers(*this, source.protected_resources.get())) {
+			throw InternalException("Checkpoint block drop reservation became inactive during preparation");
+		}
+	}
+	for (auto &delta : deltas) {
+		auto block_id = delta.block_id;
+		if (block_id >= max_block) {
+			throw InternalException("Checkpoint block drop action references block %d beyond max block %d", block_id,
+			                        max_block);
+		}
+		if (!IsBlockReservedInternal(block_id)) {
+			throw InternalException("Checkpoint block drop action for block %d is no longer reserved", block_id);
+		}
+		if (free_list.find(block_id) != free_list.end() ||
+		    free_blocks_in_use.find(block_id) != free_blocks_in_use.end()) {
+			throw InternalException("Checkpoint block drop action references already freed block %d", block_id);
+		}
+		if (modified_blocks.find(block_id) != modified_blocks.end()) {
+			throw InternalException("Checkpoint block drop action references already modified block %d", block_id);
+		}
+
+		auto multi_use_entry = multi_use_blocks.find(block_id);
+		uint32_t reference_count = 1;
+		if (multi_use_entry != multi_use_blocks.end()) {
+			reference_count = multi_use_entry->second;
+			if (reference_count <= 1) {
+				throw InternalException("Invalid multi-use reference count for checkpoint block drop action %d",
+				                        block_id);
+			}
+		}
+		if (delta.drop_count > reference_count) {
+			throw InternalException("Checkpoint block drop action count %llu exceeds reference count %u for block %d",
+			                        static_cast<uint64_t>(delta.drop_count), reference_count, block_id);
+		}
+		delta.remaining_references = reference_count - NumericCast<uint32_t>(delta.drop_count);
+	}
+
+	return PreparedCheckpointBlockDropBatch(*this, std::move(deltas), std::move(staged_free_nodes),
+	                                        std::move(block_lock), std::move(reservation_lock));
+}
+
+void SingleFileBlockManager::ApplyPreparedBlockDrops(PreparedCheckpointBlockDropBatch &&batch) noexcept {
+	if (batch.manager.get() != this || batch.applied || !batch.block_lock.owns_lock() ||
+	    batch.block_lock.mutex() != &single_file_block_lock || !batch.reservation_lock.owns_lock() ||
+	    batch.reservation_lock.mutex() != &allocator_reservation_lock) {
+		D_ASSERT(false);
+		return;
+	}
+
+	for (auto &delta : batch.deltas) {
+		auto multi_use_entry = multi_use_blocks.find(delta.block_id);
+		if (delta.remaining_references >= 2) {
+			D_ASSERT(multi_use_entry != multi_use_blocks.end());
+			multi_use_entry->second = delta.remaining_references;
+			continue;
+		}
+		if (multi_use_entry != multi_use_blocks.end()) {
+			multi_use_blocks.erase(multi_use_entry);
+		}
+		if (delta.remaining_references == 1) {
+			continue;
+		}
+
+		newly_used_blocks.erase(delta.block_id);
+		auto node = batch.staged_free_nodes.extract(delta.block_id);
+		D_ASSERT(!node.empty());
+		auto insert_result = free_blocks_in_use.insert(std::move(node));
+		D_ASSERT(insert_result.inserted);
+	}
+
+	batch.applied = true;
+	batch.reservation_lock.unlock();
+	batch.block_lock.unlock();
 }
 
 void SingleFileBlockManager::IncreaseBlockReferenceCountInternal(block_id_t block_id) {

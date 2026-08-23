@@ -17,15 +17,62 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/encryption_functions.hpp"
 #include "duckdb/storage/database_handle.hpp"
 
 namespace duckdb {
 
+class AllocatorBlockReservation;
 class DatabaseInstance;
+class SingleFileBlockManager;
 struct MetadataHandle;
 enum class FreeBlockType { NEWLY_USED_BLOCK, CHECKPOINTED_BLOCK };
+
+//! One retirement entry's persistent drops and complete runtime-protected block set.
+struct CheckpointBlockDropSource {
+	CheckpointBlockDropSource(const vector<block_id_t> &actions_p, const vector<block_id_t> &protected_resources_p,
+	                          const AllocatorBlockReservation &reservation_p)
+	    : actions(actions_p), protected_resources(protected_resources_p), reservation(reservation_p) {
+	}
+
+	reference<const vector<block_id_t>> actions;
+	reference<const vector<block_id_t>> protected_resources;
+	reference<const AllocatorBlockReservation> reservation;
+};
+
+//! Holds allocator locks and all nodes required to apply a validated checkpoint drop without allocation.
+class PreparedCheckpointBlockDropBatch {
+public:
+	PreparedCheckpointBlockDropBatch(PreparedCheckpointBlockDropBatch &&other) noexcept = default;
+	PreparedCheckpointBlockDropBatch &operator=(PreparedCheckpointBlockDropBatch &&other) noexcept = delete;
+	~PreparedCheckpointBlockDropBatch() = default;
+
+	PreparedCheckpointBlockDropBatch(const PreparedCheckpointBlockDropBatch &) = delete;
+	PreparedCheckpointBlockDropBatch &operator=(const PreparedCheckpointBlockDropBatch &) = delete;
+
+private:
+	struct DropDelta {
+		block_id_t block_id;
+		idx_t drop_count;
+		uint32_t remaining_references = 0;
+	};
+
+	PreparedCheckpointBlockDropBatch(SingleFileBlockManager &manager_p, vector<DropDelta> deltas_p,
+	                                 set<block_id_t> staged_free_nodes_p, unique_lock<mutex> block_lock_p,
+	                                 unique_lock<mutex> reservation_lock_p);
+
+private:
+	friend class SingleFileBlockManager;
+
+	optional_ptr<SingleFileBlockManager> manager;
+	vector<DropDelta> deltas;
+	set<block_id_t> staged_free_nodes;
+	bool applied = false;
+	unique_lock<mutex> block_lock;
+	unique_lock<mutex> reservation_lock;
+};
 
 struct EncryptionOptions {
 	//! indicates whether the db is encrypted
@@ -96,6 +143,9 @@ public:
 	void MarkBlockAsUsed(block_id_t block_id) override;
 	//! Mark a block as modified (re-writeable after a checkpoint)
 	void MarkBlockAsModified(block_id_t block_id) override;
+	//! Sources and reservations must remain stable until the returned batch is applied or destroyed.
+	PreparedCheckpointBlockDropBatch PrepareBlockDropsForCheckpoint(const vector<CheckpointBlockDropSource> &sources);
+	void ApplyPreparedBlockDrops(PreparedCheckpointBlockDropBatch &&batch) noexcept;
 	//! Increase the reference count of a block. The block should hold at least one reference
 	void IncreaseBlockReferenceCount(block_id_t block_id) override;
 	shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) override;

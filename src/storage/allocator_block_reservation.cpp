@@ -76,6 +76,15 @@ bool AllocatorBlockReservation::Covers(const vector<block_id_t> &all_resources) 
 	return true;
 }
 
+bool AllocatorBlockReservation::Covers(const BlockManager &expected_manager,
+                                       const vector<block_id_t> &all_resources) const {
+	return IsActiveFor(expected_manager) && Covers(all_resources);
+}
+
+bool AllocatorBlockReservation::IsActiveFor(const BlockManager &expected_manager) const noexcept {
+	return block_manager.get() == &expected_manager;
+}
+
 void AllocatorBlockReservation::Release() noexcept {
 	if (!block_manager) {
 		return;
