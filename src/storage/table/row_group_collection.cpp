@@ -2340,6 +2340,7 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 		                           dynamic_cast<SingleFileTableDataWriter *>(&checkpoint_state.writer) != nullptr;
 		vector<bool> reuse_column;
 		if (debug_verify_blocks) {
+			bool has_reused_column = false;
 			if (write_action == RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
 				auto existing_column_count = entry->ReferenceNode()->GetColumnCount();
 				reuse_column.resize(existing_column_count, true);
@@ -2347,6 +2348,10 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 				reuse_column.resize(row_group_write_data.states.size());
 				for (idx_t column_idx = 0; column_idx < row_group_write_data.states.size(); column_idx++) {
 					reuse_column[column_idx] = !row_group_write_data.states[column_idx];
+					has_reused_column |= reuse_column[column_idx];
+				}
+				if ((write_action == RowGroupWriteAction::PARTIALLY_REUSE_COLUMN_METADATA) != has_reused_column) {
+					throw InternalException("Checkpoint write action does not match column metadata reuse");
 				}
 			}
 		}

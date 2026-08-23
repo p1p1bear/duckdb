@@ -42,3 +42,45 @@ query II
 SELECT COUNT(*), SUM(c0) FROM wide_tbl
 ----
 500000	124999750000
+
+# Verify the write action reflects whether any column metadata is actually reused
+statement ok
+CREATE TABLE action_tbl AS SELECT i::INTEGER AS a, (i * 10)::INTEGER AS b FROM range(100) t(i)
+
+statement ok
+CHECKPOINT
+
+# One unchanged column produces a partial metadata-reuse checkpoint
+statement ok
+UPDATE action_tbl SET a = a + 1 WHERE a < 10
+
+statement ok
+CHECKPOINT
+
+query III
+SELECT COUNT(*), SUM(a), SUM(b) FROM action_tbl
+----
+100	4960	49500
+
+# Rewriting every column must downgrade the checkpoint action to a full checkpoint
+statement ok
+UPDATE action_tbl SET a = a + 2, b = b + 3
+
+statement ok
+CHECKPOINT
+
+statement ok
+USE memory
+
+restart
+
+statement ok
+ATTACH '{TEST_DIR}/partial_reuse_carries_column_extras.db'
+
+statement ok
+USE partial_reuse_carries_column_extras
+
+query III
+SELECT COUNT(*), SUM(a), SUM(b) FROM action_tbl
+----
+100	5160	49800
