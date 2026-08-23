@@ -890,6 +890,7 @@ bool SingleFileBlockManager::IsRootBlock(MetaBlockPointer root) {
 
 block_id_t SingleFileBlockManager::GetFreeBlockIdInternal(FreeBlockType type) {
 	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	block_id_t block_id;
 	if (!free_list.empty()) {
 		// The free list is not empty, so we take its first element.
@@ -899,6 +900,7 @@ block_id_t SingleFileBlockManager::GetFreeBlockIdInternal(FreeBlockType type) {
 	} else {
 		block_id = max_block++;
 	}
+	D_ASSERT(!IsBlockReservedInternal(block_id));
 	// add the entry to the list of newly used blocks
 	if (type == FreeBlockType::NEWLY_USED_BLOCK) {
 		newly_used_blocks.insert(block_id);
@@ -919,7 +921,9 @@ block_id_t SingleFileBlockManager::GetFreeBlockIdForCheckpoint() {
 
 block_id_t SingleFileBlockManager::PeekFreeBlockId() {
 	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	if (!free_list.empty()) {
+		D_ASSERT(!IsBlockReservedInternal(*free_list.begin()));
 		return *free_list.begin();
 	} else {
 		return max_block;
@@ -945,6 +949,9 @@ void SingleFileBlockManager::MarkBlockAsUsed(block_id_t block_id) {
 			max_block++;
 		}
 		max_block++;
+	} else if (free_blocks_in_use.find(block_id) != free_blocks_in_use.end()) {
+		// A runtime reservation protected a persistently free block. It is now owned by persistent storage.
+		free_blocks_in_use.erase(block_id);
 	} else if (free_list.find(block_id) != free_list.end()) {
 		// block is currently in the free list - erase
 		free_list.erase(block_id);
@@ -1006,6 +1013,7 @@ void SingleFileBlockManager::IncreaseBlockReferenceCountInternal(block_id_t bloc
 void SingleFileBlockManager::VerifyBlocks(const unordered_map<block_id_t, idx_t> &block_usage_count) {
 	// probably don't need this?
 	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	// all blocks should be accounted for - either in the block_usage_count, or in the free list
 	set<block_id_t> referenced_blocks;
 	for (auto &block : block_usage_count) {
@@ -1045,6 +1053,20 @@ void SingleFileBlockManager::VerifyBlocks(const unordered_map<block_id_t, idx_t>
 	}
 	for (auto &free_block : free_blocks_in_use) {
 		referenced_blocks.insert(free_block);
+	}
+	for (auto &reservation : allocator_reservation_counts) {
+		if (reservation.first < 0 || reservation.first >= max_block || reservation.second == 0 ||
+		    free_list.find(reservation.first) != free_list.end()) {
+			throw InternalException("Invalid allocator reservation for block %d", reservation.first);
+		}
+		if (free_blocks_in_use.find(reservation.first) != free_blocks_in_use.end() &&
+		    block_usage_count.find(reservation.first) != block_usage_count.end()) {
+			throw InternalException("Reserved block %d is both persistently free and referenced", reservation.first);
+		}
+		if (referenced_blocks.find(reservation.first) == referenced_blocks.end()) {
+			throw InternalException("Allocator reservation for block %d has no persistent or allocator ownership",
+			                        reservation.first);
+		}
 	}
 	if (referenced_blocks.size() != NumericCast<idx_t>(max_block)) {
 		// not all blocks are accounted for
@@ -1098,6 +1120,73 @@ void SingleFileBlockManager::IncreaseBlockReferenceCount(block_id_t block_id) {
 	IncreaseBlockReferenceCountInternal(block_id);
 }
 
+shared_ptr<BlockHandle> SingleFileBlockManager::RegisterBlockReservation(block_id_t block_id) {
+	if (block_id < 0 || block_id >= MAXIMUM_BLOCK) {
+		throw InternalException("Cannot reserve invalid physical block ID %d", block_id);
+	}
+	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
+	auto count_entry = allocator_reservation_counts.end();
+	bool inserted_count = false;
+	bool moved_from_free_list = false;
+	bool incremented_count = false;
+	auto previous_max_block = max_block;
+	try {
+		count_entry = allocator_reservation_counts.find(block_id);
+		if (count_entry == allocator_reservation_counts.end()) {
+			count_entry = allocator_reservation_counts.emplace(block_id, 0).first;
+			inserted_count = true;
+		}
+		if (block_id >= max_block) {
+			while (max_block < block_id) {
+				free_list.insert(max_block++);
+			}
+			free_blocks_in_use.insert(block_id);
+			max_block++;
+		} else {
+			auto free_entry = free_list.find(block_id);
+			if (free_entry != free_list.end()) {
+				auto node = free_list.extract(free_entry);
+				free_blocks_in_use.insert(std::move(node));
+				moved_from_free_list = true;
+			}
+		}
+		count_entry->second++;
+		incremented_count = true;
+		return RegisterBlock(block_id);
+	} catch (...) {
+		if (incremented_count) {
+			D_ASSERT(count_entry != allocator_reservation_counts.end() && count_entry->second > 0);
+			count_entry->second--;
+		}
+		if (block_id >= previous_max_block) {
+			free_blocks_in_use.erase(block_id);
+			free_list.erase(free_list.lower_bound(previous_max_block), free_list.end());
+			max_block = previous_max_block;
+		} else if (moved_from_free_list) {
+			auto free_entry = free_blocks_in_use.find(block_id);
+			D_ASSERT(free_entry != free_blocks_in_use.end());
+			auto node = free_blocks_in_use.extract(free_entry);
+			free_list.insert(std::move(node));
+		}
+		if (inserted_count) {
+			allocator_reservation_counts.erase(block_id);
+		}
+		throw;
+	}
+}
+
+void SingleFileBlockManager::UnregisterBlockReservation(block_id_t block_id) noexcept {
+	lock_guard<mutex> lock(allocator_reservation_lock);
+	auto entry = allocator_reservation_counts.find(block_id);
+	if (entry == allocator_reservation_counts.end() || entry->second == 0) {
+		D_ASSERT(false);
+		return;
+	}
+	if (--entry->second == 0) {
+		allocator_reservation_counts.erase(entry);
+	}
+}
 idx_t SingleFileBlockManager::GetMetaBlock() {
 	return meta_block;
 }
@@ -1228,11 +1317,12 @@ void SingleFileBlockManager::Truncate() {
 	BlockManager::Truncate();
 
 	lock_guard<mutex> guard(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	idx_t blocks_to_truncate = 0;
 	// reverse iterate over the free-list
 	for (auto entry = free_list.rbegin(); entry != free_list.rend(); entry++) {
 		auto block_id = *entry;
-		if (block_id + 1 != max_block) {
+		if (block_id + 1 != max_block || IsBlockReservedInternal(block_id)) {
 			break;
 		}
 		blocks_to_truncate++;
@@ -1306,6 +1396,13 @@ bool SingleFileBlockManager::AddFreeBlock(unique_lock<mutex> &lock, block_id_t b
 	if (!lock.owns_lock()) {
 		throw InternalException("AddFreeBlock must be called while holding the lock");
 	}
+	{
+		lock_guard<mutex> reservation_lock(allocator_reservation_lock);
+		if (IsBlockReservedInternal(block_id)) {
+			free_blocks_in_use.insert(block_id);
+			return false;
+		}
+	}
 	shared_ptr<BlockHandle> block = TryGetBlock(block_id);
 	if (!block) {
 		// the block does not exist
@@ -1335,6 +1432,7 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 	header.iteration = ++iteration_count;
 
 	set<block_id_t> all_free_blocks = free_list;
+	all_free_blocks.insert(free_blocks_in_use.begin(), free_blocks_in_use.end());
 	set<block_id_t> fully_freed_blocks;
 	for (auto &block : modified_blocks) {
 		all_free_blocks.insert(block);
@@ -1349,6 +1447,7 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 		written_multi_use_blocks.erase(newly_used_block);
 	}
 	modified_blocks.clear();
+	header.block_count = NumericCast<idx_t>(max_block);
 
 	if (!free_list_blocks.empty()) {
 		// there are blocks to write, either in the free_list or in the modified_blocks
@@ -1377,10 +1476,6 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 	}
 	lock.unlock();
 	metadata_manager.Flush(context);
-
-	lock.lock();
-	header.block_count = NumericCast<idx_t>(max_block);
-	lock.unlock();
 
 	header.storage_compatibility = options.storage_version;
 
@@ -1428,13 +1523,18 @@ void SingleFileBlockManager::FileSync() {
 void SingleFileBlockManager::UnregisterBlock(block_id_t id) {
 	// perform the actual unregistration
 	BlockManager::UnregisterBlock(id);
+	UnregisterBlockHandle(id);
+}
+
+void SingleFileBlockManager::UnregisterBlockHandle(block_id_t id) {
 	// check if it is part of the newly free list
 	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	auto entry = free_blocks_in_use.find(id);
-	if (entry != free_blocks_in_use.end()) {
+	if (entry != free_blocks_in_use.end() && !IsBlockReservedInternal(id)) {
 		// it is! move it to the regular free list so the block can be re-used
-		free_list.insert(id);
-		free_blocks_in_use.erase(entry);
+		auto node = free_blocks_in_use.extract(entry);
+		free_list.insert(std::move(node));
 	}
 }
 
@@ -1450,14 +1550,17 @@ void SingleFileBlockManager::TrimFreeBlocks(const set<block_id_t> &blocks) {
 		return;
 	}
 	lock_guard<mutex> lock(single_file_block_lock);
+	lock_guard<mutex> reservation_lock(allocator_reservation_lock);
 	for (auto itr = blocks.begin(); itr != blocks.end(); ++itr) {
-		if (!free_list.count(*itr)) {
+		if (!free_list.count(*itr) || IsBlockReservedInternal(*itr)) {
 			continue;
 		}
 		block_id_t first = *itr;
 		block_id_t last = first;
 		// Find end of contiguous range.
-		for (++itr; itr != blocks.end() && (*itr == last + 1) && free_list.count(*itr); ++itr) {
+		for (++itr;
+		     itr != blocks.end() && (*itr == last + 1) && free_list.count(*itr) && !IsBlockReservedInternal(*itr);
+		     ++itr) {
 			last = *itr;
 		}
 		// We are now one too far.

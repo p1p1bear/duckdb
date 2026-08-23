@@ -98,6 +98,8 @@ public:
 	void MarkBlockAsModified(block_id_t block_id) override;
 	//! Increase the reference count of a block. The block should hold at least one reference
 	void IncreaseBlockReferenceCount(block_id_t block_id) override;
+	shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) override;
+	void UnregisterBlockReservation(block_id_t block_id) noexcept override;
 	//! UnregisterBlock, only accepts non-temporary block ids
 	void UnregisterBlock(block_id_t id) override;
 	//! Return the meta block id
@@ -195,6 +197,7 @@ private:
 	block_id_t GetFreeBlockIdInternal(FreeBlockType type);
 	//! Adds a free block to the free_list, returns true if it was added to the regular free_list
 	bool AddFreeBlock(unique_lock<mutex> &lock, block_id_t block_id);
+	void UnregisterBlockHandle(block_id_t block_id) override;
 
 private:
 	AttachedDatabase &db;

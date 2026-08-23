@@ -41,7 +41,11 @@ shared_ptr<BlockHandle> BlockManager::RegisterBlock(block_id_t block_id) {
 	lock_guard<mutex> lock(blocks_lock);
 	// check if the block already exists
 	auto entry = blocks.find(block_id);
-	if (entry != blocks.end()) {
+	if (entry == blocks.end()) {
+		// Allocate the map node before constructing the BlockHandle. A failed allocation must not destroy a live
+		// BlockHandle while blocks_lock is held because its destructor unregisters itself from this map.
+		entry = blocks.emplace(block_id, weak_ptr<BlockHandle>()).first;
+	} else {
 		// already exists: check if it hasn't expired yet
 		auto existing_ptr = entry->second.lock();
 		if (existing_ptr) {
@@ -52,8 +56,28 @@ shared_ptr<BlockHandle> BlockManager::RegisterBlock(block_id_t block_id) {
 	// create a new block pointer for this block
 	auto result = make_shared_ptr<BlockHandle>(*this, block_id, MemoryTag::BASE_TABLE);
 	// register the block pointer in the set of blocks as a weak pointer
-	blocks[block_id] = weak_ptr<BlockHandle>(result);
+	entry->second = weak_ptr<BlockHandle>(result);
 	return result;
+}
+
+unique_lock<mutex> BlockManager::LockBlockReservations() {
+	return unique_lock<mutex>(allocator_reservation_lock);
+}
+
+bool BlockManager::IsBlockReserved(block_id_t block_id) {
+	auto lock = LockBlockReservations();
+	return IsBlockReserved(lock, block_id);
+}
+
+bool BlockManager::IsBlockReserved(const unique_lock<mutex> &lock, block_id_t block_id) const {
+	D_ASSERT(lock.owns_lock());
+	D_ASSERT(lock.mutex() == &allocator_reservation_lock);
+	return IsBlockReservedInternal(block_id);
+}
+
+bool BlockManager::IsBlockReservedInternal(block_id_t block_id) const {
+	auto entry = allocator_reservation_counts.find(block_id);
+	return entry != allocator_reservation_counts.end() && entry->second > 0;
 }
 
 shared_ptr<BlockHandle> BlockManager::ConvertToPersistent(QueryContext context, block_id_t block_id,
@@ -138,7 +162,19 @@ void BlockManager::UnregisterPersistentBlock(BlockHandle &block) {
 	}
 	auto id = block.BlockId();
 	D_ASSERT(id < MAXIMUM_BLOCK);
-	UnregisterBlock(id);
+	{
+		lock_guard<mutex> lock(blocks_lock);
+		auto entry = blocks.find(id);
+		if (entry == blocks.end()) {
+			return;
+		}
+		auto current = entry->second.lock();
+		if (current && current.get() != &block) {
+			return;
+		}
+		blocks.erase(entry);
+	}
+	UnregisterBlockHandle(id);
 }
 
 MetadataManager &BlockManager::GetMetadataManager() {

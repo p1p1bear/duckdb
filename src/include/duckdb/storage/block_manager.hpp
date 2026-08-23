@@ -64,6 +64,12 @@ public:
 	//! Increase the reference count of a block. The block should hold at least one reference before this method is
 	//! called.
 	virtual void IncreaseBlockReferenceCount(block_id_t block_id) = 0;
+	//! Add or remove a runtime reservation that prevents physical block reuse.
+	virtual shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) = 0;
+	virtual void UnregisterBlockReservation(block_id_t block_id) noexcept = 0;
+	unique_lock<mutex> LockBlockReservations();
+	bool IsBlockReserved(block_id_t block_id);
+	bool IsBlockReserved(const unique_lock<mutex> &lock, block_id_t block_id) const;
 	//! Get the first meta block id
 	virtual idx_t GetMetaBlock() = 0;
 	//! Read the content of the block from disk
@@ -169,6 +175,14 @@ public:
 protected:
 	bool BlockIsRegistered(block_id_t block_id);
 	shared_ptr<BlockHandle> TryGetBlock(block_id_t block_id);
+	bool IsBlockReservedInternal(block_id_t block_id) const;
+	virtual void UnregisterBlockHandle(block_id_t block_id) {
+	}
+
+protected:
+	//! Runtime references that prevent allocator, metadata, trim and truncate reuse without changing persistent counts.
+	mutable mutex allocator_reservation_lock;
+	unordered_map<block_id_t, idx_t> allocator_reservation_counts;
 
 public:
 	template <class TARGET>

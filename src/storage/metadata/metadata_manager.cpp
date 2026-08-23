@@ -120,90 +120,150 @@ uint64_t MetadataManager::RegisterTaskPrivateOwner() {
 }
 
 MetadataHandle MetadataManager::AllocateHandle() {
-	// check if there is any free space left in an existing block
-	// if not allocate a new block
 	MetadataPointer pointer;
-	unique_lock<mutex> guard(block_lock);
-	block_id_t free_block = INVALID_BLOCK;
-	for (auto &kv : blocks) {
-		auto &block = kv.second;
-		D_ASSERT(kv.first == block.block_id);
-		if (task_private_blocks.find(kv.first) == task_private_blocks.end() && !block.free_blocks.empty()) {
-			free_block = kv.first;
-			break;
+	while (true) {
+		unique_lock<mutex> guard(block_lock);
+		block_id_t free_block = INVALID_BLOCK;
+		{
+			auto reservation_lock = block_manager.LockBlockReservations();
+			for (auto &kv : blocks) {
+				auto &block = kv.second;
+				D_ASSERT(kv.first == block.block_id);
+				if (task_private_blocks.find(kv.first) == task_private_blocks.end() &&
+				    !block_manager.IsBlockReserved(reservation_lock, kv.first) && !block.free_blocks.empty()) {
+					free_block = kv.first;
+					break;
+				}
+			}
 		}
-	}
-	guard.unlock();
-	if (free_block == INVALID_BLOCK || free_block > PeekNextBlockId()) {
-		free_block = AllocateNewBlock(guard);
-	} else {
-		guard.lock();
-	}
-	D_ASSERT(guard.owns_lock());
-	D_ASSERT(free_block != INVALID_BLOCK);
 
-	// select the first free metadata block we can find
-	pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
-	auto &block = blocks.at(free_block);
-	// the block is now dirty
-	block.dirty = true;
-	if (block.block->BlockId() < MAXIMUM_BLOCK) {
-		// this block is a disk-backed block, yet we are planning to write to it
-		// we need to convert it into a transient block before we can write to it
-		ConvertToTransient(guard, free_block);
+		guard.unlock();
+		if (free_block == INVALID_BLOCK || free_block > PeekNextBlockId()) {
+			free_block = AllocateNewBlock(guard);
+		} else {
+			guard.lock();
+		}
+		D_ASSERT(guard.owns_lock());
+		D_ASSERT(free_block != INVALID_BLOCK);
+
+		bool needs_conversion;
+		{
+			auto reservation_lock = block_manager.LockBlockReservations();
+			auto block_entry = blocks.find(free_block);
+			if (block_entry == blocks.end() || task_private_blocks.find(free_block) != task_private_blocks.end() ||
+			    block_manager.IsBlockReserved(reservation_lock, free_block) ||
+			    block_entry->second.free_blocks.empty()) {
+				continue;
+			}
+			needs_conversion = block_entry->second.block->BlockId() < MAXIMUM_BLOCK;
+			if (!needs_conversion) {
+				pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
+				pointer.index = block_entry->second.free_blocks.back();
+				block_entry->second.free_blocks.pop_back();
+				block_entry->second.dirty = true;
+			}
+		}
+
+		if (needs_conversion) {
+			ConvertToTransient(guard, free_block);
+			auto reservation_lock = block_manager.LockBlockReservations();
+			auto block_entry = blocks.find(free_block);
+			if (block_entry == blocks.end() || task_private_blocks.find(free_block) != task_private_blocks.end() ||
+			    block_manager.IsBlockReserved(reservation_lock, free_block) ||
+			    block_entry->second.free_blocks.empty()) {
+				continue;
+			}
+			pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
+			pointer.index = block_entry->second.free_blocks.back();
+			block_entry->second.free_blocks.pop_back();
+			block_entry->second.dirty = true;
+		}
+
+		D_ASSERT(pointer.index < METADATA_BLOCK_COUNT);
+		guard.unlock();
+		return Pin(pointer);
 	}
-	auto &writable_block = blocks.at(free_block);
-	D_ASSERT(writable_block.block->BlockId() >= MAXIMUM_BLOCK);
-	D_ASSERT(!writable_block.free_blocks.empty());
-	pointer.index = writable_block.free_blocks.back();
-	// mark the block as used
-	writable_block.free_blocks.pop_back();
-	D_ASSERT(pointer.index < METADATA_BLOCK_COUNT);
-	guard.unlock();
-	// pin the block
-	return Pin(pointer);
 }
 
 MetadataHandle MetadataManager::AllocateTaskPrivateHandle(uint64_t owner_id) {
 	MetadataPointer pointer;
-	unique_lock<mutex> guard(block_lock);
-	auto owner_entry = task_private_owners.find(owner_id);
-	if (owner_entry == task_private_owners.end()) {
-		throw InternalException("Task-private metadata owner does not exist");
-	}
+	while (true) {
+		unique_lock<mutex> guard(block_lock);
+		auto owner_entry = task_private_owners.find(owner_id);
+		if (owner_entry == task_private_owners.end()) {
+			throw InternalException("Task-private metadata owner does not exist");
+		}
 
-	block_id_t free_block = INVALID_BLOCK;
-	for (auto block_id : owner_entry->second) {
-		auto block_entry = blocks.find(block_id);
-		auto private_entry = task_private_blocks.find(block_id);
-		if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
-		    private_entry->second != owner_id) {
-			throw InternalException("Task-private metadata block ownership is inconsistent");
+		block_id_t free_block = INVALID_BLOCK;
+		{
+			auto reservation_lock = block_manager.LockBlockReservations();
+			for (auto block_id : owner_entry->second) {
+				auto block_entry = blocks.find(block_id);
+				auto private_entry = task_private_blocks.find(block_id);
+				if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+				    private_entry->second != owner_id) {
+					throw InternalException("Task-private metadata block ownership is inconsistent");
+				}
+				if (!block_manager.IsBlockReserved(reservation_lock, block_id) &&
+				    !block_entry->second.free_blocks.empty()) {
+					free_block = block_id;
+					break;
+				}
+			}
 		}
-		if (!block_entry->second.free_blocks.empty()) {
-			free_block = block_id;
-			break;
+		if (free_block == INVALID_BLOCK) {
+			guard.unlock();
+			free_block = AllocateNewTaskPrivateBlock(guard, owner_id);
 		}
-	}
-	if (free_block == INVALID_BLOCK) {
+
+		bool needs_conversion;
+		{
+			auto reservation_lock = block_manager.LockBlockReservations();
+			auto owner_check = task_private_owners.find(owner_id);
+			auto block_entry = blocks.find(free_block);
+			auto private_entry = task_private_blocks.find(free_block);
+			if (owner_check == task_private_owners.end()) {
+				throw InternalException("Task-private metadata owner does not exist");
+			}
+			if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+			    private_entry->second != owner_id) {
+				throw InternalException("Task-private metadata block ownership is inconsistent");
+			}
+			if (block_manager.IsBlockReserved(reservation_lock, free_block) ||
+			    block_entry->second.free_blocks.empty()) {
+				continue;
+			}
+			needs_conversion = block_entry->second.block->BlockId() < MAXIMUM_BLOCK;
+			if (!needs_conversion) {
+				pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
+				pointer.index = block_entry->second.free_blocks.back();
+				block_entry->second.free_blocks.pop_back();
+				block_entry->second.dirty = true;
+			}
+		}
+
+		if (needs_conversion) {
+			ConvertToTransient(guard, free_block);
+			auto reservation_lock = block_manager.LockBlockReservations();
+			auto block_entry = blocks.find(free_block);
+			auto private_entry = task_private_blocks.find(free_block);
+			if (block_entry == blocks.end() || private_entry == task_private_blocks.end() ||
+			    private_entry->second != owner_id) {
+				throw InternalException("Task-private metadata block ownership is inconsistent");
+			}
+			if (block_manager.IsBlockReserved(reservation_lock, free_block) ||
+			    block_entry->second.free_blocks.empty()) {
+				continue;
+			}
+			pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
+			pointer.index = block_entry->second.free_blocks.back();
+			block_entry->second.free_blocks.pop_back();
+			block_entry->second.dirty = true;
+		}
+
 		guard.unlock();
-		free_block = AllocateNewTaskPrivateBlock(guard, owner_id);
+		return Pin(pointer);
 	}
-	D_ASSERT(guard.owns_lock());
-
-	auto &block = blocks.at(free_block);
-	block.dirty = true;
-	if (block.block->BlockId() < MAXIMUM_BLOCK) {
-		ConvertToTransient(guard, free_block);
-	}
-	auto &writable_block = blocks.at(free_block);
-	D_ASSERT(writable_block.block->BlockId() >= MAXIMUM_BLOCK);
-	D_ASSERT(!writable_block.free_blocks.empty());
-	pointer.block_index = UnsafeNumericCast<idx_t>(free_block);
-	pointer.index = writable_block.free_blocks.back();
-	writable_block.free_blocks.pop_back();
-	guard.unlock();
-	return Pin(pointer);
 }
 
 MetadataHandle MetadataManager::Pin(const MetadataPointer &pointer) {
@@ -256,13 +316,16 @@ void MetadataManager::ConvertToTransient(unique_lock<mutex> &block_lock, block_i
 	// copy the data to the transient block
 	memcpy(new_buffer.GetDataMutable(), old_buffer.Ptr(), block_manager.GetBlockSize());
 
-	// unregister the old block
-	block_manager.UnregisterBlock(block_id);
+	// unregister the captured generation without removing a newer handle for the same physical ID
+	block_manager.UnregisterPersistentBlock(*old_block);
 
 	block_lock.lock();
 	entry = blocks.find(block_id);
 	if (entry == blocks.end()) {
 		throw InternalException("Metadata block disappeared while converting it to transient storage");
+	}
+	if (entry->second.block != old_block) {
+		return;
 	}
 	entry->second.block = std::move(new_block);
 	entry->second.dirty = true;

@@ -16,6 +16,7 @@ endif()
 add_library_unity(
   duckdb_storage
   OBJECT
+  allocator_block_reservation.cpp
   arena_allocator.cpp
   buffer_manager.cpp
   checkpoint_manager.cpp
