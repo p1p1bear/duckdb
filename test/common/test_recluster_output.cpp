@@ -2,8 +2,10 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -23,6 +25,8 @@
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/storage/wal_entry.hpp"
+#include "duckdb/storage/write_ahead_log.hpp"
 #include "duckdb/transaction/transaction_data.hpp"
 #include "test_helpers.hpp"
 
@@ -727,5 +731,219 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
 		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
 	}
+	DeleteDatabase(path);
+}
+
+static WALReclusterEntry CreateCommittedReclusterWAL(const string &path, bool add_final_delete) {
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE finalize_db"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT ((i * 37) % 4096)::INTEGER, i FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+
+		auto start = StartOutputTask(con, "tbl");
+		REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
+		REQUIRE(start.task);
+		OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
+		PrepareOutputTask(start);
+
+		WALReclusterEntry header;
+		if (!add_final_delete) {
+			auto &output = start.task->GetTaskContext().GetOutput();
+			auto &manifest = output.GetManifest();
+			header.table_id = manifest.header.table_id;
+			header.task_id = manifest.header.task_id;
+			header.expected_layout_version = manifest.header.prepared_layout_version;
+			header.target_layout_version = header.expected_layout_version + 1;
+			header.range_start = manifest.header.input_range.start;
+			header.range_end = manifest.header.input_range.end;
+			header.manifest_pointer = output.GetManifestPointer();
+			header.manifest_size = manifest.payload_size;
+			header.manifest_checksum = manifest.checksum;
+			header.journal_resolved_through = manifest.header.last_applied_delete_sequence;
+		}
+		if (add_final_delete) {
+			REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload = 19"));
+		}
+
+		ReclusterTaskFinalizeStatus status = ReclusterTaskFinalizeStatus::STALE_TASK;
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			status =
+			    entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
+		});
+		REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
+		start.task.reset();
+		return header;
+	}
+	return {};
+}
+
+static void CheckRecoveredRecluster(Connection &con, bool payload_deleted, layout_version_t expected_version,
+                                    idx_t expected_patch_count) {
+	auto rows = con.Query("SELECT count(*), sum(payload), count(*) FILTER (WHERE payload = 19) FROM tbl");
+	REQUIRE(rows);
+	REQUIRE(CHECK_COLUMN(rows, 0, {payload_deleted ? 4095 : 4096}));
+	REQUIRE(CHECK_COLUMN(rows, 1, {payload_deleted ? 8386541 : 8386560}));
+	REQUIRE(CHECK_COLUMN(rows, 2, {payload_deleted ? 0 : 1}));
+	auto expected = con.Query("SELECT k, payload FROM tbl ORDER BY k");
+	REQUIRE(expected);
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto &storage = entry.GetStorage();
+		auto collection = storage.GetRowGroupCollection();
+		auto layout = collection->GetCurrentLayout();
+		REQUIRE(layout);
+		REQUIRE(layout->layout_version == expected_version);
+		REQUIRE(layout->patches.size() == expected_patch_count);
+		auto &sort_storage = storage.GetDataTableInfo()->GetSortStorage();
+		REQUIRE(sort_storage.current_layout_version.load() == expected_version);
+		for (auto &patch : layout->patches) {
+			REQUIRE(patch->sort_order_id != INVALID_SORT_ORDER_ID);
+			REQUIRE(patch->run_id != INVALID_SORT_RUN_ID);
+			REQUIRE(sort_storage.next_run_id.load() > patch->run_id);
+		}
+		if (expected_version > INITIAL_LAYOUT_VERSION) {
+			CheckCollectionRows(con, *collection, expected->Cast<MaterializedQueryResult>());
+		}
+	});
+}
+
+static void CheckRecoveredRecluster(const string &path, bool payload_deleted, layout_version_t expected_version,
+                                    idx_t expected_patch_count) {
+	DuckDB db(path);
+	Connection con(db);
+	CheckRecoveredRecluster(con, payload_deleted, expected_version, expected_patch_count);
+}
+
+static void TruncateReclusterWALTail(const string &path) {
+	LocalFileSystem fs;
+	auto handle = fs.OpenFile(path + ".wal", FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+	REQUIRE(file_size > 0);
+	handle->Truncate(NumericCast<int64_t>(file_size - 1));
+	handle->Sync();
+}
+
+static void AppendReclusterWAL(const string &path, const WALReclusterEntry &header, bool checkpoint_before,
+                               bool commit) {
+	DuckDB db(path);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+	if (checkpoint_before) {
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+
+	auto database_name = DatabaseManager::GetDefaultDatabase(*con.context);
+	auto attached = db.instance->GetDatabaseManager().GetDatabase(database_name);
+	REQUIRE(attached);
+	auto wal_lock = attached->GetStorageManager().GetWALLock();
+	auto wal = attached->GetStorageManager().GetWAL();
+	REQUIRE(wal);
+	wal->WriteRecluster(header);
+	if (commit) {
+		wal->Flush();
+	}
+}
+
+TEST_CASE("Recluster WAL recovery applies a committed replacement", "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_recovery.db");
+	CreateCommittedReclusterWAL(path, true);
+	CheckRecoveredRecluster(path, true, 1, 1);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery reads protected blocks through MMAP",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_mmap_recovery.db");
+	CreateCommittedReclusterWAL(path, true);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS recovery_db (IO_MODE 'MMAP', MMAP_RESERVE_SIZE '1GB')"));
+		REQUIRE_NO_FAIL(con.Query("USE recovery_db"));
+		CheckRecoveredRecluster(con, true, 1, 1);
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery ignores a torn maintenance transaction",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_torn_recovery.db");
+	CreateCommittedReclusterWAL(path, true);
+	TruncateReclusterWALTail(path);
+	CheckRecoveredRecluster(path, true, 0, 0);
+	CheckRecoveredRecluster(path, true, 0, 0);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery ignores an invalid uncommitted manifest",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_invalid_torn_manifest.db");
+	auto torn_header = CreateCommittedReclusterWAL(path, false);
+	torn_header.manifest_checksum++;
+	AppendReclusterWAL(path, torn_header, false, false);
+	CheckRecoveredRecluster(path, false, 1, 1);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery skips a checkpointed replacement", "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_skip_recovery.db");
+	auto stale_header = CreateCommittedReclusterWAL(path, false);
+	AppendReclusterWAL(path, stale_header, true, true);
+	CheckRecoveredRecluster(path, false, 1, 0);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery rejects an unknown persistent table ID",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_unknown_table.db");
+	auto stale_header = CreateCommittedReclusterWAL(path, false);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE tbl"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		auto database_name = DatabaseManager::GetDefaultDatabase(*con.context);
+		auto attached = db.instance->GetDatabaseManager().GetDatabase(database_name);
+		REQUIRE(attached);
+		auto wal_lock = attached->GetStorageManager().GetWALLock();
+		auto wal = attached->GetStorageManager().GetWAL();
+		REQUIRE(wal);
+		wal->WriteRecluster(stale_header);
+		wal->Flush();
+	}
+	string error;
+	try {
+		DuckDB reopened(path);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	REQUIRE(error.find("unknown persistent table ID") != string::npos);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster WAL recovery rejects a mismatched manifest envelope",
+          "[storage][recluster_finalize][recluster_wal]") {
+	auto path = TestCreatePath("recluster_finalize_corrupt_manifest.db");
+	auto stale_header = CreateCommittedReclusterWAL(path, false);
+	stale_header.manifest_checksum++;
+	AppendReclusterWAL(path, stale_header, true, true);
+	string error;
+	try {
+		DuckDB reopened(path);
+	} catch (std::exception &ex) {
+		error = ex.what();
+	}
+	REQUIRE(error.find("header does not match its replacement manifest") != string::npos);
 	DeleteDatabase(path);
 }

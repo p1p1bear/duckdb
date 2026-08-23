@@ -39,6 +39,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/recluster/recluster_wal_replay.hpp"
 #include "duckdb/main/profiler/metrics.hpp"
 #include "duckdb/main/query_profiler.hpp"
 
@@ -47,8 +48,10 @@ enum class WALReplayState { MAIN_WAL, CHECKPOINT_WAL };
 
 class ReplayState {
 public:
-	ReplayState(AttachedDatabase &db, ClientContext &context, WALReplayState replay_state_p)
-	    : db(db), context(context), catalog(db.GetCatalog()), replay_state(replay_state_p) {
+	ReplayState(AttachedDatabase &db, ClientContext &context, WALReplayState replay_state_p,
+	            shared_ptr<ReclusterWALReplayContext> recluster_replay_p = nullptr)
+	    : db(db), context(context), catalog(db.GetCatalog()), replay_state(replay_state_p),
+	      recluster_replay(std::move(recluster_replay_p)) {
 	}
 
 	AttachedDatabase &db;
@@ -62,6 +65,7 @@ public:
 	optional_idx checkpoint_end_position;
 	optional_idx expected_checkpoint_id;
 	WALReplayState replay_state;
+	shared_ptr<ReclusterWALReplayContext> recluster_replay;
 
 	struct ReplayIndexInfo {
 		ReplayIndexInfo(TableIndexList &index_list, unique_ptr<Index> index, const Identifier &table_schema,
@@ -215,7 +219,17 @@ public:
 		auto wal_type = deserializer.ReadProperty<WALType>(100, "wal_type");
 		if (wal_type == WALType::WAL_FLUSH) {
 			deserializer.End();
+			if (state.recluster_replay) {
+				if (deserialize_only) {
+					state.recluster_replay->FinishTransaction();
+				} else {
+					state.recluster_replay->FinishTransaction(context);
+				}
+			}
 			return true;
+		}
+		if (state.recluster_replay) {
+			state.recluster_replay->ObserveEntry(wal_type);
 		}
 		if (CanSkipPayload(wal_type)) {
 			// Framed entries have already been read and integrity-checked, so jump directly to the root terminator.
@@ -310,6 +324,8 @@ protected:
 	void ReplayDelete();
 	void ReplayUpdate();
 	void ReplayCheckpoint();
+	void ReplayRecluster();
+	void ReplayReclusterDelete();
 
 private:
 	void ReplayIndexData(IndexStorageInfo &info);
@@ -467,9 +483,10 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 	MetaTransaction::Get(*con.context).ModifyDatabase(database, DatabaseModificationType());
 
 	auto &config = DBConfig::GetConfig(database.GetDatabase());
+	auto recluster_replay = make_shared_ptr<ReclusterWALReplayContext>(database);
 	// first deserialize the WAL to look for a checkpoint flag
 	// if there is a checkpoint flag, we might have already flushed the contents of the WAL to disk
-	ReplayState checkpoint_state(database, *con.context, replay_state);
+	ReplayState checkpoint_state(database, *con.context, replay_state, recluster_replay);
 	idx_t last_wal_flush_end = 0;
 	idx_t checkpoint_truncate_offset = 0;
 	try {
@@ -535,6 +552,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 			// no checkpoint WAL - either we just need to replay this WAL, or we are done
 			if (checkpoint_was_successful) {
 				// the contents of the WAL have already been checkpointed and there is no checkpoint WAL - we are done
+				recluster_replay->ReleaseAllReservations();
 				return nullptr;
 			}
 			if (!storage_manager.GetAttached().IsReadOnly()) {
@@ -547,6 +565,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 				// the main WAL is no longer needed, we only need to replay the checkpoint WAL
 				// if this is a read-only connection then replay the checkpoint WAL directly
 				if (storage_manager.GetAttached().IsReadOnly()) {
+					recluster_replay->ReleaseAllReservations();
 					return ReplayLog(std::move(checkpoint_handle), WALReplayState::CHECKPOINT_WAL);
 				}
 				// if this is not a read-only connection we need to finish the checkpoint
@@ -558,6 +577,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 				// now open the handle again and replay the checkpoint WAL
 				checkpoint_handle =
 				    fs.OpenFile(wal_path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+				recluster_replay->ReleaseAllReservations();
 				return ReplayLog(std::move(checkpoint_handle), WALReplayState::CHECKPOINT_WAL);
 			}
 			// the checkpoint was unsuccessful
@@ -571,6 +591,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 
 				// replay the (combined) recovery WAL
 				auto main_handle = fs.OpenFile(wal_path, FileFlags::FILE_FLAGS_READ);
+				recluster_replay->ReleaseAllReservations();
 				return ReplayLog(std::move(main_handle), WALReplayState::CHECKPOINT_WAL);
 			}
 		}
@@ -597,7 +618,8 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 		truncated_wal_reader = make_uniq<BufferedFileReader>(fs, std::move(main_handle));
 	}
 	// we need to recover from the WAL: actually set up the replay state
-	ReplayState state(database, *con.context, replay_state);
+	recluster_replay->BeginReplay();
+	ReplayState state(database, *con.context, replay_state, recluster_replay);
 
 	// reset the reader - we are going to read the WAL from the beginning again
 	auto &wal_reader = truncated_wal_reader ? *truncated_wal_reader : reader;
@@ -614,6 +636,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 			auto deserializer = WriteAheadLogDeserializer::GetEntryDeserializer(state, wal_reader);
 			if (deserializer.ReplayEntry()) {
 				con.Commit();
+				recluster_replay->OnTransactionCommitted();
 
 				// Commit any outstanding indexes.
 				for (auto &info : state.replay_index_infos) {
@@ -647,6 +670,7 @@ unique_ptr<WriteAheadLog> WriteAheadLogReplayer::ReplayLog(unique_ptr<FileHandle
 		con.Query("ROLLBACK");
 		throw;
 	} // LCOV_EXCL_STOP
+	recluster_replay->VerifyReplayComplete(all_succeeded);
 	if (all_succeeded && checkpoint_handle) {
 		// we have successfully replayed the main WAL - but there is still a checkpoint WAL remaining
 		// this can only happen in read-only mode
@@ -742,6 +766,12 @@ void WriteAheadLogDeserializer::ReplayEntry(WALType entry_type) {
 		break;
 	case WALType::DROP_TRIGGER:
 		ReplayDropTrigger();
+		break;
+	case WALType::RECLUSTER:
+		ReplayRecluster();
+		break;
+	case WALType::RECLUSTER_DELETE:
+		ReplayReclusterDelete();
 		break;
 	default:
 		throw InternalException("Invalid WAL entry type!");
@@ -1428,6 +1458,28 @@ void WriteAheadLogDeserializer::ReplayCheckpoint() {
 	auto entry = WALCheckpoint::Deserialize(deserializer);
 	state.checkpoint_id = entry.meta_block;
 	state.checkpoint_position = state.current_position;
+}
+
+void WriteAheadLogDeserializer::ReplayRecluster() {
+	if (!state.recluster_replay) {
+		throw InternalException("Recluster WAL replay context is missing");
+	}
+	try {
+		state.recluster_replay->AddHeader(WALReclusterEntry::Deserialize(deserializer));
+	} catch (SerializationException &ex) {
+		throw DataCorruptionException("Invalid recluster WAL payload: %s", ex.what());
+	}
+}
+
+void WriteAheadLogDeserializer::ReplayReclusterDelete() {
+	if (!state.recluster_replay) {
+		throw InternalException("Recluster WAL replay context is missing");
+	}
+	try {
+		state.recluster_replay->AddDelete(WALReclusterDeleteEntry::Deserialize(deserializer));
+	} catch (SerializationException &ex) {
+		throw DataCorruptionException("Invalid recluster WAL DELETE payload: %s", ex.what());
+	}
 }
 
 } // namespace duckdb

@@ -390,6 +390,23 @@ MetadataPointer MetadataManager::RegisterDiskPointer(MetaBlockPointer pointer) {
 	return FromDiskPointerInternal(guard, pointer);
 }
 
+MetadataPointer MetadataManager::RegisterRecoveryDiskPointer(MetaBlockPointer pointer) {
+	unique_lock<mutex> guard(block_lock);
+
+	auto block_id = pointer.GetBlockId();
+	if (blocks.find(block_id) == blocks.end()) {
+		MetadataBlock block;
+		block.block_id = block_id;
+		AddAndRegisterBlock(guard, std::move(block));
+		if (!modified_blocks.emplace(block_id, NumericLimits<idx_t>::Maximum()).second) {
+			throw InternalException("Recovered metadata block already has modified-block state");
+		}
+	} else if (modified_blocks.find(block_id) == modified_blocks.end()) {
+		throw InternalException("Recovered metadata block is missing modified-block state");
+	}
+	return FromDiskPointerInternal(guard, pointer);
+}
+
 BlockPointer MetadataManager::ToBlockPointer(MetaBlockPointer meta_pointer, const idx_t metadata_block_size) {
 	auto index = meta_pointer.GetBlockIndex();
 	if (index >= MetadataManager::METADATA_BLOCK_COUNT) {

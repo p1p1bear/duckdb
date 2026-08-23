@@ -126,6 +126,8 @@ public:
 	}
 	//! Returns the number of total blocks
 	idx_t TotalBlocks() override;
+	//! Returns whether a complete block is present in the physical database file.
+	bool BlockExistsOnDisk(block_id_t block_id) const;
 	//! Returns the number of free blocks
 	idx_t FreeBlocks() override;
 	//! Whether or not the attached database is a remote file

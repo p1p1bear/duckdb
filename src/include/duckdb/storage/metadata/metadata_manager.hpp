@@ -104,6 +104,8 @@ public:
 	MetaBlockPointer GetDiskPointer(const MetadataPointer &pointer, uint32_t offset = 0);
 	MetadataPointer FromDiskPointer(MetaBlockPointer pointer);
 	MetadataPointer RegisterDiskPointer(MetaBlockPointer pointer);
+	//! Register metadata introduced after the checkpoint and include it in the next preserve-or-free pass.
+	MetadataPointer RegisterRecoveryDiskPointer(MetaBlockPointer pointer);
 
 	static BlockPointer ToBlockPointer(MetaBlockPointer meta_pointer, const idx_t metadata_block_size);
 	static MetaBlockPointer FromBlockPointer(BlockPointer block_pointer, const idx_t metadata_block_size);

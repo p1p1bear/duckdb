@@ -1107,6 +1107,18 @@ idx_t SingleFileBlockManager::TotalBlocks() {
 	return NumericCast<idx_t>(max_block);
 }
 
+bool SingleFileBlockManager::BlockExistsOnDisk(block_id_t block_id) const {
+	if (block_id < 0) {
+		return false;
+	}
+	auto file_size = handle->GetFileSize();
+	if (file_size < BLOCK_START) {
+		return false;
+	}
+	auto block_count = (file_size - BLOCK_START) / GetBlockAllocSize();
+	return NumericCast<idx_t>(block_id) < block_count;
+}
+
 idx_t SingleFileBlockManager::FreeBlocks() {
 	lock_guard<mutex> lock(single_file_block_lock);
 	return free_list.size();

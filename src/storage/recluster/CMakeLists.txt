@@ -14,6 +14,7 @@ add_library_unity(
   recluster_sorter.cpp
   recluster_task_context.cpp
   recluster_wal.cpp
+  recluster_wal_replay.cpp
   replacement_manifest.cpp
   row_id_remap_store.cpp
   row_group_layout.cpp

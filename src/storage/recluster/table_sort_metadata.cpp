@@ -107,6 +107,16 @@ sort_run_id_t TableSortStorageState::AllocateRunId() {
 	throw InvalidInputException("SORTED BY run ID space is exhausted");
 }
 
+void TableSortStorageState::AdvancePastRunId(sort_run_id_t run_id) {
+	if (run_id == INVALID_SORT_RUN_ID || run_id == NumericLimits<sort_run_id_t>::Maximum()) {
+		throw SerializationException("Recovered SORTED BY run ID is invalid");
+	}
+	auto target = run_id + 1;
+	auto current = next_run_id.load();
+	while (current < target && !next_run_id.compare_exchange_weak(current, target)) {
+	}
+}
+
 PersistentTableSortStorageMetadata
 TableSortStorageState::GetPersistentSnapshot(const StorageLockKey &checkpoint_or_finalize_lock) const {
 	(void)checkpoint_or_finalize_lock;

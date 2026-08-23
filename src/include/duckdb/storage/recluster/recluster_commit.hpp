@@ -26,6 +26,8 @@ public:
 	                    shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
 	                    shared_ptr<RowGroupLayout> pending_layout, vector<row_t> final_deleted_new_rowids,
 	                    delete_sequence_t journal_resolved_through);
+	ReclusterCommitInfo(shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
+	                    shared_ptr<RowGroupLayout> pending_layout, sort_run_id_t recovered_run_id);
 	~ReclusterCommitInfo();
 
 	void WriteToWAL(WriteAheadLog &wal) const;
@@ -49,7 +51,9 @@ private:
 	shared_ptr<const RowGroupLayout> published_layout;
 	vector<row_t> final_deleted_new_rowids;
 	delete_sequence_t journal_resolved_through;
+	sort_run_id_t recovered_run_id = INVALID_SORT_RUN_ID;
 	ReclusterCommitLifecycle state = ReclusterCommitLifecycle::PREPARED;
+	bool is_recovery = false;
 	bool layout_published = false;
 	bool layout_version_advanced = false;
 };

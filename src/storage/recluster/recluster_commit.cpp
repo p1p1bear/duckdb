@@ -43,11 +43,24 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_pt
 	}
 }
 
+ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
+                                         shared_ptr<RowGroupLayout> pending_layout_p, sort_run_id_t recovered_run_id_p)
+    : storage(std::move(storage_p)), old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
+      recovered_run_id(recovered_run_id_p), is_recovery(true) {
+	if (!storage || !old_layout || !pending_layout || pending_layout->visible_from != 0 ||
+	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
+	    pending_layout->layout_version != old_layout->layout_version + 1 ||
+	    pending_layout->base_tree.get() != old_layout->base_tree.get() || recovered_run_id == INVALID_SORT_RUN_ID ||
+	    recovered_run_id == NumericLimits<sort_run_id_t>::Maximum()) {
+		throw InternalException("Invalid recovered recluster commit state");
+	}
+}
+
 ReclusterCommitInfo::~ReclusterCommitInfo() {
 }
 
 void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) const {
-	if (state != ReclusterCommitLifecycle::PREPARED) {
+	if (is_recovery || state != ReclusterCommitLifecycle::PREPARED) {
 		throw InternalException("Cannot write an applied recluster commit to the WAL");
 	}
 	auto &manifest = task->GetTaskContext().GetOutput().GetManifest();
@@ -84,14 +97,16 @@ void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) const {
 }
 
 void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_state) {
-	if (state != ReclusterCommitLifecycle::PREPARED || task->GetState() != RangeTaskState::COMMITTING ||
-	    layout_published) {
+	if (state != ReclusterCommitLifecycle::PREPARED || layout_published ||
+	    (!is_recovery && (!task || task->GetState() != RangeTaskState::COMMITTING))) {
 		throw InternalException("Invalid recluster commit transition");
 	}
 
 	try {
-		auto &output = task->GetTaskContext().GetOutput();
-		output.ApplyFinalDeletes(final_deleted_new_rowids);
+		if (!is_recovery) {
+			auto &output = task->GetTaskContext().GetOutput();
+			output.ApplyFinalDeletes(final_deleted_new_rowids);
+		}
 		pending_layout->visible_from = commit_id;
 		published_layout = pending_layout;
 		storage->GetRowGroupCollection()->PublishLayout(published_layout);
@@ -146,6 +161,11 @@ void ReclusterCommitInfo::FinalizeCommit() {
 	if (state != ReclusterCommitLifecycle::APPLIED || !layout_published) {
 		throw InternalException("Cannot finalize an unapplied recluster commit");
 	}
+	if (is_recovery) {
+		storage->GetDataTableInfo()->GetSortStorage().AdvancePastRunId(recovered_run_id);
+		state = ReclusterCommitLifecycle::FINALIZED;
+		return;
+	}
 	task->GetTaskContext().GetOutput().MarkPublished();
 	auto finished = task->TryFinishCommit(true);
 	D_ASSERT(finished);
@@ -160,6 +180,10 @@ void ReclusterCommitInfo::Rollback() {
 	}
 	if (layout_published) {
 		RevertLayout();
+	}
+	if (is_recovery) {
+		state = ReclusterCommitLifecycle::ROLLED_BACK;
+		return;
 	}
 	task->GetTaskContext().GetOutput().Abort();
 	if (task->GetState() == RangeTaskState::COMMITTING) {
