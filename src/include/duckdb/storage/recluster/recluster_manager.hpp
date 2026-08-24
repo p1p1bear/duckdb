@@ -116,7 +116,11 @@ private:
 	void RunAutoReclusterPass() noexcept;
 	void FinishAutoReclusterTask() noexcept;
 	void ScheduleAutoReclusterTask() noexcept;
+	void RequestAutoCheckpoint() noexcept;
+	void ClearAutoCheckpointRequest() noexcept;
 	bool AutoReclusterEnabled() const noexcept;
+	bool AutoCheckpointEnabled() const noexcept;
+	idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const;
 	shared_ptr<TableReclusterState> SynchronizeTable(DuckTableEntry &table);
 	uint64_t AllocateInitializationToken();
 

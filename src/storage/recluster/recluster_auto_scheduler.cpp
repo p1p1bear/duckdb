@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/time_point.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection.hpp"
@@ -13,6 +14,8 @@
 #include "duckdb/parallel/task.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +23,7 @@
 namespace duckdb {
 
 static constexpr idx_t AUTO_RECLUSTER_MAX_BYTES = 1ULL << 30;
+static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS = 60 * 1000;
 
 struct ReclusterAutoSchedulerState {
 	explicit ReclusterAutoSchedulerState(ReclusterManager &manager_p) : manager(manager_p) {
@@ -31,6 +35,9 @@ struct ReclusterAutoSchedulerState {
 	bool closing = false;
 	bool active = false;
 	bool rerun_requested = false;
+	bool checkpoint_requested = false;
+	bool auto_checkpoint_completed = false;
+	int64_t last_auto_checkpoint_ms = 0;
 };
 
 class ReclusterAutoTask final : public Task {
@@ -79,6 +86,7 @@ void ReclusterManager::StopAutoRecluster() noexcept {
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		auto_scheduler_state->closing = true;
 		auto_scheduler_state->rerun_requested = false;
+		auto_scheduler_state->checkpoint_requested = false;
 	}
 	try {
 		WaitForAutoRecluster();
@@ -97,6 +105,71 @@ bool ReclusterManager::AutoReclusterEnabled() const noexcept {
 		       Settings::Get<AutoReclusterSetting>(db.GetDatabase());
 	} catch (...) {
 		return false;
+	}
+}
+
+bool ReclusterManager::AutoCheckpointEnabled() const noexcept {
+	try {
+		return AutoReclusterEnabled() && Settings::Get<ReclusterTriggerCheckpointSetting>(db.GetDatabase());
+	} catch (...) {
+		return false;
+	}
+}
+
+void ReclusterManager::ClearAutoCheckpointRequest() noexcept {
+	lock_guard<mutex> guard(auto_scheduler_state->lock);
+	auto_scheduler_state->checkpoint_requested = false;
+}
+
+void ReclusterManager::RequestAutoCheckpoint() noexcept {
+	if (!AutoCheckpointEnabled()) {
+		return;
+	}
+	auto now_ms = TimePoint::GetTickMs();
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing) {
+			return;
+		}
+		auto_scheduler_state->checkpoint_requested = true;
+		if (auto_scheduler_state->auto_checkpoint_completed &&
+		    now_ms - auto_scheduler_state->last_auto_checkpoint_ms < AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS) {
+			return;
+		}
+	}
+
+	try {
+		Connection connection(db.GetDatabase());
+		{
+			lock_guard<mutex> guard(auto_scheduler_state->lock);
+			if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested) {
+				return;
+			}
+		}
+		if (db.GetStorageManager().GetWALSize() == 0) {
+			return;
+		}
+		connection.context->RunFunctionInTransaction(
+		    [&]() { TransactionManager::Get(db).Checkpoint(*connection.context, false); });
+		now_ms = TimePoint::GetTickMs();
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_requested = false;
+		auto_scheduler_state->auto_checkpoint_completed = true;
+		auto_scheduler_state->last_auto_checkpoint_ms = now_ms;
+	} catch (TransactionException &) {
+		// A writer or checkpoint owns the lock. A later commit/checkpoint wake-up retries the pending request.
+	} catch (FatalException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (DataCorruptionException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (SerializationException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (InternalException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (std::exception &ex) {
+		LogAutoReclusterError(db, string("checkpoint request: ") + ex.what());
+	} catch (...) {
+		LogAutoReclusterError(db, "unknown checkpoint request error");
 	}
 }
 
@@ -122,9 +195,10 @@ void ReclusterManager::RequestAutoRecluster() noexcept {
 	if (!AutoReclusterEnabled()) {
 		return;
 	}
+	auto allow_catalog_discovery = AutoCheckpointEnabled();
 	{
 		lock_guard<mutex> guard(queue_lock);
-		if (tables.empty()) {
+		if (tables.empty() && !allow_catalog_discovery) {
 			return;
 		}
 	}
@@ -208,6 +282,7 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 		return;
 	}
 
+	bool checkpoint_needed = false;
 	for (auto &table_name : table_names) {
 		if (!AutoReclusterEnabled()) {
 			return;
@@ -219,10 +294,14 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 				auto &table = Catalog::GetEntry<DuckTableEntry>(*connection.context, table_name);
 				auto state = table.GetStorage().GetDataTableInfo()->GetReclusterState();
 				if (!state) {
+					state = SynchronizeTable(table);
+				}
+				if (!state) {
 					return;
 				}
 				auto checkpoint = state->GetLastCheckpoint();
 				if (!checkpoint || checkpoint->checkpoint_number == 0) {
+					checkpoint_needed |= EstimateRemainingReclusterBytes(table.GetStorage(), *state) > 0;
 					return;
 				}
 				ReclusterExplicitOptions options;
@@ -232,6 +311,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 			});
 			if (result.state == ReclusterExplicitState::FAILED) {
 				LogAutoReclusterError(db, table_name.ToString() + ": " + result.message);
+			} else if (result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE &&
+			           result.remaining_recluster_bytes > 0) {
+				checkpoint_needed = true;
 			}
 		} catch (FatalException &ex) {
 			InvalidateAfterAutoReclusterError(db, ex);
@@ -250,6 +332,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 		} catch (...) {
 			LogAutoReclusterError(db, table_name.ToString() + ": unknown background error");
 		}
+	}
+	if (checkpoint_needed) {
+		RequestAutoCheckpoint();
 	}
 }
 

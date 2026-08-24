@@ -1239,6 +1239,13 @@
         ]
     },
     {
+        "name": "recluster_trigger_checkpoint",
+        "description": "Allow automatic SORTED BY maintenance to request rate-limited checkpoints",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "false"
+    },
+    {
         "name": "regex_match_operator_semantics",
         "description": "Configures whether regex match operators use partial or full string matching",
         "type": "ENUM<RegexMatchOperatorSemantics>",

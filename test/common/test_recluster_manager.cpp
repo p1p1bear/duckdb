@@ -30,6 +30,23 @@ static ReclusterManager &GetReclusterManager(Connection &con, const string &tabl
 	return *result;
 }
 
+static uint64_t GetReclusterCheckpointNumber(Connection &con, const string &table_name) {
+	auto state = GetReclusterState(con, table_name);
+	REQUIRE(state);
+	auto checkpoint = state->GetLastCheckpoint();
+	REQUIRE(checkpoint);
+	return checkpoint->checkpoint_number;
+}
+
+static void AppendInterleavedSortedRuns(Connection &con, const string &table_name, idx_t run_count) {
+	for (idx_t run_index = 0; run_index < run_count; run_index++) {
+		auto offset = run_count - run_index - 1;
+		auto query = "INSERT INTO " + table_name + " SELECT (i * " + std::to_string(run_count) + " + " +
+		             std::to_string(offset) + ")::BIGINT FROM range(4096) t(i)";
+		REQUIRE_NO_FAIL(con.Query(query));
+	}
+}
+
 TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage][recluster_manager]") {
 	auto path = TestCreatePath("recluster_manager_checkpoint.db");
 	DeleteDatabase(path);
@@ -178,6 +195,180 @@ TEST_CASE("Maintenance commits chain automatic work across task limits", "[stora
 		REQUIRE(layout->patches.size() == 2);
 		REQUIRE(layout->patches[0]->range.end == layout->patches[1]->range.start);
 	});
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic recluster does not request checkpoints by default", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint_default.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS checkpoint_default (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE checkpoint_default"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	AppendInterleavedSortedRuns(con, "tbl", 5);
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_default"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
+
+	auto setting = con.Query("SELECT current_setting('recluster_trigger_checkpoint')");
+	REQUIRE(CHECK_COLUMN(setting, 0, {false}));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
+	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes > 0 "
+	                           "FROM recluster('checkpoint_default.main.tbl')");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"NO_ELIGIBLE_RANGE"}));
+	REQUIRE(CHECK_COLUMN(remaining, 2, {true}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic checkpoint requests discover newly sorted tables", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint_discovery.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS checkpoint_discovery (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE checkpoint_discovery"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (i * 37) % 4096 FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE(!GetReclusterState(con, "tbl"));
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") > 0);
+	auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('checkpoint_discovery.main.tbl')");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"COMPLETE"}));
+	auto inversions =
+	    con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic checkpoint requests coalesce across sorted tables", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint_coalesce.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS checkpoint_coalesce (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE checkpoint_coalesce"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE left_tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE right_tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	AppendInterleavedSortedRuns(con, "left_tbl", 5);
+	AppendInterleavedSortedRuns(con, "right_tbl", 5);
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_coalesce"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "left_tbl");
+	REQUIRE(GetReclusterCheckpointNumber(con, "right_tbl") == checkpoint_number);
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	GetReclusterManager(con, "left_tbl").WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "left_tbl") == checkpoint_number + 1);
+	REQUIRE(GetReclusterCheckpointNumber(con, "right_tbl") == checkpoint_number + 1);
+	auto remaining = con.Query("SELECT table_name, tasks_completed, state FROM ("
+	                           "SELECT 'left' table_name, * FROM recluster('checkpoint_coalesce.main.left_tbl') "
+	                           "UNION ALL "
+	                           "SELECT 'right' table_name, * FROM recluster('checkpoint_coalesce.main.right_tbl')) "
+	                           "ORDER BY table_name");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {"left", "right"}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {0, 0}));
+	REQUIRE(CHECK_COLUMN(remaining, 2, {"COMPLETE", "COMPLETE"}));
+	auto inversions =
+	    con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous_i FROM left_tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic checkpoint requests are rate limited", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint_rate_limit.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS checkpoint_rate (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE checkpoint_rate"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	AppendInterleavedSortedRuns(con, "tbl", 17);
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_rate"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number + 1);
+	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes > 0 "
+	                           "FROM recluster('checkpoint_rate.main.tbl')");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"NO_ELIGIBLE_RANGE"}));
+	REQUIRE(CHECK_COLUMN(remaining, 2, {true}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic checkpoint requests retry after a writer releases the checkpoint lock",
+          "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint_retry.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	Connection writer(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS checkpoint_retry (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE checkpoint_retry"));
+	REQUIRE_NO_FAIL(writer.Query("USE checkpoint_retry"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	AppendInterleavedSortedRuns(con, "tbl", 5);
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_retry"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
+	auto &manager = GetReclusterManager(con, "tbl");
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(writer.Query("BEGIN"));
+	REQUIRE_NO_FAIL(writer.Query("UPDATE wake SET i = 2"));
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
+	auto rows = con.Query("SELECT count(*), sum(i) FROM tbl");
+	REQUIRE(CHECK_COLUMN(rows, 0, {20480}));
+	REQUIRE(CHECK_COLUMN(rows, 1, {209704960}));
+
+	REQUIRE_NO_FAIL(writer.Query("COMMIT"));
+	manager.WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number + 1);
+	auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('checkpoint_retry.main.tbl')");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"COMPLETE"}));
 	DeleteDatabase(path);
 }
 

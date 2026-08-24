@@ -105,6 +105,7 @@ optional<PendingCheckpointTableState> ReclusterManager::PrepareCheckpoint(DuckTa
 }
 
 void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &&states) noexcept {
+	ClearAutoCheckpointRequest();
 	bool installed_snapshot = false;
 	for (auto &pending : states) {
 		if (!pending.storage || !pending.storage->IsMainTable()) {
@@ -284,7 +285,7 @@ static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block
 	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
 }
 
-static idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) {
+idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
 	auto current_sort_order = state.GetCurrentSortOrderId();
 	if (current_sort_order == INVALID_SORT_ORDER_ID) {
 		return 0;
@@ -311,6 +312,8 @@ static idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterS
 	}
 
 	ReclusterByteEstimateCollector collector;
+	idx_t transient_bytes = 0;
+	bool has_remaining_work = false;
 	auto include_current_runs = current_run_count > 1 || (has_old_organization && current_run_count > 0);
 	for (auto &row_group_entry : row_groups) {
 		auto &row_group = *row_group_entry.row_group;
@@ -321,10 +324,16 @@ static idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterS
 		    physical_rows > 0 && live_rows < physical_rows &&
 		    static_cast<long double>(physical_rows - live_rows) >= static_cast<long double>(physical_rows) * 0.25;
 		if (!is_current || include_current_runs || needs_delete_cleanup) {
+			has_remaining_work = true;
+			transient_bytes = AddReclusterBytes(transient_bytes, row_group.GetAllocationSize());
 			collector.Add(row_group);
 		}
 	}
-	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+	auto persistent_bytes = collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+	if (persistent_bytes > 0 || !has_remaining_work) {
+		return persistent_bytes;
+	}
+	return transient_bytes > 0 ? transient_bytes : 1;
 }
 
 ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
