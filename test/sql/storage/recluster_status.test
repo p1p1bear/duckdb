@@ -1,0 +1,185 @@
+# name: test/sql/storage/recluster_status.test
+# description: Inspect SORTED BY layout, maintenance, and checkpoint status
+# group: [storage]
+
+statement ok
+SET threads=1
+
+statement ok
+SET auto_recluster=false
+
+statement ok
+SET debug_skip_checkpoint_on_commit=true
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_status.db' AS r (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE r
+
+statement ok
+CREATE TABLE plain(i INTEGER)
+
+query I
+SELECT count(*) FROM duckdb_recluster_status()
+----
+0
+
+statement ok
+CREATE TABLE events(i BIGINT) SORTED BY (i)
+
+loop i 0 5
+
+statement ok
+INSERT INTO events SELECT x * 5 + (4 - {i}) FROM range(4096) t(x)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query TTT
+SELECT typeof(table_id), typeof(sort_columns), typeof(oldest_unsorted_age)
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+UUID	VARCHAR[]	INTERVAL
+
+query TITIRIIIIIRII
+SELECT sort_state, current_sort_order_id::BIGINT, array_to_string(sort_columns, '|'), layout_version::BIGINT,
+       round(current_order_coverage, 3), unsorted_row_groups::BIGINT, run_count::BIGINT,
+       max_overlap_depth::BIGINT, p95_overlap_depth::BIGINT, (remaining_recluster_bytes > 0)::BIGINT,
+       round(largest_run_fraction, 3), (blocked_reason IS NULL)::BIGINT, retired_layout_bytes::BIGINT
+FROM duckdb_recluster_status()
+WHERE database_name = 'r' AND schema_name = 'main' AND table_name = 'events'
+----
+ENABLED	1	i ASC NULLS LAST	0	1.0	0	5	5	5	1	0.2	1	0
+
+statement ok
+CREATE TEMP TABLE saved_status_id AS
+SELECT table_id FROM duckdb_recluster_status() WHERE table_name = 'events'
+
+query I
+SELECT tasks_completed FROM recluster('r.main.events', max_tasks=1, max_bytes='1GB')
+----
+1
+
+query IRIIIIRTI
+SELECT layout_version::BIGINT, round(current_order_coverage, 3), run_count::BIGINT,
+       max_overlap_depth::BIGINT, p95_overlap_depth::BIGINT, (remaining_recluster_bytes > 0)::BIGINT,
+       round(largest_run_fraction, 3), blocked_reason, (retired_layout_bytes > 0)::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+1	1.0	2	2	2	1	0.667	NO_CHECKPOINTED_RANGE	1
+
+statement ok
+CHECKPOINT r
+
+query III
+SELECT (blocked_reason IS NULL)::BIGINT, retired_layout_bytes::BIGINT,
+       not_checkpointed_unsorted_bytes::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+1	0	0
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.events', max_tasks=1, max_bytes='1GB')
+----
+1	COMPLETE
+
+query IIIIIRI
+SELECT layout_version::BIGINT, run_count::BIGINT, max_overlap_depth::BIGINT, p95_overlap_depth::BIGINT,
+       remaining_recluster_bytes::BIGINT, round(largest_run_fraction, 3), (blocked_reason IS NULL)::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+2	1	1	1	0	1.0	1
+
+statement ok
+ALTER TABLE events RENAME i TO event_id
+
+query T
+SELECT array_to_string(sort_columns, '|') FROM duckdb_recluster_status() WHERE table_name = 'events'
+----
+event_id ASC NULLS LAST
+
+statement ok
+ALTER TABLE events RESET SORTED BY
+
+query I
+SELECT s.table_id = r.table_id
+FROM saved_status_id s, duckdb_recluster_status() r
+WHERE r.table_name = 'events'
+----
+true
+
+query TITIRIIIIIRIIIII
+SELECT sort_state, current_sort_order_id::BIGINT, array_to_string(sort_columns, '|'), layout_version::BIGINT,
+       current_order_coverage, unsorted_row_groups::BIGINT, run_count::BIGINT, max_overlap_depth::BIGINT,
+       p95_overlap_depth::BIGINT, remaining_recluster_bytes::BIGINT, largest_run_fraction,
+       active_prepare_tasks::BIGINT, pending_finalize_tasks::BIGINT, pending_delete_rows::BIGINT,
+       prepared_bytes::BIGINT, (blocked_reason IS NULL)::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+DISABLED	0	(empty)	2	0.0	0	0	0	0	0	0.0	0	0	0	0	1
+
+statement ok
+CREATE TABLE backlog(i BIGINT)
+
+statement ok
+INSERT INTO backlog SELECT (x * 37) % 4096 FROM range(4096) t(x)
+
+statement ok
+ALTER TABLE backlog SET SORTED BY (i)
+
+query RIIIIII
+SELECT current_order_coverage, unsorted_row_groups::BIGINT, (unsorted_bytes > 0)::BIGINT,
+       (not_checkpointed_unsorted_bytes > 0)::BIGINT, (oldest_unsorted_age IS NOT NULL)::BIGINT,
+       (remaining_recluster_bytes > 0)::BIGINT, (blocked_reason = 'NO_CHECKPOINTED_RANGE')::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'backlog'
+----
+0.0	2	1	1	1	1	1
+
+statement ok
+CHECKPOINT r
+
+query III
+SELECT not_checkpointed_unsorted_bytes::BIGINT, (blocked_reason IS NULL)::BIGINT,
+       (remaining_recluster_bytes > 0)::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'backlog'
+----
+0	1	1
+
+statement ok
+SET debug_force_commit_failure=true
+
+query T
+SELECT state FROM recluster('r.main.backlog', max_tasks=1, max_bytes='1GB')
+----
+FAILED
+
+statement ok
+SET debug_force_commit_failure=false
+
+query I
+SELECT last_error IS NOT NULL FROM duckdb_recluster_status() WHERE table_name = 'backlog'
+----
+true
+
+query T
+SELECT state FROM recluster('r.main.backlog', max_tasks=1, max_bytes='1GB')
+----
+COMPLETE
+
+query I
+SELECT count(*) FROM duckdb_recluster_status() WHERE table_name = 'plain'
+----
+0
