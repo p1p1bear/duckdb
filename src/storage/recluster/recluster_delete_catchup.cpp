@@ -63,6 +63,7 @@ ReclusterDeleteCatchupResult ReclusterDeleteCatchup::Run(idx_t max_slots, idx_t 
 	if (scan.resolved_through > previous_sequence) {
 		result.deleted_row_count = output.ApplyDeleteCatchup(std::move(new_rowids), scan.resolved_through);
 	}
+	task.UpdatePreparedOutputStatus(output.GetManifest().header.last_applied_delete_sequence, output.GetByteSize());
 
 	CheckTask();
 	if (!scan.limit_exceeded && !task.TryAdvance(RangeTaskState::CATCHING_UP_DELETES, RangeTaskState::PREPARED)) {

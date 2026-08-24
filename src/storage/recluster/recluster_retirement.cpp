@@ -3,6 +3,7 @@
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/reference_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/valid_checker.hpp"
@@ -380,6 +381,22 @@ idx_t ReclusterRetirementRegistry::Count() const {
 		count++;
 	}
 	return count;
+}
+
+idx_t ReclusterRetirementRegistry::GetRetiredBytes(const DataTableInfo &table_info) const {
+	unordered_set<block_id_t> blocks;
+	lock_guard<mutex> guard(lock);
+	for (auto entry = entries.get(); entry; entry = entry->next.get()) {
+		if (&entry->collection->GetTableInfo() != &table_info) {
+			continue;
+		}
+		blocks.insert(entry->protected_resources.begin(), entry->protected_resources.end());
+	}
+	auto block_size = db.GetStorageManager().GetBlockManager().GetBlockAllocSize();
+	if (block_size != 0 && blocks.size() > NumericLimits<idx_t>::Maximum() / block_size) {
+		return NumericLimits<idx_t>::Maximum();
+	}
+	return blocks.size() * block_size;
 }
 
 void ReclusterRetirementRegistry::DestroyEntries(unique_ptr<ReclusterRetirementEntry> entries_p) noexcept {

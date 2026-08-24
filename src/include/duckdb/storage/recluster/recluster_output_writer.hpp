@@ -53,6 +53,7 @@ public:
 	idx_t GetRowCount() const {
 		return row_count;
 	}
+	idx_t GetByteSize() const;
 
 	void MarkPublished();
 	void Abort();

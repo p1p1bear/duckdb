@@ -1,6 +1,8 @@
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/time_point.hpp"
 
 namespace duckdb {
 
@@ -194,6 +196,58 @@ vector<RowGroupRange> TableReclusterState::GetReservedRanges() const {
 		result.push_back(entry.second.range);
 	}
 	return result;
+}
+
+static idx_t AddStatusCount(idx_t left, idx_t right) {
+	return right > NumericLimits<idx_t>::Maximum() - left ? NumericLimits<idx_t>::Maximum() : left + right;
+}
+
+TableReclusterTaskStatus TableReclusterState::GetTaskStatus() const {
+	lock_guard<mutex> guard(task_lock);
+	TableReclusterTaskStatus result;
+	for (auto &entry : tasks) {
+		auto task_status = entry.second->GetStatusSnapshot();
+		switch (task_status.state) {
+		case RangeTaskState::STARTING:
+		case RangeTaskState::PREPARING:
+		case RangeTaskState::CATCHING_UP_DELETES:
+			result.active_prepare_tasks++;
+			break;
+		case RangeTaskState::PREPARED:
+		case RangeTaskState::FINALIZING:
+		case RangeTaskState::COMMITTING:
+			result.pending_finalize_tasks++;
+			break;
+		default:
+			break;
+		}
+		result.pending_delete_rows = AddStatusCount(result.pending_delete_rows, task_status.pending_delete_rows);
+		result.prepared_bytes = AddStatusCount(result.prepared_bytes, task_status.prepared_bytes);
+	}
+	return result;
+}
+
+optional<int64_t> TableReclusterState::ObserveRemainingWorkAgeMs(bool has_remaining_work) {
+	lock_guard<mutex> guard(task_lock);
+	if (!has_remaining_work) {
+		remaining_work_observed_ms.reset();
+		return nullopt;
+	}
+	auto now_ms = TimePoint::GetTickMs();
+	if (!remaining_work_observed_ms) {
+		remaining_work_observed_ms = now_ms;
+	}
+	return now_ms - *remaining_work_observed_ms;
+}
+
+void TableReclusterState::SetLastError(string error) {
+	lock_guard<mutex> guard(task_lock);
+	last_error = std::move(error);
+}
+
+optional<string> TableReclusterState::GetLastError() const {
+	lock_guard<mutex> guard(task_lock);
+	return last_error;
 }
 
 idx_t TableReclusterState::GetTaskCount() const {

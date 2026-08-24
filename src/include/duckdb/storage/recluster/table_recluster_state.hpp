@@ -17,6 +17,13 @@
 
 namespace duckdb {
 
+struct TableReclusterTaskStatus {
+	idx_t active_prepare_tasks = 0;
+	idx_t pending_finalize_tasks = 0;
+	idx_t pending_delete_rows = 0;
+	idx_t prepared_bytes = 0;
+};
+
 class TableReclusterState {
 public:
 	explicit TableReclusterState(uint64_t initialization_token);
@@ -43,6 +50,10 @@ public:
 	vector<shared_ptr<RangeTask>> DisableAndGetTasks();
 	void RemoveTask(recluster_task_id_t task_id);
 	vector<RowGroupRange> GetReservedRanges() const;
+	TableReclusterTaskStatus GetTaskStatus() const;
+	optional<int64_t> ObserveRemainingWorkAgeMs(bool has_remaining_work);
+	void SetLastError(string error);
+	optional<string> GetLastError() const;
 
 	unique_lock<mutex> LockFinalize() {
 		return unique_lock<mutex>(finalize_mutex);
@@ -74,6 +85,8 @@ private:
 	map<row_t, RangeReservation> reserved_ranges;
 	unordered_map<recluster_task_id_t, row_t> reservation_starts;
 	unordered_map<recluster_task_id_t, shared_ptr<RangeTask>> tasks;
+	optional<int64_t> remaining_work_observed_ms;
+	optional<string> last_error;
 };
 
 } // namespace duckdb

@@ -16,6 +16,7 @@
 namespace duckdb {
 
 class AttachedDatabase;
+struct DataTableInfo;
 class RowGroupCollection;
 struct ReclusterRetirementEntry;
 struct ReclusterRetirementCheckpointState;
@@ -78,6 +79,7 @@ public:
 	void Cleanup() noexcept;
 
 	idx_t Count() const;
+	idx_t GetRetiredBytes(const DataTableInfo &table_info) const;
 
 private:
 	friend class ReclusterRetirementCheckpoint;

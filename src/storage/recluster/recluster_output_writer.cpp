@@ -129,6 +129,14 @@ vector<shared_ptr<RowGroup>> ReclusterOutput::GetRowGroups() const {
 	return result;
 }
 
+idx_t ReclusterOutput::GetByteSize() const {
+	auto block_size = block_manager.GetBlockAllocSize();
+	if (block_size != 0 && block_ids.size() > NumericLimits<idx_t>::Maximum() / block_size) {
+		return NumericLimits<idx_t>::Maximum();
+	}
+	return block_ids.size() * block_size;
+}
+
 void ReclusterOutput::AdoptTaskPrivateBlocks(vector<block_id_t> block_ids_p) {
 	if (owns_blocks || !data_block_ids.empty() || !block_ids.empty()) {
 		throw InternalException("Recluster output already owns task-private blocks");
@@ -535,6 +543,9 @@ void ReclusterOutputWriter::Write() {
 		task_blocks = UniqueSortedBlocks(std::move(task_blocks));
 		output->AdoptTaskPrivateBlocks(std::move(task_blocks));
 		task_context.SetOutput(std::move(output));
+		auto &installed_output = task_context.GetOutput();
+		task.UpdatePreparedOutputStatus(installed_output.GetManifest().header.last_applied_delete_sequence,
+		                                installed_output.GetByteSize());
 	} catch (...) {
 		for (auto &partial_manager : partial_managers) {
 			partial_manager->Rollback();

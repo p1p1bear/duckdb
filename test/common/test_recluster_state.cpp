@@ -122,3 +122,42 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	REQUIRE(!state.AcceptsNewTasks());
 	REQUIRE_THROWS_AS(state.SynchronizeCatalog(hugeint_t(8, 11), 3, 18, true), InternalException);
 }
+
+TEST_CASE("Table recluster state snapshots task metrics and observations", "[storage][recluster_state]") {
+	TableReclusterState state(101);
+	state.SetAcceptNewTasks(true);
+	auto task = MakeRangeTask(1, 0, 100);
+	auto first = task->TryReserveDeleteSlot({1, 2});
+	auto second = task->TryReserveDeleteSlot({3});
+	auto aborted = task->TryReserveDeleteSlot({4, 5});
+	REQUIRE(first);
+	REQUIRE(second);
+	REQUIRE(aborted);
+	REQUIRE(task->ResolveDeleteSlot(*first, DeleteSlotState::COMMITTED));
+	REQUIRE(task->ResolveDeleteSlot(*second, DeleteSlotState::COMMITTED));
+	REQUIRE(task->ResolveDeleteSlot(*aborted, DeleteSlotState::ABORTED));
+	REQUIRE(state.TryRegisterTask(task));
+
+	auto status = state.GetTaskStatus();
+	REQUIRE(status.active_prepare_tasks == 1);
+	REQUIRE(status.pending_finalize_tasks == 0);
+	REQUIRE(status.pending_delete_rows == 3);
+	REQUIRE(status.prepared_bytes == 0);
+
+	task->UpdatePreparedOutputStatus(first->GetSequence(), 8192);
+	REQUIRE(task->TryAdvance(RangeTaskState::STARTING, RangeTaskState::PREPARING));
+	REQUIRE(task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
+	REQUIRE(task->TryAdvance(RangeTaskState::CATCHING_UP_DELETES, RangeTaskState::PREPARED));
+	status = state.GetTaskStatus();
+	REQUIRE(status.active_prepare_tasks == 0);
+	REQUIRE(status.pending_finalize_tasks == 1);
+	REQUIRE(status.pending_delete_rows == 1);
+	REQUIRE(status.prepared_bytes == 8192);
+
+	auto age = state.ObserveRemainingWorkAgeMs(true);
+	REQUIRE(age);
+	REQUIRE(*age >= 0);
+	REQUIRE(!state.ObserveRemainingWorkAgeMs(false));
+	state.SetLastError("test failure");
+	REQUIRE(state.GetLastError() == "test failure");
+}

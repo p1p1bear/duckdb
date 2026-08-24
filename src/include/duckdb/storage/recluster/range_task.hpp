@@ -30,6 +30,12 @@ enum class RangeTaskState : uint8_t {
 	FAILED
 };
 
+struct RangeTaskStatusSnapshot {
+	RangeTaskState state = RangeTaskState::STARTING;
+	idx_t pending_delete_rows = 0;
+	idx_t prepared_bytes = 0;
+};
+
 class RangeTask {
 public:
 	RangeTask(recluster_task_id_t task_id, RowGroupRange range,
@@ -59,6 +65,8 @@ public:
 	ReclusterDeleteJournalScan ScanResolvedDeletes(delete_sequence_t after_sequence, idx_t max_slots,
 	                                               idx_t max_rowids) const;
 	delete_sequence_t GetLatestDeleteSequence() const;
+	RangeTaskStatusSnapshot GetStatusSnapshot() const;
+	void UpdatePreparedOutputStatus(delete_sequence_t applied_delete_sequence, idx_t prepared_bytes) noexcept;
 	const ReclusterDeleteJournalLimits &GetDeleteJournalLimits() const {
 		return delete_journal.GetLimits();
 	}
@@ -84,6 +92,8 @@ private:
 	std::atomic<uint16_t> control;
 	ReclusterDeleteJournal delete_journal;
 	unique_ptr<ReclusterTaskContext> task_context;
+	std::atomic<delete_sequence_t> applied_delete_sequence {0};
+	std::atomic<idx_t> prepared_bytes {0};
 };
 
 } // namespace duckdb

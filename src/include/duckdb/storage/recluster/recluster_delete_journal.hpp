@@ -70,6 +70,7 @@ public:
 	delete_sequence_t GetLatestSequence() const;
 	idx_t GetSlotCount() const;
 	idx_t GetRowIdCount() const;
+	idx_t GetCommittedRowIdCountAfter(delete_sequence_t sequence) const;
 	const ReclusterDeleteJournalLimits &GetLimits() const {
 		return limits;
 	}

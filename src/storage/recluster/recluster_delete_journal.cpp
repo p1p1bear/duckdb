@@ -107,4 +107,19 @@ idx_t ReclusterDeleteJournal::GetRowIdCount() const {
 	return rowid_count;
 }
 
+idx_t ReclusterDeleteJournal::GetCommittedRowIdCountAfter(delete_sequence_t sequence) const {
+	lock_guard<mutex> guard(lock);
+	if (sequence > slots.size()) {
+		throw InternalException("Recluster DELETE journal status starts after its latest sequence");
+	}
+	idx_t result = 0;
+	for (idx_t slot_index = NumericCast<idx_t>(sequence); slot_index < slots.size(); slot_index++) {
+		auto &slot = *slots[slot_index];
+		if (slot.GetState() == DeleteSlotState::COMMITTED) {
+			result += slot.GetOldRowIds().size();
+		}
+	}
+	return result;
+}
+
 } // namespace duckdb

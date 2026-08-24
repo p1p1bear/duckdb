@@ -91,6 +91,21 @@ delete_sequence_t RangeTask::GetLatestDeleteSequence() const {
 	return delete_journal.GetLatestSequence();
 }
 
+RangeTaskStatusSnapshot RangeTask::GetStatusSnapshot() const {
+	RangeTaskStatusSnapshot result;
+	result.state = GetState();
+	auto applied_sequence = applied_delete_sequence.load(std::memory_order_acquire);
+	result.pending_delete_rows = delete_journal.GetCommittedRowIdCountAfter(applied_sequence);
+	result.prepared_bytes = prepared_bytes.load(std::memory_order_acquire);
+	return result;
+}
+
+void RangeTask::UpdatePreparedOutputStatus(delete_sequence_t applied_sequence, idx_t bytes) noexcept {
+	D_ASSERT(applied_sequence >= applied_delete_sequence.load(std::memory_order_relaxed));
+	prepared_bytes.store(bytes, std::memory_order_relaxed);
+	applied_delete_sequence.store(applied_sequence, std::memory_order_release);
+}
+
 RangeTaskState RangeTask::DecodeState(uint16_t control) {
 	return static_cast<RangeTaskState>(control & RANGE_TASK_STATE_MASK);
 }

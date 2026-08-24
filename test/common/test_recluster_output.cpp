@@ -661,6 +661,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	auto &wal_retention = manager.GetWALBlockRetention();
 	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
 	REQUIRE(retirement.Count() == 0);
+	REQUIRE(retirement.GetRetiredBytes(*storage->GetDataTableInfo()) == 0);
 	REQUIRE(wal_retention.Count() == 0);
 	auto unresolved_slot = start.task->TryReserveDeleteSlot({23});
 	REQUIRE(unresolved_slot);
@@ -700,6 +701,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE(start.task->GetState() == RangeTaskState::PUBLISHED);
 	REQUIRE(!state->GetTask(start.task->GetTaskId()));
 	REQUIRE(retirement.Count() == 1);
+	REQUIRE(retirement.GetRetiredBytes(*storage->GetDataTableInfo()) > 0);
 	REQUIRE(wal_retention.Count() == 1);
 	for (auto block_id : runtime_wal_blocks) {
 		REQUIRE(block_manager.IsBlockReserved(block_id));
@@ -730,6 +732,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
 	REQUIRE(retirement.Count() == 1);
+	REQUIRE(retirement.GetRetiredBytes(*storage->GetDataTableInfo()) > 0);
 	REQUIRE(wal_retention.Count() == 0);
 	REQUIRE(!old_layout_reference.expired());
 	for (auto block_id : runtime_wal_blocks) {
@@ -754,6 +757,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	retirement.Cleanup();
 	REQUIRE(old_layout_reference.expired());
 	REQUIRE(retirement.Count() == 0);
+	REQUIRE(retirement.GetRetiredBytes(*storage->GetDataTableInfo()) == 0);
 	DeleteDatabase(path);
 }
 
