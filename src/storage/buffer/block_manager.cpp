@@ -64,6 +64,10 @@ unique_lock<mutex> BlockManager::LockBlockReservations() {
 	return unique_lock<mutex>(allocator_reservation_lock);
 }
 
+unique_lock<mutex> BlockManager::LockOwnershipDrops() {
+	return unique_lock<mutex>(ownership_drop_lock);
+}
+
 bool BlockManager::IsBlockReserved(block_id_t block_id) {
 	auto lock = LockBlockReservations();
 	return IsBlockReserved(lock, block_id);

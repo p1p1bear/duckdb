@@ -68,6 +68,7 @@ public:
 	virtual shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) = 0;
 	virtual void UnregisterBlockReservation(block_id_t block_id) noexcept = 0;
 	unique_lock<mutex> LockBlockReservations();
+	unique_lock<mutex> LockOwnershipDrops();
 	bool IsBlockReserved(block_id_t block_id);
 	bool IsBlockReserved(const unique_lock<mutex> &lock, block_id_t block_id) const;
 	//! Get the first meta block id
@@ -183,6 +184,8 @@ protected:
 	//! Runtime references that prevent allocator, metadata, trim and truncate reuse without changing persistent counts.
 	mutable mutex allocator_reservation_lock;
 	unordered_map<block_id_t, idx_t> allocator_reservation_counts;
+	//! Serializes persistent ownership claims and their allocator updates.
+	mutex ownership_drop_lock;
 
 public:
 	template <class TARGET>

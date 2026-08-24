@@ -30,6 +30,45 @@ class SingleFileBlockManager;
 struct MetadataHandle;
 enum class FreeBlockType { NEWLY_USED_BLOCK, CHECKPOINTED_BLOCK };
 
+//! Holds allocator locks and all nodes required to mark committed drops without allocation.
+class PreparedBlockModificationBatch {
+public:
+	PreparedBlockModificationBatch(PreparedBlockModificationBatch &&other) noexcept = default;
+	PreparedBlockModificationBatch &operator=(PreparedBlockModificationBatch &&other) noexcept = delete;
+	~PreparedBlockModificationBatch() = default;
+
+	PreparedBlockModificationBatch(const PreparedBlockModificationBatch &) = delete;
+	PreparedBlockModificationBatch &operator=(const PreparedBlockModificationBatch &) = delete;
+
+private:
+	enum class FinalDropTarget : uint8_t { NONE, MODIFIED, FREE, FREE_IN_USE };
+
+	struct DropDelta {
+		block_id_t block_id;
+		idx_t drop_count;
+		uint32_t remaining_references = 0;
+		FinalDropTarget target = FinalDropTarget::NONE;
+	};
+
+	PreparedBlockModificationBatch(SingleFileBlockManager &manager_p, vector<DropDelta> deltas_p,
+	                               set<block_id_t> staged_free_nodes_p,
+	                               unordered_set<block_id_t> staged_modified_nodes_p,
+	                               vector<shared_ptr<BlockHandle>> held_blocks_p, unique_lock<mutex> block_lock_p,
+	                               unique_lock<mutex> reservation_lock_p);
+
+private:
+	friend class SingleFileBlockManager;
+
+	optional_ptr<SingleFileBlockManager> manager;
+	vector<DropDelta> deltas;
+	set<block_id_t> staged_free_nodes;
+	unordered_set<block_id_t> staged_modified_nodes;
+	vector<shared_ptr<BlockHandle>> held_blocks;
+	bool applied = false;
+	unique_lock<mutex> block_lock;
+	unique_lock<mutex> reservation_lock;
+};
+
 //! One retirement entry's persistent drops and complete runtime-protected block set.
 struct CheckpointBlockDropSource {
 	CheckpointBlockDropSource(const vector<block_id_t> &actions_p, const vector<block_id_t> &protected_resources_p,
@@ -143,6 +182,8 @@ public:
 	void MarkBlockAsUsed(block_id_t block_id) override;
 	//! Mark a block as modified (re-writeable after a checkpoint)
 	void MarkBlockAsModified(block_id_t block_id) override;
+	PreparedBlockModificationBatch PrepareBlockDropsForCommit(const vector<block_id_t> &actions);
+	void ApplyPreparedBlockDrops(PreparedBlockModificationBatch &&batch) noexcept;
 	//! Sources and reservations must remain stable until the returned batch is applied or destroyed.
 	PreparedCheckpointBlockDropBatch PrepareBlockDropsForCheckpoint(const vector<CheckpointBlockDropSource> &sources);
 	void ApplyPreparedBlockDrops(PreparedCheckpointBlockDropBatch &&batch) noexcept;

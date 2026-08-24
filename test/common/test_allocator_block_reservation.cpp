@@ -115,6 +115,48 @@ TEST_CASE("Prepared checkpoint block drops preserve multiplicity and have no pre
 	REQUIRE(block_manager.PeekFreeBlockId() == partial_block);
 }
 
+TEST_CASE("Prepared committed block drops preserve multiplicity and defer persistent reuse",
+          "[storage][allocator_block_reservation]") {
+	auto path = TestCreatePath("prepared_committed_block_drop_multiplicity.db");
+	DeleteDatabase(path);
+	DuckDB db(path);
+	Connection con(db);
+	auto &block_manager = GetSingleFileBlockManager(db, con);
+
+	auto block_id = block_manager.GetFreeBlockId();
+	block_manager.MarkBlockAsCheckpointed(block_id);
+	block_manager.IncreaseBlockReferenceCount(block_id);
+	block_manager.IncreaseBlockReferenceCount(block_id);
+	duckdb::vector<block_id_t> too_many_actions {block_id, block_id, block_id, block_id};
+	REQUIRE_THROWS(block_manager.PrepareBlockDropsForCommit(too_many_actions));
+
+	duckdb::vector<block_id_t> duplicate_actions {block_id, block_id};
+	{ auto abandoned_batch = block_manager.PrepareBlockDropsForCommit(duplicate_actions); }
+	auto batch = block_manager.PrepareBlockDropsForCommit(duplicate_actions);
+	block_manager.ApplyPreparedBlockDrops(std::move(batch));
+	block_manager.MarkBlockAsModified(block_id);
+	REQUIRE(block_manager.PeekFreeBlockId() != block_id);
+	REQUIRE_THROWS(block_manager.MarkBlockAsModified(block_id));
+}
+
+TEST_CASE("Prepared committed block drops keep newly used reservations unavailable",
+          "[storage][allocator_block_reservation]") {
+	auto path = TestCreatePath("prepared_committed_block_drop_reserved.db");
+	DeleteDatabase(path);
+	DuckDB db(path);
+	Connection con(db);
+	auto &block_manager = GetSingleFileBlockManager(db, con);
+
+	auto block_id = block_manager.GetFreeBlockId();
+	auto reservation = AllocatorBlockReservation::Reserve(block_manager, {block_id});
+	duckdb::vector<block_id_t> actions {block_id};
+	auto batch = block_manager.PrepareBlockDropsForCommit(actions);
+	block_manager.ApplyPreparedBlockDrops(std::move(batch));
+	REQUIRE(block_manager.PeekFreeBlockId() != block_id);
+	reservation.Release();
+	REQUIRE(block_manager.PeekFreeBlockId() == block_id);
+}
+
 TEST_CASE("Prepared checkpoint block drops release a single reference directly",
           "[storage][allocator_block_reservation]") {
 	auto path = TestCreatePath("prepared_checkpoint_block_drop_single.db");

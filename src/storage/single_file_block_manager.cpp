@@ -28,6 +28,15 @@
 
 namespace duckdb {
 
+PreparedBlockModificationBatch::PreparedBlockModificationBatch(
+    SingleFileBlockManager &manager_p, vector<DropDelta> deltas_p, set<block_id_t> staged_free_nodes_p,
+    unordered_set<block_id_t> staged_modified_nodes_p, vector<shared_ptr<BlockHandle>> held_blocks_p,
+    unique_lock<mutex> block_lock_p, unique_lock<mutex> reservation_lock_p)
+    : manager(manager_p), deltas(std::move(deltas_p)), staged_free_nodes(std::move(staged_free_nodes_p)),
+      staged_modified_nodes(std::move(staged_modified_nodes_p)), held_blocks(std::move(held_blocks_p)),
+      block_lock(std::move(block_lock_p)), reservation_lock(std::move(reservation_lock_p)) {
+}
+
 PreparedCheckpointBlockDropBatch::PreparedCheckpointBlockDropBatch(SingleFileBlockManager &manager_p,
                                                                    vector<DropDelta> deltas_p,
                                                                    set<block_id_t> staged_free_nodes_p,
@@ -1007,6 +1016,154 @@ void SingleFileBlockManager::MarkBlockAsModified(block_id_t block_id) {
 		// add it to the modified blocks indicating it will be re-usable after the next checkpoint
 		modified_blocks.insert(block_id);
 	}
+}
+
+PreparedBlockModificationBatch SingleFileBlockManager::PrepareBlockDropsForCommit(const vector<block_id_t> &actions) {
+	vector<block_id_t> sorted_actions;
+	sorted_actions.reserve(actions.size());
+	for (auto block_id : actions) {
+		if (block_id < 0 || block_id >= MAXIMUM_BLOCK) {
+			throw InternalException("Invalid committed block drop action for block %d", block_id);
+		}
+		sorted_actions.push_back(block_id);
+	}
+	std::sort(sorted_actions.begin(), sorted_actions.end());
+
+	vector<PreparedBlockModificationBatch::DropDelta> deltas;
+	deltas.reserve(sorted_actions.size());
+	set<block_id_t> staged_free_nodes;
+	unordered_set<block_id_t> staged_modified_nodes;
+	staged_modified_nodes.reserve(sorted_actions.size());
+	for (idx_t action_index = 0; action_index < sorted_actions.size();) {
+		auto block_id = sorted_actions[action_index];
+		idx_t next_action = action_index + 1;
+		while (next_action < sorted_actions.size() && sorted_actions[next_action] == block_id) {
+			next_action++;
+		}
+		deltas.push_back(
+		    {block_id, next_action - action_index, 0, PreparedBlockModificationBatch::FinalDropTarget::NONE});
+		staged_free_nodes.insert(block_id);
+		staged_modified_nodes.insert(block_id);
+		action_index = next_action;
+	}
+	vector<shared_ptr<BlockHandle>> held_blocks(deltas.size());
+
+	unique_lock<mutex> block_lock(single_file_block_lock);
+	unique_lock<mutex> reservation_lock(allocator_reservation_lock);
+	idx_t modified_target_count = 0;
+	for (idx_t delta_index = 0; delta_index < deltas.size(); delta_index++) {
+		auto &delta = deltas[delta_index];
+		auto block_id = delta.block_id;
+		if (block_id >= max_block) {
+			throw InternalException("Committed block drop action references block %d beyond max block %d", block_id,
+			                        max_block);
+		}
+		if (free_list.find(block_id) != free_list.end() ||
+		    free_blocks_in_use.find(block_id) != free_blocks_in_use.end()) {
+			throw InternalException("Committed block drop action references already freed block %d", block_id);
+		}
+		if (modified_blocks.find(block_id) != modified_blocks.end()) {
+			throw InternalException("Committed block drop action references already modified block %d", block_id);
+		}
+
+		auto multi_use_entry = multi_use_blocks.find(block_id);
+		uint32_t reference_count = 1;
+		if (multi_use_entry != multi_use_blocks.end()) {
+			reference_count = multi_use_entry->second;
+			if (reference_count <= 1) {
+				throw InternalException("Invalid multi-use reference count for committed block drop action %d",
+				                        block_id);
+			}
+		}
+		if (delta.drop_count > reference_count) {
+			throw InternalException("Committed block drop action count %llu exceeds reference count %u for block %d",
+			                        static_cast<uint64_t>(delta.drop_count), reference_count, block_id);
+		}
+		delta.remaining_references = reference_count - NumericCast<uint32_t>(delta.drop_count);
+		if (delta.remaining_references != 0) {
+			continue;
+		}
+		if (newly_used_blocks.find(block_id) == newly_used_blocks.end()) {
+			delta.target = PreparedBlockModificationBatch::FinalDropTarget::MODIFIED;
+			modified_target_count++;
+			continue;
+		}
+		if (IsBlockReservedInternal(block_id)) {
+			delta.target = PreparedBlockModificationBatch::FinalDropTarget::FREE_IN_USE;
+			continue;
+		}
+		held_blocks[delta_index] = TryGetBlock(block_id);
+		delta.target = held_blocks[delta_index] ? PreparedBlockModificationBatch::FinalDropTarget::FREE_IN_USE
+		                                        : PreparedBlockModificationBatch::FinalDropTarget::FREE;
+	}
+	if (modified_target_count > NumericLimits<idx_t>::Maximum() - modified_blocks.size()) {
+		throw InternalException("Committed block drop target count overflow");
+	}
+	modified_blocks.reserve(modified_blocks.size() + modified_target_count);
+
+	return PreparedBlockModificationBatch(*this, std::move(deltas), std::move(staged_free_nodes),
+	                                      std::move(staged_modified_nodes), std::move(held_blocks),
+	                                      std::move(block_lock), std::move(reservation_lock));
+}
+
+void SingleFileBlockManager::ApplyPreparedBlockDrops(PreparedBlockModificationBatch &&batch) noexcept {
+	if (batch.manager.get() != this || batch.applied || !batch.block_lock.owns_lock() ||
+	    batch.block_lock.mutex() != &single_file_block_lock || !batch.reservation_lock.owns_lock() ||
+	    batch.reservation_lock.mutex() != &allocator_reservation_lock) {
+		D_ASSERT(false);
+		return;
+	}
+
+	for (auto &delta : batch.deltas) {
+		auto multi_use_entry = multi_use_blocks.find(delta.block_id);
+		if (delta.remaining_references >= 2) {
+			D_ASSERT(multi_use_entry != multi_use_blocks.end());
+			multi_use_entry->second = delta.remaining_references;
+			continue;
+		}
+		if (multi_use_entry != multi_use_blocks.end()) {
+			multi_use_blocks.erase(multi_use_entry);
+		}
+		if (delta.remaining_references == 1) {
+			continue;
+		}
+
+		newly_used_blocks.erase(delta.block_id);
+		switch (delta.target) {
+		case PreparedBlockModificationBatch::FinalDropTarget::MODIFIED: {
+			auto node = batch.staged_modified_nodes.extract(delta.block_id);
+			D_ASSERT(!node.empty());
+			auto insert_result = modified_blocks.insert(std::move(node));
+			D_ASSERT(insert_result.inserted);
+			(void)insert_result;
+			break;
+		}
+		case PreparedBlockModificationBatch::FinalDropTarget::FREE: {
+			auto node = batch.staged_free_nodes.extract(delta.block_id);
+			D_ASSERT(!node.empty());
+			auto insert_result = free_list.insert(std::move(node));
+			D_ASSERT(insert_result.inserted);
+			(void)insert_result;
+			break;
+		}
+		case PreparedBlockModificationBatch::FinalDropTarget::FREE_IN_USE: {
+			auto node = batch.staged_free_nodes.extract(delta.block_id);
+			D_ASSERT(!node.empty());
+			auto insert_result = free_blocks_in_use.insert(std::move(node));
+			D_ASSERT(insert_result.inserted);
+			(void)insert_result;
+			break;
+		}
+		case PreparedBlockModificationBatch::FinalDropTarget::NONE:
+			D_ASSERT(false);
+			break;
+		}
+	}
+
+	batch.applied = true;
+	batch.reservation_lock.unlock();
+	batch.block_lock.unlock();
+	batch.held_blocks.clear();
 }
 
 PreparedCheckpointBlockDropBatch
