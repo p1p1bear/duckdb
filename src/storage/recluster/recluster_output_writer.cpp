@@ -325,6 +325,7 @@ void ReclusterOutputWriter::CheckTask() const {
 	if (task.GetState() != RangeTaskState::PREPARING) {
 		throw InternalException("Recluster output writer observed an invalid task state");
 	}
+	task.GetTaskContext().InterruptCheck();
 }
 
 static vector<column_t> ReclusterPhysicalColumns(idx_t column_count) {

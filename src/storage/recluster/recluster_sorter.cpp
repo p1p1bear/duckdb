@@ -57,7 +57,7 @@ void ReclusterSorter::CheckTask() const {
 	if (task.GetState() != RangeTaskState::PREPARING) {
 		throw InternalException("Recluster sorter observed an invalid task state");
 	}
-	task_context.GetSnapshotContext().InterruptCheck();
+	task_context.InterruptCheck();
 }
 
 void ReclusterSorter::ResetSortResources() {

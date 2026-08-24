@@ -22,6 +22,7 @@ void ReclusterDeleteCatchup::CheckTask() const {
 	if (task.GetState() != RangeTaskState::CATCHING_UP_DELETES) {
 		throw InternalException("Recluster DELETE catch-up observed an invalid task state");
 	}
+	task.GetTaskContext().InterruptCheck();
 }
 
 ReclusterDeleteCatchupResult ReclusterDeleteCatchup::Run(idx_t max_slots, idx_t max_rowids) {

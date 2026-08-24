@@ -229,3 +229,32 @@ TEST_CASE("Recluster task start rejects a stale physical identity", "[storage][r
 	REQUIRE(state->GetReservedRanges().empty());
 	DeleteDatabase(path);
 }
+
+TEST_CASE("Explicit recluster reports an already active table task", "[storage][recluster_start]") {
+	auto path = TestCreatePath("recluster_explicit_already_running.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE start_db"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT start_db"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT start_db"));
+
+	auto candidate = SelectStartCandidate(con, "tbl", {4096, 2, 4, 0.25});
+	auto started = StartCandidate(con, "tbl", candidate);
+	REQUIRE(started.status == ReclusterTaskStartStatus::STARTED);
+	REQUIRE(started.task);
+
+	auto explicit_result =
+	    con.Query("SELECT tasks_completed, state FROM recluster('start_db.main.tbl', max_bytes='16MB', max_tasks=1)");
+	REQUIRE(explicit_result);
+	REQUIRE(CHECK_COLUMN(explicit_result, 0, {0}));
+	REQUIRE(CHECK_COLUMN(explicit_result, 1, {"ALREADY_RUNNING"}));
+
+	auto state = GetStartTestState(con, "tbl");
+	CleanupStartedTask(state, started.task);
+	DeleteDatabase(path);
+}

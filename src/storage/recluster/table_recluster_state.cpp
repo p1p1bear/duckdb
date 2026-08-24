@@ -196,4 +196,9 @@ vector<RowGroupRange> TableReclusterState::GetReservedRanges() const {
 	return result;
 }
 
+idx_t TableReclusterState::GetTaskCount() const {
+	lock_guard<mutex> guard(task_lock);
+	return tasks.size();
+}
+
 } // namespace duckdb

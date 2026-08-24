@@ -18,6 +18,7 @@
 #include "duckdb/storage/recluster/recluster_retirement.hpp"
 #include "duckdb/storage/recluster/recluster_wal_retention.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
 
@@ -26,6 +27,26 @@ class DataTable;
 class DuckTableEntry;
 class RangeTask;
 class TableReclusterState;
+
+enum class ReclusterExplicitState : uint8_t { COMPLETE, BUDGET_EXHAUSTED, NO_ELIGIBLE_RANGE, ALREADY_RUNNING, FAILED };
+
+struct ReclusterExplicitOptions {
+	bool create_checkpoint = false;
+	idx_t max_bytes = 0;
+	idx_t max_tasks = 0;
+};
+
+struct ReclusterExplicitResult {
+	string table_name;
+	idx_t tasks_completed = 0;
+	idx_t input_bytes = 0;
+	idx_t output_bytes = 0;
+	idx_t remaining_recluster_bytes = 0;
+	ReclusterExplicitState state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
+	string message;
+};
+
+const char *ReclusterExplicitStateToString(ReclusterExplicitState state);
 
 enum class ReclusterTaskStartStatus : uint8_t { STARTED, STALE_CANDIDATE, RANGE_UNAVAILABLE, CANCELLED };
 enum class ReclusterTaskFinalizeStatus : uint8_t { PUBLISHED, RETRY, STALE_TASK, CANCELLED };
@@ -56,8 +77,11 @@ public:
 	void InitializeCheckpointTables();
 	//! Called after WAL replay to synchronize the final recovered catalog without creating new candidates.
 	void SynchronizeLoadedCatalog();
-	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate);
+	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
+	                                      optional_ptr<ClientContext> driver_context = nullptr);
 	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
+	ReclusterExplicitResult RunExplicit(ClientContext &context, const QualifiedName &table_name,
+	                                    const ReclusterExplicitOptions &options);
 	ReclusterWALBlockRetention &GetWALBlockRetention() {
 		return wal_block_retention;
 	}

@@ -47,6 +47,10 @@ public:
 	unique_lock<mutex> LockFinalize() {
 		return unique_lock<mutex>(finalize_mutex);
 	}
+	unique_lock<mutex> TryLockExplicit() {
+		return unique_lock<mutex>(explicit_mutex, std::try_to_lock);
+	}
+	idx_t GetTaskCount() const;
 
 private:
 	struct RangeReservation {
@@ -60,6 +64,7 @@ private:
 private:
 	uint64_t initialization_token;
 	mutable mutex finalize_mutex;
+	mutable mutex explicit_mutex;
 	mutable mutex task_lock;
 	bool accept_new_tasks = false;
 	persistent_table_id_t table_id = hugeint_t(0, 0);

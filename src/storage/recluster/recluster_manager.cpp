@@ -2,24 +2,35 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_commit.hpp"
+#include "duckdb/storage/recluster/recluster_delete_catchup.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
+
+#include <chrono>
+#include <exception>
+#include <thread>
 
 namespace duckdb {
 
@@ -182,7 +193,137 @@ static recluster_task_id_t GenerateReclusterTaskId(TableReclusterState &state) {
 	throw InternalException("Failed to allocate a unique recluster task ID");
 }
 
-ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate) {
+const char *ReclusterExplicitStateToString(ReclusterExplicitState state) {
+	switch (state) {
+	case ReclusterExplicitState::COMPLETE:
+		return "COMPLETE";
+	case ReclusterExplicitState::BUDGET_EXHAUSTED:
+		return "BUDGET_EXHAUSTED";
+	case ReclusterExplicitState::NO_ELIGIBLE_RANGE:
+		return "NO_ELIGIBLE_RANGE";
+	case ReclusterExplicitState::ALREADY_RUNNING:
+		return "ALREADY_RUNNING";
+	case ReclusterExplicitState::FAILED:
+		return "FAILED";
+	default:
+		throw InternalException("Unknown explicit recluster state");
+	}
+}
+
+class ReclusterByteEstimateCollector : public BlockIdVisitor {
+public:
+	void Visit(block_id_t block_id) override {
+		if (block_id >= 0) {
+			blocks.insert(block_id);
+		}
+	}
+
+	void Add(const MetaBlockPointer &pointer) {
+		if (pointer.IsValid()) {
+			Visit(pointer.GetBlockId());
+		}
+	}
+
+	void Add(RowGroup &row_group) {
+		for (idx_t column_index = 0; column_index < row_group.GetColumnCount(); column_index++) {
+			row_group.GetRawColumnData(column_index).VisitBlockIds(*this);
+		}
+		for (auto &pointer : row_group.GetColumnStartPointers()) {
+			Add(pointer);
+		}
+		for (auto &pointer : row_group.GetExtraMetadataBlockPointers()) {
+			Add(pointer);
+		}
+		for (auto &pointer : row_group.GetDeleteStartPointers()) {
+			Add(pointer);
+		}
+		for (auto &pointer : row_group.GetLoadedDeleteStoragePointers()) {
+			Add(pointer);
+		}
+	}
+
+	idx_t GetByteSize(const BlockManager &block_manager) const {
+		auto block_size = block_manager.GetBlockAllocSize();
+		if (block_size != 0 && blocks.size() > NumericLimits<idx_t>::Maximum() / block_size) {
+			return NumericLimits<idx_t>::Maximum();
+		}
+		return blocks.size() * block_size;
+	}
+
+private:
+	unordered_set<block_id_t> blocks;
+};
+
+static idx_t AddReclusterBytes(idx_t left, idx_t right) {
+	if (right > NumericLimits<idx_t>::Maximum() - left) {
+		return NumericLimits<idx_t>::Maximum();
+	}
+	return left + right;
+}
+
+static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange &range) {
+	ReclusterByteEstimateCollector collector;
+	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot(), range);
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		collector.Add(*entry.row_group);
+	}
+	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+}
+
+static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block_id_t> &block_ids) {
+	ReclusterByteEstimateCollector collector;
+	for (auto block_id : block_ids) {
+		collector.Visit(block_id);
+	}
+	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+}
+
+static idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) {
+	auto current_sort_order = state.GetCurrentSortOrderId();
+	if (current_sort_order == INVALID_SORT_ORDER_ID) {
+		return 0;
+	}
+
+	vector<LayoutRowGroupEntry> row_groups;
+	bool has_old_organization = false;
+	idx_t current_run_count = 0;
+	sort_run_id_t previous_run_id = INVALID_SORT_RUN_ID;
+	bool previous_was_current = false;
+	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot());
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		auto metadata = entry.row_group->GetSortMetadata();
+		auto is_current = metadata.sort_order_id == current_sort_order;
+		if (!is_current) {
+			has_old_organization = true;
+		} else if (!previous_was_current || metadata.run_id != previous_run_id) {
+			current_run_count++;
+		}
+		previous_was_current = is_current;
+		previous_run_id = is_current ? metadata.run_id : INVALID_SORT_RUN_ID;
+		row_groups.push_back(entry);
+	}
+
+	ReclusterByteEstimateCollector collector;
+	auto include_current_runs = current_run_count > 1 || (has_old_organization && current_run_count > 0);
+	for (auto &row_group_entry : row_groups) {
+		auto &row_group = *row_group_entry.row_group;
+		auto is_current = row_group.GetSortMetadata().sort_order_id == current_sort_order;
+		auto physical_rows = row_group.count.load();
+		auto live_rows = row_group.GetCommittedRowCount();
+		auto needs_delete_cleanup =
+		    physical_rows > 0 && live_rows < physical_rows &&
+		    static_cast<long double>(physical_rows - live_rows) >= static_cast<long double>(physical_rows) * 0.25;
+		if (!is_current || include_current_runs || needs_delete_cleanup) {
+			collector.Add(row_group);
+		}
+	}
+	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+}
+
+ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
+                                                        optional_ptr<ClientContext> driver_context) {
 	auto &storage = table.GetStorage();
 	if (&storage.GetDataTableInfo()->GetDB() != &db) {
 		throw InternalException("Cannot start a recluster task through a different attached database");
@@ -222,7 +363,7 @@ ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, c
 		auto task_id = GenerateReclusterTaskId(*state);
 		auto task_context = make_uniq<ReclusterTaskContext>(
 		    metadata.table_id, state->GetInitializationToken(), std::move(*validated), *definition,
-		    std::move(physical_sort_indexes), storage.shared_from_this(), db);
+		    std::move(physical_sort_indexes), storage.shared_from_this(), db, driver_context);
 		task = make_shared_ptr<RangeTask>(task_id, std::move(task_context));
 		if (!state->TryRegisterTask(task)) {
 			return {ReclusterTaskStartStatus::RANGE_UNAVAILABLE, nullptr};
@@ -475,6 +616,233 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		}
 		throw;
 	}
+}
+
+static void CancelExplicitTask(TableReclusterState &state, const shared_ptr<RangeTask> &task) {
+	if (!task || !state.OwnsTask(task)) {
+		return;
+	}
+	std::exception_ptr cleanup_error;
+	task->RequestCancel();
+	if (task->TryEnterCancelling()) {
+		if (task->HasTaskContext() && task->GetTaskContext().HasOutput()) {
+			try {
+				task->GetTaskContext().GetOutput().Abort();
+			} catch (...) {
+				cleanup_error = std::current_exception();
+			}
+		}
+		if (task->HasTaskContext()) {
+			try {
+				task->GetTaskContext().CloseSnapshot();
+			} catch (...) {
+				if (!cleanup_error) {
+					cleanup_error = std::current_exception();
+				}
+			}
+		}
+		if (!task->TryDetach() && !cleanup_error) {
+			cleanup_error = std::make_exception_ptr(InternalException("Failed to detach an explicit recluster task"));
+		}
+	} else if (!task->IsFinished()) {
+		task->TryFail();
+	}
+	state.RemoveTask(task->GetTaskId());
+	if (cleanup_error) {
+		std::rethrow_exception(cleanup_error);
+	}
+}
+
+static ReclusterCandidateLimits ExplicitCandidateLimits(DataTable &storage, idx_t max_row_groups) {
+	auto row_group_size = storage.GetRowGroupSize();
+	auto max_rows = row_group_size > NumericLimits<idx_t>::Maximum() / max_row_groups ? NumericLimits<idx_t>::Maximum()
+	                                                                                  : row_group_size * max_row_groups;
+	return {max_rows, max_row_groups, 4, 0.25};
+}
+
+ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, const QualifiedName &table_name,
+                                                      const ReclusterExplicitOptions &options) {
+	if (options.max_bytes == 0 || options.max_tasks == 0) {
+		throw InvalidInputException("Explicit recluster budgets must be greater than zero");
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw TransactionException("CALL recluster cannot run inside an explicit transaction");
+	}
+	if (db.IsReadOnly()) {
+		throw PermissionException("Cannot recluster a read-only database");
+	}
+
+	auto &initial_table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
+	if (&initial_table.GetStorage().GetDataTableInfo()->GetDB() != &db) {
+		throw InternalException("Cannot explicitly recluster a table through a different attached database");
+	}
+	if (!initial_table.SortEnabled()) {
+		throw InvalidInputException("Table %s does not have SORTED BY enabled", table_name.ToString());
+	}
+	auto storage = initial_table.GetStorage().shared_from_this();
+	auto state = storage->GetDataTableInfo()->GetReclusterState();
+	if (!state) {
+		state = SynchronizeTable(initial_table);
+	}
+	if (!state) {
+		throw InternalException("SORTED BY table has no recluster state");
+	}
+
+	ReclusterExplicitResult result;
+	result.table_name = table_name.ToString();
+	result.state = ReclusterExplicitState::COMPLETE;
+	auto explicit_lock = state->TryLockExplicit();
+	if (!explicit_lock.owns_lock() || state->GetTaskCount() != 0) {
+		result.state = ReclusterExplicitState::ALREADY_RUNNING;
+		result.message = "another maintenance task is already active for this table";
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+		return result;
+	}
+
+	bool checkpoint_created = false;
+	idx_t stale_attempts = 0;
+	while (result.tasks_completed < options.max_tasks) {
+		context.InterruptCheck();
+		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
+		if (&table.GetStorage() != storage.get() || !table.SortEnabled() ||
+		    storage->GetDataTableInfo()->GetReclusterState().get() != state.get()) {
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the table definition changed while recluster was running";
+			break;
+		}
+
+		auto remaining_budget = options.max_bytes - result.input_bytes;
+		idx_t max_row_groups = 32;
+		ReclusterCandidateSelection selection;
+		idx_t candidate_bytes = 0;
+		while (true) {
+			auto limits = ExplicitCandidateLimits(*storage, max_row_groups);
+			selection = SelectReclusterCandidate(*storage->GetRowGroupCollection(), storage->Columns(), *state, limits);
+			if (!selection.candidate) {
+				break;
+			}
+			candidate_bytes = EstimateReclusterRangeBytes(*storage, selection.candidate->range);
+			if (candidate_bytes <= remaining_budget) {
+				break;
+			}
+			if (selection.candidate->row_group_count <= 1) {
+				selection.candidate.reset();
+				break;
+			}
+			max_row_groups = selection.candidate->row_group_count - 1;
+		}
+
+		if (!selection.candidate) {
+			result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+			if (candidate_bytes > remaining_budget || result.input_bytes >= options.max_bytes) {
+				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+				result.message = "the remaining byte budget cannot admit another row group";
+				break;
+			}
+			if (result.remaining_recluster_bytes == 0) {
+				result.state = ReclusterExplicitState::COMPLETE;
+				result.message = "no recluster work remains";
+				break;
+			}
+			if (!checkpoint_created && options.create_checkpoint &&
+			    selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE) {
+				TransactionManager::Get(db).Checkpoint(context, false);
+				checkpoint_created = true;
+				continue;
+			}
+			result.state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
+			result.message = selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT
+			                     ? "the next sorted run exceeds the per-task row-group limit"
+			                     : "remaining work is waiting for a successful checkpoint";
+			break;
+		}
+
+		auto start = TryStartTask(table, *selection.candidate, context);
+		if (start.status != ReclusterTaskStartStatus::STARTED || !start.task) {
+			if (start.status == ReclusterTaskStartStatus::RANGE_UNAVAILABLE) {
+				result.state = ReclusterExplicitState::ALREADY_RUNNING;
+				result.message = "the selected range is already being maintained";
+				break;
+			}
+			if (++stale_attempts < 8) {
+				continue;
+			}
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the table changed repeatedly while selecting recluster work";
+			break;
+		}
+		stale_attempts = 0;
+
+		try {
+			ReclusterOutputWriter writer(*start.task);
+			writer.Write();
+			if (!start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES)) {
+				throw InternalException("Failed to begin explicit recluster DELETE catch-up");
+			}
+			while (start.task->GetState() == RangeTaskState::CATCHING_UP_DELETES) {
+				ReclusterDeleteCatchup catchup(*start.task);
+				catchup.Run();
+			}
+			auto task_output_bytes =
+			    EstimateReclusterOutputBytes(*storage, start.task->GetTaskContext().GetOutput().GetBlockIds());
+
+			auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (true) {
+				context.InterruptCheck();
+				auto finalize_status = FinalizeTask(table, start.task);
+				if (finalize_status == ReclusterTaskFinalizeStatus::PUBLISHED) {
+					break;
+				}
+				if (finalize_status != ReclusterTaskFinalizeStatus::RETRY) {
+					throw IOException("Explicit recluster task could not publish its replacement layout");
+				}
+				if (std::chrono::steady_clock::now() >= retry_deadline) {
+					throw IOException("Explicit recluster timed out waiting for concurrent DELETE transactions");
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			result.tasks_completed++;
+			result.input_bytes = AddReclusterBytes(result.input_bytes, candidate_bytes);
+			result.output_bytes = AddReclusterBytes(result.output_bytes, task_output_bytes);
+		} catch (...) {
+			auto error = std::current_exception();
+			CancelExplicitTask(*state, start.task);
+			try {
+				std::rethrow_exception(error);
+			} catch (InterruptException &) {
+				throw;
+			} catch (FatalException &) {
+				throw;
+			} catch (DataCorruptionException &) {
+				throw;
+			} catch (SerializationException &) {
+				throw;
+			} catch (InternalException &) {
+				throw;
+			} catch (std::exception &ex) {
+				result.state = ReclusterExplicitState::FAILED;
+				result.message = ex.what();
+				break;
+			}
+		}
+	}
+
+	result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+	if (result.state == ReclusterExplicitState::FAILED || result.state == ReclusterExplicitState::ALREADY_RUNNING ||
+	    result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE) {
+		return result;
+	}
+	if (result.remaining_recluster_bytes == 0) {
+		result.state = ReclusterExplicitState::COMPLETE;
+		result.message = "no recluster work remains";
+	} else if (result.tasks_completed >= options.max_tasks) {
+		result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+		result.message = "the task budget was exhausted";
+	} else if (result.input_bytes >= options.max_bytes) {
+		result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+		result.message = "the byte budget was exhausted";
+	}
+	return result;
 }
 
 } // namespace duckdb

@@ -27,7 +27,8 @@ class ReclusterTaskContext {
 public:
 	ReclusterTaskContext(persistent_table_id_t table_id, uint64_t initialization_token, ReclusterCandidate candidate,
 	                     SortOrderDefinition sort_definition, vector<idx_t> physical_sort_indexes,
-	                     shared_ptr<DataTable> storage, AttachedDatabase &db);
+	                     shared_ptr<DataTable> storage, AttachedDatabase &db,
+	                     optional_ptr<ClientContext> driver_context = nullptr);
 	~ReclusterTaskContext();
 
 	persistent_table_id_t GetTableId() const {
@@ -60,6 +61,7 @@ public:
 	bool HasActiveSnapshot() const;
 	ClientContext &GetSnapshotContext();
 	DuckTransaction &GetSnapshotTransaction();
+	void InterruptCheck() const;
 	void CloseSnapshot();
 	bool HasOutput() const {
 		return output != nullptr;
@@ -79,6 +81,7 @@ private:
 	RowIdRemapStore row_id_remap;
 	shared_ptr<AttachedDatabase> db;
 	unique_ptr<Connection> snapshot_connection;
+	optional_ptr<ClientContext> driver_context;
 	transaction_t snapshot_start_time;
 	unique_ptr<ReclusterOutput> output;
 };

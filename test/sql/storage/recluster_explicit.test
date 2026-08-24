@@ -1,0 +1,151 @@
+# name: test/sql/storage/recluster_explicit.test
+# description: Explicitly recluster checkpointed SORTED BY table ranges
+# group: [storage]
+
+statement ok
+SET threads=1
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown
+
+statement ok
+SET debug_skip_checkpoint_on_commit=true
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE r
+
+statement ok
+CREATE TABLE plain(i INTEGER)
+
+statement error
+CALL recluster('r.main.plain')
+----
+<REGEX>:.*does not have SORTED BY enabled.*
+
+statement ok
+CREATE TABLE events(k INTEGER, payload BIGINT)
+
+statement ok
+INSERT INTO events SELECT ((i * 37) % 4096)::INTEGER, i FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE events SET SORTED BY (k)
+
+# SET changes the active rule and clears the preceding checkpoint snapshot.
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.events', create_checkpoint=false)
+----
+0	NO_ELIGIBLE_RANGE
+
+# One explicit call may create at most one checkpoint and then consume its candidate.
+query TIIIITT
+SELECT table_name, tasks_completed, (input_bytes > 0)::INTEGER, (output_bytes > 0)::INTEGER,
+       remaining_recluster_bytes, state, message
+FROM recluster('r.main.events', create_checkpoint=true, max_tasks=1)
+----
+r.main.events	1	1	1	0	COMPLETE	no recluster work remains
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM events
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM events
+----
+4096	8386560
+
+statement ok
+CREATE TABLE budgeted(k INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO budgeted SELECT (4095 - i)::INTEGER, repeat('x', 32) FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE budgeted SET SORTED BY (k)
+
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.budgeted', max_bytes='1B')
+----
+0	BUDGET_EXHAUSTED
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.budgeted', max_bytes='16MB', max_tasks=1)
+----
+1	COMPLETE
+
+statement error
+CALL recluster('r.main.events', max_tasks=0)
+----
+<REGEX>:.*max_tasks must be greater than zero.*
+
+statement error
+CALL recluster('r.main.events', max_bytes='-1MB')
+----
+<REGEX>:.*max_bytes must be a positive byte size.*
+
+statement ok
+BEGIN
+
+statement error
+CALL recluster('r.main.events')
+----
+<REGEX>:.*cannot run inside an explicit transaction.*
+
+statement ok
+ROLLBACK
+
+# Reopen with the maintenance WAL still present and verify replayed layouts.
+statement ok
+USE memory
+
+restart
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r
+
+statement ok
+USE r
+
+query II
+SELECT count(*), sum(payload) FROM events
+----
+4096	8386560
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM budgeted
+) WHERE k < previous_k
+----
+0
+
+statement ok
+CHECKPOINT r
+
+statement ok
+USE memory
+
+statement ok
+DETACH r
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r (READ_ONLY)
+
+statement error
+CALL recluster('r.main.events')
+----
+<REGEX>:.*Cannot recluster a read-only database.*
