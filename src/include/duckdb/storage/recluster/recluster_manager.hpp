@@ -25,7 +25,10 @@ namespace duckdb {
 class AttachedDatabase;
 class DataTable;
 class DuckTableEntry;
+struct ProducerToken;
 class RangeTask;
+class ReclusterAutoTask;
+struct ReclusterAutoSchedulerState;
 class TableReclusterState;
 
 enum class ReclusterExplicitState : uint8_t { COMPLETE, BUDGET_EXHAUSTED, NO_ELIGIBLE_RANGE, ALREADY_RUNNING, FAILED };
@@ -68,6 +71,7 @@ struct PendingCheckpointTableState {
 class ReclusterManager {
 public:
 	explicit ReclusterManager(AttachedDatabase &db);
+	~ReclusterManager();
 
 	uint64_t BeginCheckpoint();
 	optional<PendingCheckpointTableState> PrepareCheckpoint(DuckTableEntry &table, uint64_t checkpoint_number);
@@ -82,6 +86,12 @@ public:
 	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
 	ReclusterExplicitResult RunExplicit(ClientContext &context, const QualifiedName &table_name,
 	                                    const ReclusterExplicitOptions &options);
+	//! Coalesces a commit/checkpoint wake-up into one background scheduler task.
+	void RequestAutoRecluster() noexcept;
+	//! Stops accepting automatic work and drains any queued/running task before database close.
+	void StopAutoRecluster() noexcept;
+	//! Drains this manager's background work. Used by shutdown and deterministic tests.
+	void WaitForAutoRecluster();
 	ReclusterWALBlockRetention &GetWALBlockRetention() {
 		return wal_block_retention;
 	}
@@ -100,6 +110,13 @@ public:
 	}
 
 private:
+	friend class ReclusterAutoTask;
+
+	void InitializeAutoScheduler();
+	void RunAutoReclusterPass() noexcept;
+	void FinishAutoReclusterTask() noexcept;
+	void ScheduleAutoReclusterTask() noexcept;
+	bool AutoReclusterEnabled() const noexcept;
 	shared_ptr<TableReclusterState> SynchronizeTable(DuckTableEntry &table);
 	uint64_t AllocateInitializationToken();
 
@@ -107,6 +124,8 @@ private:
 	AttachedDatabase &db;
 	ReclusterWALBlockRetention wal_block_retention;
 	ReclusterRetirementRegistry retirement_registry;
+	shared_ptr<ReclusterAutoSchedulerState> auto_scheduler_state;
+	unique_ptr<ProducerToken> auto_scheduler_producer;
 	mutex queue_lock;
 	StorageLock layout_publish_lock;
 	unordered_map<persistent_table_id_t, weak_ptr<TableReclusterState>> tables;

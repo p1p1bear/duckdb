@@ -172,6 +172,13 @@
         "default_value": "100000"
     },
     {
+        "name": "auto_recluster",
+        "description": "Automatically schedule SORTED BY reclustering after successful commits and checkpoints",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "true"
+    },
+    {
         "name": "autoinstall_extension_repository",
         "description": "Overrides the custom endpoint for extension installation on autoloading",
         "type": "VARCHAR",

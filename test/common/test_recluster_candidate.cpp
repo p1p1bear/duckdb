@@ -59,6 +59,7 @@ TEST_CASE("Recluster candidates convert the earliest checkpointed inputs", "[sto
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE candidate_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -113,6 +114,7 @@ TEST_CASE("Recluster candidates preserve runs and prioritize delete cleanup", "[
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE candidate_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));

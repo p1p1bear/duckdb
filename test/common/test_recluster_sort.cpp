@@ -50,6 +50,7 @@ TEST_CASE("Recluster sorter orders snapshot rows and builds the row ID remap", "
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS sort_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE sort_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k1 INTEGER, k2 VARCHAR, payload BIGINT)"));
@@ -105,6 +106,7 @@ TEST_CASE("Recluster sorter handles a snapshot with no live rows", "[storage][re
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(
 	    con.Query("ATTACH '" + path + "' AS sort_empty_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE sort_empty_db"));

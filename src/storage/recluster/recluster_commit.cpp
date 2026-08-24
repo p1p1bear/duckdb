@@ -50,6 +50,7 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_pt
 	retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
 	    storage->GetRowGroupCollection(), old_layout, task->GetRange());
 	auto &output = task->GetTaskContext().GetOutput();
+	output.GetManifest().VerifySeal();
 	auto &manager = storage->GetAttached().GetReclusterManager();
 	auto &attached = storage->GetAttached();
 	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL()) {
@@ -121,6 +122,7 @@ void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) const {
 		throw InternalException("Cannot write an applied recluster commit to the WAL");
 	}
 	auto &manifest = task->GetTaskContext().GetOutput().GetManifest();
+	manifest.VerifySeal();
 	auto delete_chunk_count = final_deleted_new_rowids.empty()
 	                              ? 0
 	                              : NumericCast<uint32_t>((final_deleted_new_rowids.size() + STANDARD_VECTOR_SIZE - 1) /

@@ -212,6 +212,7 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS output_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE output_db"));
 	REQUIRE_NO_FAIL(
@@ -354,6 +355,7 @@ TEST_CASE("Recluster output supports an empty replacement", "[storage][recluster
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(
 	    con.Query("ATTACH '" + path + "' AS output_empty_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE output_empty_db"));
@@ -401,6 +403,7 @@ TEST_CASE("Recluster DELETE catch-up persists resolved journal prefixes", "[stor
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS catchup_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE catchup_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload BIGINT)"));
@@ -514,6 +517,7 @@ TEST_CASE("Recluster DELETE catch-up skips rows absent from an empty replacement
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(
 	    con.Query("ATTACH '" + path + "' AS catchup_empty_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE catchup_empty_db"));
@@ -563,6 +567,7 @@ TEST_CASE("Recluster committed DELETE metadata spans task-private blocks", "[sto
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(
 	    con.Query("ATTACH '" + path + "' AS delete_blocks_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE delete_blocks_db"));
@@ -626,6 +631,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE finalize_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload BIGINT)"));
@@ -757,6 +763,7 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(
 		    con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 		REQUIRE_NO_FAIL(con.Query("USE finalize_db"));
@@ -805,6 +812,7 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
 		REQUIRE(rows);
 		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
@@ -832,6 +840,7 @@ static CommittedReclusterWAL CreateCommittedReclusterWAL(const string &path, boo
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		REQUIRE_NO_FAIL(
 		    con.Query("ATTACH '" + path + "' AS finalize_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
@@ -917,6 +926,7 @@ static void CheckRecoveredRecluster(const string &path, bool payload_deleted, la
                                     idx_t expected_patch_count) {
 	DuckDB db(path);
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	CheckRecoveredRecluster(con, payload_deleted, expected_version, expected_patch_count);
 }
 
@@ -940,6 +950,7 @@ static idx_t AppendReclusterWAL(const string &path, const WALReclusterEntry &hea
                                 bool commit) {
 	DuckDB db(path);
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 	if (checkpoint_before) {
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
@@ -1019,6 +1030,7 @@ TEST_CASE("Recluster WAL recovery applies a committed replacement", "[storage][r
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		auto &attached = GetReclusterDatabase(db, con);
 		auto &retention = attached.GetReclusterManager().GetWALBlockRetention();
@@ -1044,6 +1056,7 @@ TEST_CASE("Recluster WAL recovery reads protected blocks through MMAP",
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS recovery_db (IO_MODE 'MMAP', MMAP_RESERVE_SIZE '1GB')"));
 		REQUIRE_NO_FAIL(con.Query("USE recovery_db"));
 		CheckRecoveredRecluster(con, true, 1, 1);
@@ -1062,6 +1075,7 @@ TEST_CASE("Recluster WAL recovery ignores a torn maintenance transaction",
 		config.options.access_mode = AccessMode::READ_ONLY;
 		DuckDB db(path, &config);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		auto &attached = GetReclusterDatabase(db, con);
 		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 1);
 		CheckReclusterBlocksReserved(attached, wal, true);
@@ -1072,6 +1086,7 @@ TEST_CASE("Recluster WAL recovery ignores a torn maintenance transaction",
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		auto &attached = GetReclusterDatabase(db, con);
 		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 0);
@@ -1111,6 +1126,7 @@ TEST_CASE("Recluster WAL recovery fails if torn tail cleanup is not durable",
 		{
 			DuckDB db(path);
 			Connection con(db);
+			REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 			REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 			CheckRecoveredRecluster(con, true, 0, 0);
 			REQUIRE(GetReclusterWALFileSize(path) == wal.previous_flush_end);
@@ -1138,6 +1154,7 @@ TEST_CASE("Recluster WAL recovery rolls back replacement ownership after commit 
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		auto &attached = GetReclusterDatabase(db, con);
 		REQUIRE(attached.GetReclusterManager().GetWALBlockRetention().Count() == 1);
@@ -1156,6 +1173,7 @@ TEST_CASE("Recluster WAL recovery ignores an invalid uncommitted manifest",
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		CheckRecoveredRecluster(con, false, 1, 1);
 		REQUIRE(GetReclusterWALFileSize(path) == previous_flush_end);
@@ -1170,6 +1188,7 @@ TEST_CASE("Recluster WAL recovery skips a checkpointed replacement", "[storage][
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		auto &attached = GetReclusterDatabase(db, con);
 		auto &retention = attached.GetReclusterManager().GetWALBlockRetention();
@@ -1190,6 +1209,7 @@ TEST_CASE("Recluster WAL recovery rejects an unknown persistent table ID",
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		REQUIRE_NO_FAIL(con.Query("DROP TABLE tbl"));
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));

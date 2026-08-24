@@ -36,6 +36,7 @@ namespace duckdb {
 
 ReclusterManager::ReclusterManager(AttachedDatabase &db_p)
     : db(db_p), wal_block_retention(db_p), retirement_registry(db_p) {
+	InitializeAutoScheduler();
 }
 
 uint64_t ReclusterManager::AllocateInitializationToken() {
@@ -104,6 +105,7 @@ optional<PendingCheckpointTableState> ReclusterManager::PrepareCheckpoint(DuckTa
 }
 
 void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &&states) noexcept {
+	bool installed_snapshot = false;
 	for (auto &pending : states) {
 		if (!pending.storage || !pending.storage->IsMainTable()) {
 			continue;
@@ -118,8 +120,11 @@ void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &
 		if (storage_generation_id != pending.candidate_snapshot.storage_generation_id) {
 			continue;
 		}
-		pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
-		                                            std::move(pending.candidate_snapshot));
+		installed_snapshot |= pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
+		                                                                  std::move(pending.candidate_snapshot));
+	}
+	if (installed_snapshot) {
+		RequestAutoRecluster();
 	}
 }
 
@@ -698,6 +703,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
 		return result;
 	}
+	auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 
 	bool checkpoint_created = false;
 	idx_t stale_attempts = 0;

@@ -9,6 +9,7 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/read_stream.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -222,12 +223,33 @@ static vector<row_t> ValidateWALTransaction(const PendingReclusterWALTransaction
 
 static void ValidateManifest(const WALReclusterEntry &header, const ReplacementManifest &manifest,
                              const vector<row_t> &final_deleted_new_rowids, const vector<block_id_t> &manifest_blocks) {
-	if (manifest.payload_size != header.manifest_size || manifest.checksum != header.manifest_checksum ||
-	    manifest.header.table_id != header.table_id || manifest.header.task_id != header.task_id ||
-	    manifest.header.input_range.start != header.range_start ||
-	    manifest.header.input_range.end != header.range_end ||
-	    header.journal_resolved_through < manifest.header.last_applied_delete_sequence) {
-		throw DataCorruptionException("Recluster WAL header does not match its replacement manifest");
+	const char *mismatch = nullptr;
+	if (manifest.payload_size != header.manifest_size) {
+		throw DataCorruptionException(
+		    "Recluster WAL header does not match its replacement manifest: payload size %llu does not match %llu at "
+		    "block %lld (header table %s task %s, disk table %s task %s revision %llu)",
+		    header.manifest_size, manifest.payload_size, header.manifest_pointer.GetBlockId(),
+		    UUID::ToString(header.table_id), UUID::ToString(header.task_id), UUID::ToString(manifest.header.table_id),
+		    UUID::ToString(manifest.header.task_id), manifest.header.manifest_revision);
+	} else if (manifest.checksum != header.manifest_checksum) {
+		throw DataCorruptionException(
+		    "Recluster WAL header does not match its replacement manifest: checksum at block %lld (header table %s "
+		    "task %s, disk table %s task %s revision %llu)",
+		    header.manifest_pointer.GetBlockId(), UUID::ToString(header.table_id), UUID::ToString(header.task_id),
+		    UUID::ToString(manifest.header.table_id), UUID::ToString(manifest.header.task_id),
+		    manifest.header.manifest_revision);
+	} else if (manifest.header.table_id != header.table_id) {
+		mismatch = "table ID";
+	} else if (manifest.header.task_id != header.task_id) {
+		mismatch = "task ID";
+	} else if (manifest.header.input_range.start != header.range_start ||
+	           manifest.header.input_range.end != header.range_end) {
+		mismatch = "input range";
+	} else if (header.journal_resolved_through < manifest.header.last_applied_delete_sequence) {
+		mismatch = "DELETE journal sequence";
+	}
+	if (mismatch) {
+		throw DataCorruptionException("Recluster WAL header does not match its replacement manifest: %s", mismatch);
 	}
 	for (auto block_id : manifest.all_referenced_blocks) {
 		if (std::find(manifest_blocks.begin(), manifest_blocks.end(), block_id) != manifest_blocks.end()) {

@@ -386,6 +386,9 @@ void AttachedDatabase::Close(const DatabaseCloseAction action) {
 	}
 	D_ASSERT(catalog);
 	is_closed = true;
+	if (recluster_manager) {
+		recluster_manager->StopAutoRecluster();
+	}
 
 	try {
 		auto create_checkpoint = true;

@@ -19,6 +19,7 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/checkpoint/checkpoint_options.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -330,12 +331,14 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// check if we can checkpoint
 	unique_ptr<StorageLockKey> lock;
 	auto undo_properties = transaction.GetUndoProperties();
+	auto trigger_auto_recluster = transaction.ChangesMade();
 	auto checkpoint_decision =
 	    error.HasError() ? CheckpointDecision(error.Message()) : CanCheckpoint(transaction, lock, undo_properties);
 	unique_lock<mutex> held_wal_lock;
 	unique_ptr<StorageCommitState> commit_state;
 	bool skip_wal_write_due_to_checkpoint = false;
 	bool wal_written = false;
+	bool checkpoint_failed = false;
 	if (checkpoint_decision.can_checkpoint) {
 		// we can perform an automatic checkpoint
 		// we have two options:
@@ -488,12 +491,17 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		try {
 			storage_manager.CreateCheckpoint(context, options);
 		} catch (std::exception &ex) {
+			checkpoint_failed = true;
 			if (wal_written) {
 				context.transaction.SetAutocheckpointError(BuildAutocheckpointError(db, ex));
 			} else {
 				error.Merge(ErrorData(ex));
 			}
 		}
+	}
+	if (!error.HasError() && !checkpoint_failed && trigger_auto_recluster && db.HasReclusterManager() &&
+	    db.GetStorageManager().IsLoaded()) {
+		db.GetReclusterManager().RequestAutoRecluster();
 	}
 
 	return error;

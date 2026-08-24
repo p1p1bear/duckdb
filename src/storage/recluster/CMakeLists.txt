@@ -3,6 +3,7 @@ add_library_unity(
   OBJECT
   checkpoint_snapshot.cpp
   recluster_candidate.cpp
+  recluster_auto_scheduler.cpp
   recluster_commit.cpp
   recluster_delete_catchup.cpp
   recluster_delete_journal.cpp

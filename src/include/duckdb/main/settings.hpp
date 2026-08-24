@@ -349,6 +349,17 @@ struct AutoCheckpointSkipWalThresholdSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct AutoReclusterSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "auto_recluster";
+	static constexpr const char *Description =
+	    "Automatically schedule SORTED BY reclustering after successful commits and checkpoints";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct AutoinstallExtensionRepositorySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "autoinstall_extension_repository";

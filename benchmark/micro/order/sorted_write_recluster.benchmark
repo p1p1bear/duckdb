@@ -10,6 +10,7 @@ require_reinit
 
 load
 SET debug_skip_checkpoint_on_commit=true;
+SET auto_recluster=false;
 CREATE TABLE source AS
 SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
        ((i * 97) % 10000)::INTEGER AS tenant_id,

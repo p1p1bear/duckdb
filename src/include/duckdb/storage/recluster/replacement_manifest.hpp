@@ -54,6 +54,7 @@ struct ReplacementManifest {
 	uint64_t checksum = 0;
 
 	void Seal();
+	void VerifySeal() const;
 	void Write(WriteStream &stream) const;
 	static ReplacementManifest Read(ReadStream &stream);
 	void Validate() const;

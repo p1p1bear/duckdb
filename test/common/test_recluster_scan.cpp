@@ -65,6 +65,7 @@ TEST_CASE("Recluster range scans use the STARTING snapshot and include old row I
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS scan_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE scan_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER, s VARCHAR)"));

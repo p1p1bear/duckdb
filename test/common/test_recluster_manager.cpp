@@ -4,7 +4,9 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
 #include "test_helpers.hpp"
 
 using namespace duckdb; // NOLINT
@@ -18,6 +20,16 @@ static duckdb::shared_ptr<TableReclusterState> GetReclusterState(Connection &con
 	return result;
 }
 
+static ReclusterManager &GetReclusterManager(Connection &con, const string &table_name) {
+	ReclusterManager *result = nullptr;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		result = &entry.GetStorage().GetAttached().GetReclusterManager();
+	});
+	REQUIRE(result);
+	return *result;
+}
+
 TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage][recluster_manager]") {
 	auto path = TestCreatePath("recluster_manager_checkpoint.db");
 	DeleteDatabase(path);
@@ -26,6 +38,7 @@ TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage]
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(
 		    con.Query("ATTACH '" + path + "' AS manager_test (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 		REQUIRE_NO_FAIL(con.Query("USE manager_test"));
@@ -56,6 +69,7 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("SET checkpoint_threshold = '10 GB'"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		REQUIRE_NO_FAIL(
@@ -73,6 +87,7 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS recovered"));
 		REQUIRE_NO_FAIL(con.Query("USE recovered"));
 
@@ -109,6 +124,175 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 			wal_rows += row_group.count;
 		}
 		REQUIRE(wal_rows == 2048);
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Successful checkpoints schedule automatic recluster work", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_checkpoint.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS auto_checkpoint (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE auto_checkpoint"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_checkpoint"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_checkpoint"));
+
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	auto inversions =
+	    con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('auto_checkpoint.main.tbl')");
+	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"COMPLETE"}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Maintenance commits chain automatic work across task limits", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_task_chain.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS auto_chain (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE auto_chain"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 69999 - i FROM range(70000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_chain"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_chain"));
+
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto layout = entry.GetStorage().GetRowGroupCollection()->GetCurrentLayout();
+		REQUIRE(layout);
+		REQUIRE(layout->layout_version == 2);
+		REQUIRE(layout->patches.size() == 2);
+		REQUIRE(layout->patches[0]->range.end == layout->patches[1]->range.start);
+	});
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Commits wake automatic recluster after it is enabled", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_commit.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS auto_commit (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE auto_commit"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_commit"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_commit"));
+
+	auto &manager = GetReclusterManager(con, "tbl");
+	manager.WaitForAutoRecluster();
+	auto before =
+	    con.Query("SELECT count(*) > 0 FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(before, 0, {true}));
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	manager.WaitForAutoRecluster();
+	auto after = con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(after, 0, {0}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Database close drains automatic recluster work", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_close.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+		REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS auto_close (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE auto_close"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_close"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_close"));
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+	}
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS auto_close"));
+		REQUIRE_NO_FAIL(con.Query("USE auto_close"));
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_close"));
+		auto rows = con.Query("SELECT count(*), sum(i) FROM tbl");
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recovered checkpoint snapshots wait for a new checkpoint before automatic work",
+          "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_recovery_snapshot.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+		REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS auto_recovery (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE auto_recovery"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_recovery"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_recovery"));
+		GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	}
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+		REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS auto_recovery"));
+		REQUIRE_NO_FAIL(con.Query("USE auto_recovery"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+		auto &manager = GetReclusterManager(con, "tbl");
+		manager.WaitForAutoRecluster();
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto layout = entry.GetStorage().GetRowGroupCollection()->GetCurrentLayout();
+			REQUIRE(layout);
+			REQUIRE(layout->layout_version == 1);
+			REQUIRE(layout->patches.size() == 1);
+		});
+
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_recovery"));
+		manager.WaitForAutoRecluster();
+		auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('auto_recovery.main.tbl')");
+		REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
+		REQUIRE(CHECK_COLUMN(remaining, 1, {"COMPLETE"}));
 	}
 	DeleteDatabase(path);
 }

@@ -61,6 +61,7 @@ TEST_CASE("User DELETE commits exact row IDs to recluster tasks", "[storage][rec
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(setup.Query("ATTACH '" + path + "' AS delete_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(setup.Query("USE delete_db"));
 	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -118,6 +119,7 @@ TEST_CASE("Recluster journal exhaustion cancels only the background task", "[sto
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS delete_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE delete_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));
@@ -152,6 +154,7 @@ TEST_CASE("Commit preflight restores sorted table write gates", "[storage][reclu
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS preflight_db (STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE preflight_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));

@@ -587,6 +587,7 @@ TEST_CASE("Checkpoint materializes the current row group layout", "[storage][row
 	{
 		DuckDB db;
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		REQUIRE_NO_FAIL(
 		    con.Query("ATTACH '" + path + "' AS layout_checkpoint (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 		REQUIRE_NO_FAIL(con.Query("USE layout_checkpoint"));

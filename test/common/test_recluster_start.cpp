@@ -70,6 +70,7 @@ TEST_CASE("Recluster task start revalidates and registers a read snapshot", "[st
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE start_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -115,6 +116,7 @@ TEST_CASE("Recluster task start waits for writers before taking its snapshot", "
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(setup.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(setup.Query("USE start_db"));
 	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -155,6 +157,7 @@ TEST_CASE("Recluster task start releases the table gate while a checkpoint is pe
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(setup.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(setup.Query("USE start_db"));
 	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -207,6 +210,7 @@ TEST_CASE("Recluster task start rejects a stale physical identity", "[storage][r
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE start_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
@@ -235,6 +239,7 @@ TEST_CASE("Explicit recluster reports an already active table task", "[storage][
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS start_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE start_db"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
