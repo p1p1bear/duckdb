@@ -792,6 +792,10 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 
 	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
 	collection->PublishLayout(collection->BuildPatchedLayout(10, MakeEmptyReplacementPatch(0, first->GetCount(), 1)));
+	auto source_row_group = collection->GetRowGroup(1);
+	REQUIRE(source_row_group);
+	auto source_i_ownership = source_row_group->GetColumnDropOwnershipBundle(0);
+	auto source_j_ownership = source_row_group->GetColumnDropOwnershipBundle(1);
 
 	auto scan_column = [&](RowGroupCollection &source, StorageIndex column_id, const LogicalType &type) {
 		duckdb::vector<Value> result;
@@ -824,6 +828,12 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	REQUIRE(added->HasLayoutHistory());
 	REQUIRE(added->GetCurrentLayout()->layout_version == 1);
 	REQUIRE(added->GetCurrentLayout()->patches.empty());
+	auto added_row_group = added->GetRowGroup(0);
+	REQUIRE(added_row_group);
+	REQUIRE(added_row_group->GetColumnDropOwnershipBundle(0) == source_i_ownership);
+	REQUIRE(added_row_group->GetColumnDropOwnershipBundle(1) == source_j_ownership);
+	REQUIRE(added_row_group->GetColumnDropOwnershipBundle(2) != source_i_ownership);
+	REQUIRE(added_row_group->GetColumnDropOwnershipBundle(2) != source_j_ownership);
 	auto added_values = scan_column(*added, StorageIndex(0), LogicalType::INTEGER);
 	REQUIRE(added_values.size() == remaining_rows);
 	REQUIRE(added_values.front() == Value::INTEGER(NumericCast<int32_t>(first->GetCount())));
@@ -839,6 +849,9 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	REQUIRE(removed->HasLayoutHistory());
 	REQUIRE(removed->GetCurrentLayout()->layout_version == 1);
 	REQUIRE(removed->GetCurrentLayout()->patches.empty());
+	auto removed_row_group = removed->GetRowGroup(0);
+	REQUIRE(removed_row_group);
+	REQUIRE(removed_row_group->GetColumnDropOwnershipBundle(0) == source_i_ownership);
 	auto removed_values = scan_column(*removed, StorageIndex(0), LogicalType::INTEGER);
 	REQUIRE(removed_values.size() == remaining_rows);
 	REQUIRE(removed_values.front() == Value::INTEGER(NumericCast<int32_t>(first->GetCount())));
@@ -853,6 +866,10 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	REQUIRE(changed->HasLayoutHistory());
 	REQUIRE(changed->GetCurrentLayout()->layout_version == 1);
 	REQUIRE(changed->GetCurrentLayout()->patches.empty());
+	auto changed_row_group = changed->GetRowGroup(0);
+	REQUIRE(changed_row_group);
+	REQUIRE(changed_row_group->GetColumnDropOwnershipBundle(0) != source_i_ownership);
+	REQUIRE(changed_row_group->GetColumnDropOwnershipBundle(1) == source_j_ownership);
 	auto changed_values = scan_column(*changed, StorageIndex(0), LogicalType::BIGINT);
 	REQUIRE(changed_values.size() == remaining_rows);
 	REQUIRE(changed_values.front() == Value::BIGINT(NumericCast<int64_t>(first->GetCount())));

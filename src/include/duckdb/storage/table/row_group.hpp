@@ -26,6 +26,7 @@ namespace duckdb {
 class AttachedDatabase;
 class BlockManager;
 class ColumnData;
+class ColumnDropOwnershipBundle;
 class DatabaseInstance;
 class DataTable;
 class DuckTableEntry;
@@ -113,6 +114,8 @@ private:
 	shared_ptr<RowVersionManager> owned_version_info;
 	//! The column data of the row_group (mutable because `const` can lazily load)
 	mutable vector<shared_ptr<ColumnData>> columns;
+	//! Runtime ownership identity for each top-level column's concrete storage tree.
+	vector<shared_ptr<ColumnDropOwnershipBundle>> column_drop_ownership_bundles;
 
 public:
 	void MoveToCollection(RowGroupCollection &collection);
@@ -267,6 +270,7 @@ public:
 	//! Direct accessors, fall outside of general use but can be useful to some extensions
 	ColumnData &GetRawColumnData(const StorageIndex &c) const;
 	ColumnData &GetRawColumnData(storage_t c) const;
+	const shared_ptr<ColumnDropOwnershipBundle> &GetColumnDropOwnershipBundle(idx_t column_index) const;
 
 private:
 	//! Registers prefetch candidates for the next row_count rows, returns false when prefetching is not supported
@@ -293,7 +297,10 @@ private:
 	void UnloadColumn(storage_t c);
 	bool HasUnchangedColumns() const;
 	static shared_ptr<ColumnData> CheckpointColumn(const RowGroup &row_group, idx_t column_idx, RowGroupWriteInfo &info,
-	                                               RowGroupWriteData &write_data);
+	                                               RowGroupWriteData &write_data,
+	                                               shared_ptr<ColumnDropOwnershipBundle> &result_bundle);
+	static shared_ptr<ColumnDropOwnershipBundle> InitializeColumnDropOwnership(ColumnData &column);
+	static void BindColumnDropOwnership(ColumnData &column, ColumnDropOwnershipBundle &bundle);
 
 	bool HasUnloadedDeletes() const;
 	unique_ptr<RowGroup> CreateNewRowGroupCopy(RowGroupCollection &new_collection, idx_t new_column_count);

@@ -10,6 +10,9 @@
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "test_helpers.hpp"
 
+#include <atomic>
+#include <exception>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -59,20 +62,62 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 	{
 		DuckDB db(path);
 		Connection con(db);
-		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(payload VARCHAR[])"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(payload VARCHAR[], removed INTEGER, retained BIGINT)"));
 		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT [repeat(i::VARCHAR, 64), "
-		                          "repeat((i + 1)::VARCHAR, 64)] FROM range(4096) t(i)"));
+		                          "repeat((i + 1)::VARCHAR, 64)], i::INTEGER, i::BIGINT FROM range(4096) t(i)"));
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
 	}
 	{
 		DuckDB db(path);
 		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET experimental_metadata_reuse=true"));
+		shared_ptr<RowGroup> pre_checkpoint_row_group;
+		vector<shared_ptr<ColumnDropOwnershipBundle>> pre_checkpoint_bundles;
 		con.context->RunFunctionInTransaction([&]() {
 			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
 			auto collection = entry.GetStorage().GetRowGroupCollection();
 			auto root = collection->GetRowGroups()->GetRootSegment();
 			REQUIRE(root);
-			auto &column = root->GetNode().GetRawColumnData(0);
+			pre_checkpoint_row_group = root->ReferenceNode();
+			for (idx_t column_index = 0; column_index < pre_checkpoint_row_group->GetColumnCount(); column_index++) {
+				pre_checkpoint_bundles.push_back(pre_checkpoint_row_group->GetColumnDropOwnershipBundle(column_index));
+			}
+
+			auto removed_collection = collection->RemoveColumn(1);
+			auto removed_root = removed_collection->GetRowGroups()->GetRootSegment();
+			REQUIRE(removed_root);
+			auto &removed_row_group = removed_root->GetNode();
+			REQUIRE(removed_row_group.GetColumnDropOwnershipBundle(0) == pre_checkpoint_bundles[0]);
+			REQUIRE(removed_row_group.GetColumnDropOwnershipBundle(1) == pre_checkpoint_bundles[2]);
+
+			atomic<idx_t> ready_count {0};
+			atomic<bool> start {false};
+			std::exception_ptr source_error;
+			std::exception_ptr clone_error;
+			auto load_column = [&](RowGroup &row_group, std::exception_ptr &error) {
+				ready_count.fetch_add(1);
+				while (!start.load()) {
+					std::this_thread::yield();
+				}
+				try {
+					row_group.GetRawColumnData(0);
+				} catch (...) {
+					error = std::current_exception();
+				}
+			};
+			std::thread source_loader(load_column, std::ref(*pre_checkpoint_row_group), std::ref(source_error));
+			std::thread clone_loader(load_column, std::ref(removed_row_group), std::ref(clone_error));
+			while (ready_count.load() != 2) {
+				std::this_thread::yield();
+			}
+			start = true;
+			source_loader.join();
+			clone_loader.join();
+			REQUIRE_FALSE(source_error);
+			REQUIRE_FALSE(clone_error);
+
+			auto &column = pre_checkpoint_row_group->GetRawColumnData(0);
+			auto &clone_column = removed_row_group.GetRawColumnData(0);
 
 			ColumnDropOwnershipBlockCollector direct_blocks;
 			ColumnDropOwnershipBlockCollector recursive_blocks;
@@ -101,22 +146,19 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 			REQUIRE(shape_nodes[3].layout_tag.runtime_kind == ColumnDropOwnershipRuntimeKind::VALIDITY);
 			REQUIRE(shape_nodes[3].child_key.role == ColumnDropOwnershipChildRole::VALIDITY);
 			REQUIRE(shape_nodes[3].parent_index == 2);
-			for (auto &node : runtime_tree.nodes) {
-				REQUIRE_FALSE(node.get().GetDropOwnershipToken());
-			}
 
-			ColumnDropOwnershipBundle bundle;
 			vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
-			REQUIRE(bundle.Bind(runtime_tree.shape, canonical_tokens) == ColumnDropOwnershipBindResult::ADOPTED);
+			auto &bundle = pre_checkpoint_row_group->GetColumnDropOwnershipBundle(0);
+			REQUIRE(bundle->Bind(runtime_tree.shape, canonical_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
 			REQUIRE(runtime_tree.ApplyTokenPlan(canonical_tokens));
 			for (idx_t node_index = 0; node_index < runtime_tree.nodes.size(); node_index++) {
 				REQUIRE(canonical_tokens[node_index]);
 				REQUIRE(runtime_tree.nodes[node_index].get().GetDropOwnershipToken() == canonical_tokens[node_index]);
 			}
 
-			auto rebound_tree = CaptureColumnDropOwnershipRuntimeTree(column);
+			auto rebound_tree = CaptureColumnDropOwnershipRuntimeTree(clone_column);
 			vector<shared_ptr<RowGroupColumnDropOwnership>> rebound_tokens(rebound_tree.nodes.size());
-			REQUIRE(bundle.Bind(rebound_tree.shape, rebound_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
+			REQUIRE(bundle->Bind(rebound_tree.shape, rebound_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
 			REQUIRE(rebound_tree.ApplyTokenPlan(rebound_tokens));
 			REQUIRE(rebound_tokens == canonical_tokens);
 
@@ -137,6 +179,27 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 
 			AliasedColumnDropOwnershipColumn aliased(column.GetBlockManager(), column.GetTableInfo());
 			REQUIRE_THROWS_AS(CaptureColumnDropOwnershipRuntimeTree(aliased), InternalException);
+		});
+
+		REQUIRE_NO_FAIL(con.Query("UPDATE tbl SET retained = retained + 1"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto collection = entry.GetStorage().GetRowGroupCollection();
+			auto root = collection->GetRowGroups()->GetRootSegment();
+			REQUIRE(root);
+			auto current_row_group = root->ReferenceNode();
+			REQUIRE(current_row_group != pre_checkpoint_row_group);
+			REQUIRE(current_row_group->GetColumnDropOwnershipBundle(0) == pre_checkpoint_bundles[0]);
+			REQUIRE(current_row_group->GetColumnDropOwnershipBundle(1) == pre_checkpoint_bundles[1]);
+			REQUIRE(current_row_group->GetColumnDropOwnershipBundle(2) != pre_checkpoint_bundles[2]);
+
+			auto old_changed_tree =
+			    CaptureColumnDropOwnershipRuntimeTree(pre_checkpoint_row_group->GetRawColumnData(2));
+			auto new_changed_tree = CaptureColumnDropOwnershipRuntimeTree(current_row_group->GetRawColumnData(2));
+			REQUIRE(old_changed_tree.nodes.size() == new_changed_tree.nodes.size());
+			REQUIRE(old_changed_tree.nodes[0].get().GetDropOwnershipToken() !=
+			        new_changed_tree.nodes[0].get().GetDropOwnershipToken());
 		});
 	}
 	DeleteDatabase(path);
