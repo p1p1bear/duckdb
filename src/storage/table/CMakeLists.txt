@@ -5,6 +5,7 @@ add_library_unity(
   OBJECT
   chunk_info.cpp
   column_drop_ownership_bundle.cpp
+  column_drop_ownership_runtime.cpp
   column_checkpoint_state.cpp
   column_data_checkpointer.cpp
   column_data.cpp

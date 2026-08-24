@@ -1,4 +1,5 @@
 #include "duckdb/storage/table/standard_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/update_segment.hpp"
 #include "duckdb/storage/table/append_state.hpp"
@@ -214,6 +215,17 @@ void StandardColumnData::FetchRows(TransactionData transaction, ColumnFetchState
 	FetchRowsAtSegmentLevel(transaction, state, offsets, sel, fetch_count, result, result_offset);
 	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, sel, fetch_count, result,
 	                                  result_offset);
+}
+
+ColumnDropOwnershipRuntimeKind StandardColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::STANDARD;
+}
+
+void StandardColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!validity) {
+		throw InternalException("Cannot observe incomplete standard column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VALIDITY, 0), *validity);
 }
 
 void StandardColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {

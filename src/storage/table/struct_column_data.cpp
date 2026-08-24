@@ -1,4 +1,5 @@
 #include "duckdb/storage/table/struct_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
@@ -358,6 +359,24 @@ void StructColumnData::FetchRows(TransactionData transaction, ColumnFetchState &
 	for (idx_t i = 0; i < child_entries.size(); i++) {
 		sub_columns[i]->FetchRows(transaction, state, storage_index, offsets, sel, fetch_count, child_entries[i],
 		                          result_offset);
+	}
+}
+
+ColumnDropOwnershipRuntimeKind StructColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::STRUCT;
+}
+
+void StructColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!validity) {
+		throw InternalException("Cannot observe incomplete struct column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VALIDITY, 0), *validity);
+	for (idx_t child_index = 0; child_index < sub_columns.size(); child_index++) {
+		if (!sub_columns[child_index]) {
+			throw InternalException("Cannot observe incomplete struct column drop ownership");
+		}
+		visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::STRUCT_FIELD, child_index),
+		              *sub_columns[child_index]);
 	}
 }
 

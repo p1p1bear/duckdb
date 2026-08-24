@@ -1,5 +1,6 @@
 #include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/storage/table/array_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/statistics/array_stats.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
@@ -274,6 +275,18 @@ void ArrayColumnData::FetchRows(TransactionData transaction, ColumnFetchState &s
 		child_column->ScanCount(child_state, child_scan, array_size);
 		VectorOperations::Copy(child_scan, child_vec, array_size, 0, (result_offset + idx) * array_size);
 	}
+}
+
+ColumnDropOwnershipRuntimeKind ArrayColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::ARRAY;
+}
+
+void ArrayColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!validity || !child_column) {
+		throw InternalException("Cannot observe incomplete array column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VALIDITY, 0), *validity);
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::ELEMENT, 0), *child_column);
 }
 
 void ArrayColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {
