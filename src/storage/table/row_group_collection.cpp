@@ -326,6 +326,20 @@ shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transact
 }
 
 void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) {
+	if (!layout) {
+		throw InternalException("Cannot publish a null row group layout");
+	}
+	for (auto &patch : layout->patches) {
+		for (auto &row_group : patch->replacement_groups) {
+			if (RefersToSameObject(row_group->GetCollection(), *this)) {
+				continue;
+			}
+			if (&row_group->GetBlockManager() != &GetBlockManager() || &row_group->GetTableInfo() != &GetTableInfo()) {
+				throw InternalException("Cannot publish a replacement row group from a different table");
+			}
+			row_group->MoveToCollection(*this);
+		}
+	}
 	shared_ptr<TableLayoutHistory> history;
 	{
 		lock_guard<mutex> guard(row_group_pointer_lock);

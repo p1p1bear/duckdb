@@ -9,6 +9,8 @@
 
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/storage/recluster/recluster_retirement.hpp"
+#include "duckdb/storage/recluster/recluster_wal_retention.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 
 namespace duckdb {
@@ -28,7 +30,7 @@ public:
 	                    delete_sequence_t journal_resolved_through);
 	ReclusterCommitInfo(shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
 	                    shared_ptr<RowGroupLayout> pending_layout, sort_run_id_t recovered_run_id,
-	                    vector<block_id_t> recovered_blocks);
+	                    vector<block_id_t> recovered_blocks, RowGroupRange retired_range);
 	~ReclusterCommitInfo();
 
 	void WriteToWAL(WriteAheadLog &wal) const;
@@ -42,6 +44,7 @@ private:
 	void RevertLayout();
 	void ReleaseRecoveredBlocks();
 	void ReleaseRecoveredBlocksNoThrow() noexcept;
+	void CommitRuntimeWALRetention() noexcept;
 
 private:
 	enum class ReclusterCommitLifecycle : uint8_t { PREPARED, APPLIED, FINALIZED, ROLLED_BACK };
@@ -57,6 +60,9 @@ private:
 	sort_run_id_t recovered_run_id = INVALID_SORT_RUN_ID;
 	vector<block_id_t> recovered_blocks;
 	idx_t recovered_owned_block_count = 0;
+	PreparedReclusterRetirement retirement;
+	ReclusterWALRetentionReservation wal_retention;
+	uint64_t wal_checkpoint_iteration = 0;
 	ReclusterCommitLifecycle state = ReclusterCommitLifecycle::PREPARED;
 	bool is_recovery = false;
 	bool layout_published = false;

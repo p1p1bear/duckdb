@@ -128,6 +128,10 @@ public:
 	const vector<MetaBlockPointer> &GetColumnStartPointers() const;
 
 	vector<MetaBlockPointer> GetExtraMetadataBlockPointers() const;
+	const vector<MetaBlockPointer> &GetDeleteStartPointers() const {
+		return deletes_pointers;
+	}
+	vector<MetaBlockPointer> GetLoadedDeleteStoragePointers() const;
 	bool HasPerColumnMetadataBlocks() const {
 		return has_per_column_metadata_blocks;
 	}

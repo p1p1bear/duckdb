@@ -1588,6 +1588,14 @@ vector<MetaBlockPointer> RowGroup::GetExtraMetadataBlockPointers() const {
 	return extra_metadata_block_pointers;
 }
 
+vector<MetaBlockPointer> RowGroup::GetLoadedDeleteStoragePointers() const {
+	auto version_info = GetVersionInfoIfLoaded();
+	if (!version_info) {
+		return {};
+	}
+	return version_info->GetStoragePointersForRetention();
+}
+
 bool RowGroup::CanReuseMetadata(RowGroupWriter &writer) const {
 	if (!Settings::Get<ExperimentalMetadataReuseSetting>(writer.GetDatabase())) {
 		// disabled by configuration

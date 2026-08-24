@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -22,7 +23,9 @@
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_column_drop_ownership.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
@@ -58,6 +61,27 @@ static void PrepareOutputTask(ReclusterTaskStartResult &start) {
 	ReclusterDeleteCatchup catchup(*start.task);
 	catchup.Run();
 	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
+}
+
+static duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>>
+CaptureLayoutDropOwnership(const duckdb::shared_ptr<const RowGroupLayout> &layout, RowGroupRange range) {
+	duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>> result;
+	reference_set_t<RowGroupColumnDropOwnership> visited;
+	LayoutRowGroupCursor cursor(RowGroupCollectionSnapshot(layout), range);
+	LayoutRowGroupEntry current;
+	while (cursor.Next(current)) {
+		for (idx_t column_index = 0; column_index < current.row_group->GetColumnCount(); column_index++) {
+			auto tree = CaptureColumnDropOwnershipRuntimeTree(current.row_group->GetRawColumnData(column_index));
+			for (auto &node : tree.nodes) {
+				auto ownership = node.get().GetDropOwnershipToken();
+				REQUIRE(ownership);
+				if (visited.insert(reference<RowGroupColumnDropOwnership>(*ownership)).second) {
+					result.push_back(std::move(ownership));
+				}
+			}
+		}
+	}
+	return result;
 }
 
 static void RemoveOutputTask(Connection &con, ReclusterTaskStartResult &start, const string &table_name) {
@@ -622,6 +646,16 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load();
 	REQUIRE(old_layout);
 	REQUIRE(old_layout->layout_version == old_layout_version);
+	auto old_ownership = CaptureLayoutDropOwnership(old_layout, start.task->GetRange());
+	REQUIRE(!old_ownership.empty());
+	auto runtime_wal_blocks = start.task->GetTaskContext().GetOutput().GetBlockIds();
+	REQUIRE(!runtime_wal_blocks.empty());
+	auto &manager = storage->GetAttached().GetReclusterManager();
+	auto &retirement = manager.GetRetirementRegistry();
+	auto &wal_retention = manager.GetWALBlockRetention();
+	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
+	REQUIRE(retirement.Count() == 0);
+	REQUIRE(wal_retention.Count() == 0);
 	auto unresolved_slot = start.task->TryReserveDeleteSlot({23});
 	REQUIRE(unresolved_slot);
 	ReclusterTaskFinalizeStatus status = ReclusterTaskFinalizeStatus::STALE_TASK;
@@ -633,6 +667,11 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
 	REQUIRE(state->OwnsTask(start.task));
 	REQUIRE(collection->GetCurrentLayout().get() == old_layout.get());
+	REQUIRE(retirement.Count() == 0);
+	REQUIRE(wal_retention.Count() == 0);
+	for (auto &ownership : old_ownership) {
+		REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::LIVE);
+	}
 	REQUIRE(start.task->ResolveDeleteSlot(*unresolved_slot, DeleteSlotState::ABORTED));
 
 	Connection old_reader(db);
@@ -654,6 +693,14 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
 	REQUIRE(start.task->GetState() == RangeTaskState::PUBLISHED);
 	REQUIRE(!state->GetTask(start.task->GetTaskId()));
+	REQUIRE(retirement.Count() == 1);
+	REQUIRE(wal_retention.Count() == 1);
+	for (auto block_id : runtime_wal_blocks) {
+		REQUIRE(block_manager.IsBlockReserved(block_id));
+	}
+	for (auto &ownership : old_ownership) {
+		REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::LIVE);
+	}
 
 	auto published_layout = collection->GetCurrentLayout();
 	REQUIRE(published_layout);
@@ -662,6 +709,29 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE(published_layout->patches.size() == 1);
 	REQUIRE(published_layout->patches[0]->task_id == start.task->GetTaskId());
 	REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version + 1);
+	duckdb::weak_ptr<const RowGroupLayout> old_layout_reference(old_layout);
+	old_layout.reset();
+
+	{
+		auto abandoned_checkpoint = retirement.PrepareCheckpoint();
+		REQUIRE(!abandoned_checkpoint.Empty());
+	}
+	REQUIRE(retirement.Count() == 1);
+	for (auto &ownership : old_ownership) {
+		REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::LIVE);
+	}
+
+	REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT finalize_db"));
+	REQUIRE(retirement.Count() == 1);
+	REQUIRE(wal_retention.Count() == 0);
+	REQUIRE(!old_layout_reference.expired());
+	for (auto block_id : runtime_wal_blocks) {
+		REQUIRE(!block_manager.IsBlockReserved(block_id));
+	}
+	for (auto &ownership : old_ownership) {
+		REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::DROPPED);
+	}
 
 	auto old_rows = old_reader.Query("SELECT count(*), count(*) FILTER (WHERE payload = 19) FROM tbl");
 	REQUIRE(old_rows);
@@ -674,6 +744,10 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	old_reader.Rollback();
 
 	start.task.reset();
+	REQUIRE_NO_FAIL(con.Query("SELECT 1"));
+	retirement.Cleanup();
+	REQUIRE(old_layout_reference.expired());
+	REQUIRE(retirement.Count() == 0);
 	DeleteDatabase(path);
 }
 
@@ -717,6 +791,8 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=false"));
 		REQUIRE(start.task->GetState() == RangeTaskState::FAILED);
 		REQUIRE(!state->GetTask(start.task->GetTaskId()));
+		REQUIRE(storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Count() == 0);
+		REQUIRE(storage->GetAttached().GetReclusterManager().GetWALBlockRetention().Count() == 0);
 		REQUIRE(collection->GetCurrentLayout().get() == old_layout.get());
 		REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version);
 		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
@@ -946,12 +1022,15 @@ TEST_CASE("Recluster WAL recovery applies a committed replacement", "[storage][r
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
 		auto &attached = GetReclusterDatabase(db, con);
 		auto &retention = attached.GetReclusterManager().GetWALBlockRetention();
+		auto &retirement = attached.GetReclusterManager().GetRetirementRegistry();
 		REQUIRE(retention.Count() == 1);
+		REQUIRE(retirement.Count() == 1);
 		CheckReclusterBlocksReserved(attached, wal, true);
 		CheckRecoveredRecluster(con, true, 1, 1);
 
 		REQUIRE_NO_FAIL(con.Query("FORCE CHECKPOINT"));
 		REQUIRE(retention.Count() == 0);
+		REQUIRE(retirement.Count() == 0);
 		CheckReclusterBlocksReserved(attached, wal, false);
 	}
 	CheckRecoveredRecluster(path, true, 1, 0);

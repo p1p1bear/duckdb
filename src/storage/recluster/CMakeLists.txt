@@ -10,6 +10,7 @@ add_library_unity(
   range_task.cpp
   recluster_manager.cpp
   recluster_output_writer.cpp
+  recluster_retirement.cpp
   recluster_range_scanner.cpp
   recluster_sorter.cpp
   recluster_task_context.cpp

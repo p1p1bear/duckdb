@@ -15,6 +15,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
+#include "duckdb/storage/recluster/recluster_retirement.hpp"
 #include "duckdb/storage/recluster/recluster_wal_retention.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 
@@ -60,6 +61,9 @@ public:
 	ReclusterWALBlockRetention &GetWALBlockRetention() {
 		return wal_block_retention;
 	}
+	ReclusterRetirementRegistry &GetRetirementRegistry() {
+		return retirement_registry;
+	}
 
 	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
 		return layout_publish_lock.GetSharedLock();
@@ -78,6 +82,7 @@ private:
 private:
 	AttachedDatabase &db;
 	ReclusterWALBlockRetention wal_block_retention;
+	ReclusterRetirementRegistry retirement_registry;
 	mutex queue_lock;
 	StorageLock layout_publish_lock;
 	unordered_map<persistent_table_id_t, weak_ptr<TableReclusterState>> tables;

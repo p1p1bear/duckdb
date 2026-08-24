@@ -523,9 +523,9 @@ public:
 		patch->replacement_physical_rows = replacement_rows;
 		patch->replacement_groups = std::move(replacement_groups);
 		auto pending_layout = collection->BuildPendingPatchedLayout(std::move(patch));
-		auto commit_info =
-		    make_uniq<ReclusterCommitInfo>(storage, old_layout, std::move(pending_layout),
-		                                   record.manifest.header.run_id, std::move(record.replacement_blocks));
+		auto commit_info = make_uniq<ReclusterCommitInfo>(
+		    storage, old_layout, std::move(pending_layout), record.manifest.header.run_id,
+		    std::move(record.replacement_blocks), RowGroupRange {record.header.range_start, record.header.range_end});
 		auto &transaction = DuckTransaction::Get(context, db);
 		transaction.SetIsReclusterMaintenanceTransaction();
 		transaction.PushRecluster(std::move(commit_info));

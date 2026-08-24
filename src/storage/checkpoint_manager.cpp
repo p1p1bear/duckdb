@@ -290,12 +290,26 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		throw IOException("Checkpoint aborted before header write (non-fatal) because of PRAGMA checkpoint_abort flag");
 	}
 
+	unique_lock<mutex> owned_wal_lock;
+	optional_ptr<unique_lock<mutex>> wal_lock;
+	if (has_wal) {
+		if (!options.wal_lock) {
+			owned_wal_lock = storage_manager.GetWALLock();
+			wal_lock = owned_wal_lock;
+		} else {
+			wal_lock = options.wal_lock;
+		}
+	}
+	auto retirement_checkpoint = recluster_manager.GetRetirementRegistry().PrepareCheckpoint();
+	retirement_checkpoint.Apply();
+
 	// finally write the updated header
 	DatabaseHeader header;
 	header.meta_block = meta_block.block_pointer;
 	header.block_alloc_size = block_manager.GetBlockAllocSize();
 	header.vector_size = STANDARD_VECTOR_SIZE;
 	block_manager.WriteHeader(context, header);
+	retirement_checkpoint.HeaderSucceeded();
 
 	auto debug_verify_blocks = Settings::Get<DebugVerifyBlocksSetting>(db.GetDatabase());
 	if (debug_verify_blocks) {
@@ -340,16 +354,6 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 
 	// truncate the WAL
 	if (has_wal) {
-		unique_lock<mutex> owned_wal_lock;
-		optional_ptr<unique_lock<mutex>> wal_lock;
-		if (!options.wal_lock) {
-			// not holding the WAL lock yet - grab it
-			owned_wal_lock = storage_manager.GetWALLock();
-			wal_lock = owned_wal_lock;
-		} else {
-			// we already have the WAL lock - just refer to it
-			wal_lock = options.wal_lock;
-		}
 		storage_manager.WALFinishCheckpoint(*wal_lock);
 	}
 

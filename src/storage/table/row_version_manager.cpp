@@ -405,4 +405,9 @@ vector<MetaBlockPointer> RowVersionManager::GetStoragePointers() {
 	return storage_pointers;
 }
 
+vector<MetaBlockPointer> RowVersionManager::GetStoragePointersForRetention() {
+	lock_guard<mutex> lock(version_lock);
+	return storage_pointers;
+}
+
 } // namespace duckdb

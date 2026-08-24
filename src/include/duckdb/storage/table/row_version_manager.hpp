@@ -58,6 +58,7 @@ public:
 	bool HasDeletes();
 	bool HasUncommittedChanges();
 	vector<MetaBlockPointer> GetStoragePointers();
+	vector<MetaBlockPointer> GetStoragePointersForRetention();
 
 private:
 	mutex version_lock;

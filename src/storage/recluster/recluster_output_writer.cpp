@@ -290,7 +290,7 @@ void ReclusterOutput::MarkPublished() {
 	if (delete_metadata_owner) {
 		delete_metadata_owner->MarkPublished();
 	}
-	manifest_owner->MarkPublished();
+	manifest_owner->Abort();
 	owns_blocks = false;
 }
 
