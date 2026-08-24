@@ -1,0 +1,37 @@
+# name: benchmark/micro/order/sorted_write_recluster.benchmark
+# description: Explicitly recluster one historical persistent table range
+# group: [order]
+
+name SORTED BY Explicit Recluster
+group micro
+subgroup order
+storage persistent v2.0.0
+require_reinit
+
+load
+SET debug_skip_checkpoint_on_commit=true;
+CREATE TABLE source AS
+SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
+       ((i * 97) % 10000)::INTEGER AS tenant_id,
+       TIMESTAMP '2020-01-01' + ((i * 32452843) % 31536000) * INTERVAL 1 SECOND AS event_time,
+       i::BIGINT AS payload_id,
+       ((i * 48271) % 1000000)::DOUBLE / 100.0 AS amount,
+       (i % 8)::TINYINT AS status,
+       ((i * 31) % 1024)::SMALLINT AS region,
+       lpad(to_hex(i), 16, '0') || repeat('x', 48) AS payload
+FROM range(10000000) t(i);
+CREATE TABLE events AS FROM source;
+CHECKPOINT;
+ALTER TABLE events SET SORTED BY (tenant_id, event_time, event_id);
+CHECKPOINT;
+
+run
+CALL recluster('main.events', max_bytes='16GB', max_tasks=4)
+
+cleanup
+CHECKPOINT;
+DROP TABLE events;
+CREATE TABLE events AS FROM source;
+CHECKPOINT;
+ALTER TABLE events SET SORTED BY (tenant_id, event_time, event_id);
+CHECKPOINT;

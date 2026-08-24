@@ -1,0 +1,25 @@
+# name: benchmark/micro/order/orderby_recluster_unsorted.benchmark
+# description: ORDER BY on an unsorted persistent table used as the recluster baseline
+# group: [order]
+
+name ORDER BY Recluster Baseline
+group micro
+subgroup order
+storage persistent v2.0.0
+require_reinit
+
+load
+CREATE TABLE events AS
+SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
+       ((i * 97) % 10000)::INTEGER AS tenant_id,
+       TIMESTAMP '2020-01-01' + ((i * 32452843) % 31536000) * INTERVAL 1 SECOND AS event_time,
+       i::BIGINT AS payload_id,
+       ((i * 48271) % 1000000)::DOUBLE / 100.0 AS amount,
+       (i % 8)::TINYINT AS status,
+       ((i * 31) % 1024)::SMALLINT AS region,
+       lpad(to_hex(i), 16, '0') || repeat('x', 48) AS payload
+FROM range(10000000) t(i);
+CHECKPOINT;
+
+run
+SELECT * FROM events ORDER BY tenant_id, event_time, event_id
