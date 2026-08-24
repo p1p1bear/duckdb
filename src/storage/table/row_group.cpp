@@ -675,21 +675,27 @@ void RowGroup::CommitDrop(CommitDropState &drop_state) {
 	}
 }
 
-struct BlockIdDropper : public BlockIdVisitor {
-	explicit BlockIdDropper(CommitDropState &drop_state) : drop_state(drop_state) {
-	}
-
+struct BlockIdCollector : public BlockIdVisitor {
 	void Visit(block_id_t block_id) override {
-		drop_state.DropBlock(block_id);
+		block_ids.push_back(block_id);
 	}
 
-	CommitDropState &drop_state;
+	vector<block_id_t> block_ids;
 };
 
 void RowGroup::CommitDropColumn(const idx_t column_index, CommitDropState &drop_state) {
 	auto &column = GetColumn(column_index);
-	BlockIdDropper dropper(drop_state);
-	column.VisitBlockIds(dropper);
+	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
+	for (auto &node_ref : runtime_tree.nodes) {
+		auto &node = node_ref.get();
+		auto ownership = node.GetDropOwnershipToken();
+		if (!ownership) {
+			throw InternalException("Cannot drop a column without initialized block ownership");
+		}
+		BlockIdCollector collector;
+		node.VisitDirectBlockIds(collector);
+		drop_state.DropColumnOwnership(std::move(ownership), std::move(collector.block_ids));
+	}
 }
 
 void RowGroup::CommitDrop() {

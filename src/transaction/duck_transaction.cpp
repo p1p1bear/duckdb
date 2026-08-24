@@ -440,6 +440,7 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
 	try {
 		storage->Commit(commit_state.get());
 		undo_buffer.Commit(iterator_state, commit_info);
+		drop_state.PrepareFinalize();
 		if (!db.IsSystem() && !db.IsTemporary() && Settings::Get<DebugForceCommitFailureSetting>(db.GetDatabase())) {
 			throw InvalidInputException("Forced commit failure (debug_force_commit_failure)");
 		}
@@ -455,6 +456,15 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
 		// escape this noexcept function and trigger std::terminate.
 		error_data = ErrorData(ex);
 	}
+	if (drop_state.IrreversibleFinalizationStarted()) {
+		commit_finalization_irreversible = true;
+		ValidChecker::Invalidate(db.GetDatabase(),
+		                         "Failed while finalizing a durable transaction commit. The database must be reopened. "
+		                         "Commit finalization error: " +
+		                             error_data.RawMessage());
+		return error_data;
+	}
+	drop_state.RevertPrepared();
 
 	try {
 		undo_buffer.RevertCommit(iterator_state, this->transaction_id);

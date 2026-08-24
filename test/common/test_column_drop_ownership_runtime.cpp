@@ -3,9 +3,11 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
+#include "duckdb/storage/table/row_group_column_drop_ownership.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "test_helpers.hpp"
@@ -26,6 +28,29 @@ public:
 
 	vector<block_id_t> blocks;
 };
+
+static vector<shared_ptr<RowGroupColumnDropOwnership>>
+CaptureTableDropOwnership(Connection &con, const string &table_name, optional_idx selected_column = {}) {
+	vector<shared_ptr<RowGroupColumnDropOwnership>> result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		auto row_group = collection->GetRowGroup(0);
+		REQUIRE(row_group);
+		auto first_column = selected_column.IsValid() ? selected_column.GetIndex() : 0;
+		auto last_column = selected_column.IsValid() ? first_column + 1 : row_group->GetColumnCount();
+		REQUIRE(last_column <= row_group->GetColumnCount());
+		for (idx_t column_index = first_column; column_index < last_column; column_index++) {
+			auto tree = CaptureColumnDropOwnershipRuntimeTree(row_group->GetRawColumnData(column_index));
+			for (auto &node : tree.nodes) {
+				auto token = node.get().GetDropOwnershipToken();
+				REQUIRE(token);
+				result.push_back(std::move(token));
+			}
+		}
+	});
+	return result;
+}
 
 class AliasedColumnDropOwnershipColumn : public ColumnData {
 public:
@@ -201,6 +226,80 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 			REQUIRE(old_changed_tree.nodes[0].get().GetDropOwnershipToken() !=
 			        new_changed_tree.nodes[0].get().GetDropOwnershipToken());
 		});
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Column ownership drops revert before WAL commit and finalize once", "[storage][drop_ownership_runtime]") {
+	auto path = TestCreatePath("column_drop_ownership_commit.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(payload VARCHAR[], retained BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT [repeat(i::VARCHAR, 64)], i FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		auto tokens = CaptureTableDropOwnership(con, "tbl", 0);
+		REQUIRE(tokens.size() > 1);
+		for (auto &token : tokens) {
+			REQUIRE(token->GetState() == RowGroupColumnDropOwnership::State::LIVE);
+		}
+
+		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=true"));
+		auto failed = con.Query("ALTER TABLE tbl DROP COLUMN payload");
+		REQUIRE_FAIL(failed);
+		REQUIRE(failed->GetError().find("Forced commit failure") != string::npos);
+		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=false"));
+		for (auto &token : tokens) {
+			REQUIRE(token->GetState() == RowGroupColumnDropOwnership::State::LIVE);
+		}
+		auto rows = con.Query("SELECT count(*), sum(retained) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl DROP COLUMN payload"));
+		for (auto &token : tokens) {
+			REQUIRE(token->GetState() == RowGroupColumnDropOwnership::State::DROPPED);
+		}
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		auto rows = con.Query("SELECT count(*), sum(retained) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Table drop applies column ownership before index cleanup", "[storage][drop_ownership_runtime]") {
+	auto path = TestCreatePath("column_drop_ownership_index.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(id INTEGER, payload VARCHAR)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i, repeat(i::VARCHAR, 64) FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CREATE INDEX tbl_id ON tbl(id)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		auto tokens = CaptureTableDropOwnership(con, "tbl");
+		REQUIRE_FALSE(tokens.empty());
+
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE tbl"));
+		for (auto &token : tokens) {
+			REQUIRE(token->GetState() == RowGroupColumnDropOwnership::State::DROPPED);
+		}
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_FAIL(con.Query("SELECT * FROM tbl"));
 	}
 	DeleteDatabase(path);
 }

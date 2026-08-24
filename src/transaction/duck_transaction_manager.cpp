@@ -409,7 +409,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		error = transaction.Commit(db, info, std::move(commit_state));
 	}
 
-	if (error.HasError()) {
+	if (error.HasError() && !transaction.CommitFinalizationIrreversible()) {
 		DUCKDB_LOG(context, TransactionLogType, db, "Rollback (after failed commit)", info.commit_id);
 
 		// COMMIT not successful: ROLLBACK.
@@ -425,9 +425,14 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 			    error.Message(), rollback_error.Message());
 		}
 	} else {
+		if (error.HasError()) {
+			checkpoint_decision = CheckpointDecision(error.Message());
+			DUCKDB_LOG(context, TransactionLogType, db, "Commit finalization failed", info.commit_id);
+		} else {
+			DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
+		}
 		transaction.ResolveReclusterDeletes(true);
 		recluster_preparation_guard.Dismiss();
-		DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
 		last_commit = info.commit_id;
 
 		// check if catalog changes were made

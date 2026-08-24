@@ -23,8 +23,10 @@ class TableIndexList;
 class DataChunk;
 class DuckTransaction;
 class ReclusterCommitInfo;
+class RowGroupColumnDropOwnership;
 class WriteAheadLog;
 class ClientContext;
+class CommitDropStatePrepared;
 
 struct DataTableInfo;
 class DataTable;
@@ -45,26 +47,43 @@ struct PendingIndexRemoval {
 class CommitDropState {
 public:
 	explicit CommitDropState(optional_ptr<BlockManager> block_manager);
+	~CommitDropState();
 
 public:
-	//! Register an on-disk block to mark as modified during FinalizeCommit.
-	void DropBlock(block_id_t block_id);
+	//! Register one concrete column node's persistent ownership for commit-time release.
+	void DropColumnOwnership(shared_ptr<RowGroupColumnDropOwnership> ownership, vector<block_id_t> actions);
 	//! Register an index to be removed from a table's index list during FinalizeCommit. Index removal will drop in
 	//! memory index data and also marks all blocks on disk as free blocks allowing for reclamation. Block marking for
 	//! indexes is handled implicitly along destruction paths for index memory.
 	void RemoveIndex(TableIndexList &indexes, Identifier name);
 	//! Register a recluster ownership transfer to run only after the WAL is durable.
 	void AddRecluster(ReclusterCommitInfo &info);
+	//! Claim and validate all registered block drops before the WAL commit is flushed.
+	void PrepareFinalize();
+	//! Release a prepared claim before reverting a failed commit.
+	void RevertPrepared() noexcept;
 	//! Finalize accumulated block marks and index removals.
 	void FinalizeCommit();
+	//! True once FinalizeCommit has begun applying non-revertible side effects.
+	bool IrreversibleFinalizationStarted() const noexcept {
+		return irreversible_finalization_started;
+	}
 	//! True if no work has been queued.
 	bool Empty() const;
 
 private:
+	struct PendingColumnDropOwnership {
+		shared_ptr<RowGroupColumnDropOwnership> ownership;
+		vector<block_id_t> actions;
+	};
+
 	optional_ptr<BlockManager> block_manager;
-	vector<block_id_t> dropped_block_ids;
+	vector<PendingColumnDropOwnership> pending_column_drops;
 	vector<PendingIndexRemoval> pending_index_removals;
 	vector<reference<ReclusterCommitInfo>> pending_reclusters;
+	unique_ptr<CommitDropStatePrepared> prepared;
+	bool prepare_complete = false;
+	bool irreversible_finalization_started = false;
 };
 
 struct IndexDataRemover {

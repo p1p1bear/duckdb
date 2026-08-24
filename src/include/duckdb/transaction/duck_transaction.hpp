@@ -79,6 +79,9 @@ public:
 	//! commit failed, or an empty string if the commit was successful
 	ErrorData Commit(AttachedDatabase &db, CommitInfo &commit_info,
 	                 unique_ptr<StorageCommitState> commit_state) noexcept;
+	bool CommitFinalizationIrreversible() const noexcept {
+		return commit_finalization_irreversible;
+	}
 	//! Returns whether or not a commit of this transaction should trigger an automatic checkpoint
 	bool AutomaticCheckpoint(AttachedDatabase &db, const UndoBufferProperties &properties);
 
@@ -174,6 +177,8 @@ private:
 	unordered_map<recluster_task_id_t, PendingTaskDeletes> pending_recluster_deletes;
 	bool is_recluster_maintenance_transaction = false;
 	bool has_recluster_undo = false;
+	//! A durable commit reached non-revertible storage finalization before reporting an error.
+	bool commit_finalization_irreversible = false;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };

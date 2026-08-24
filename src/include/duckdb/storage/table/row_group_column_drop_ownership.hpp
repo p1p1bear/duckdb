@@ -59,7 +59,7 @@ private:
 	bool TryTransition(const RowGroupColumnDropClaim &claim_owner, State target) noexcept;
 
 private:
-	//! Access is serialized by StorageManager's ownership drop lock.
+	//! Access is serialized by the BlockManager ownership drop lock.
 	vector<block_id_t> immutable_drop_actions;
 	bool frozen = false;
 	State state = State::LIVE;

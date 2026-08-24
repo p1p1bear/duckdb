@@ -10,8 +10,10 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/storage/block_manager.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/chunk_info.hpp"
 #include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/row_group_column_drop_ownership.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 #include "duckdb/storage/table/update_segment.hpp"
@@ -30,11 +32,30 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // CommitDropState
 //===--------------------------------------------------------------------===//
+class CommitDropStatePrepared {
+public:
+	unique_lock<mutex> ownership_lock;
+	shared_ptr<RowGroupColumnDropClaim> claim_owner;
+	vector<shared_ptr<RowGroupColumnDropOwnership>> claimed_ownership;
+	unique_ptr<PreparedBlockModificationBatch> block_batch;
+};
+
 CommitDropState::CommitDropState(optional_ptr<BlockManager> block_manager) : block_manager(block_manager) {
 }
 
-void CommitDropState::DropBlock(block_id_t block_id) {
-	dropped_block_ids.push_back(block_id);
+CommitDropState::~CommitDropState() {
+	RevertPrepared();
+}
+
+void CommitDropState::DropColumnOwnership(shared_ptr<RowGroupColumnDropOwnership> ownership,
+                                          vector<block_id_t> actions) {
+	if (!ownership) {
+		throw InternalException("Cannot drop column blocks without an ownership token");
+	}
+	if (prepare_complete || irreversible_finalization_started) {
+		throw InternalException("Cannot add column ownership after preparing commit drops");
+	}
+	pending_column_drops.push_back({std::move(ownership), std::move(actions)});
 }
 
 void CommitDropState::RemoveIndex(TableIndexList &indexes, Identifier name) {
@@ -45,14 +66,119 @@ void CommitDropState::AddRecluster(ReclusterCommitInfo &info) {
 	pending_reclusters.emplace_back(info);
 }
 
-void CommitDropState::FinalizeCommit() {
-	if (block_manager) {
-		for (auto block_id : dropped_block_ids) {
-			block_manager->MarkBlockAsModified(block_id);
-		}
+void CommitDropState::PrepareFinalize() {
+	if (prepare_complete) {
+		return;
 	}
-	// assert that !block_manager -> dropped_block_ids.empty()
-	D_ASSERT(block_manager || dropped_block_ids.empty());
+	if (irreversible_finalization_started) {
+		throw InternalException("Cannot prepare block drops after finalization has started");
+	}
+
+	vector<PendingColumnDropOwnership> unique_drops;
+	unique_drops.reserve(pending_column_drops.size());
+	reference_map_t<RowGroupColumnDropOwnership, idx_t> ownership_indexes;
+	ownership_indexes.reserve(pending_column_drops.size());
+	idx_t maximum_action_count = 0;
+	for (auto &pending : pending_column_drops) {
+		if (pending.actions.size() > NumericLimits<idx_t>::Maximum() - maximum_action_count) {
+			throw InternalException("Commit block drop action count overflow");
+		}
+		maximum_action_count += pending.actions.size();
+		auto entry = ownership_indexes.find(*pending.ownership);
+		if (entry != ownership_indexes.end()) {
+			if (unique_drops[entry->second].actions != pending.actions) {
+				throw InternalException("Conflicting actions for shared row group column drop ownership");
+			}
+			continue;
+		}
+		ownership_indexes.emplace(*pending.ownership, unique_drops.size());
+		unique_drops.push_back({pending.ownership, pending.actions});
+	}
+
+	if (!unique_drops.empty() && !block_manager) {
+		throw InternalException("Cannot finalize block ownership drops without a block manager");
+	}
+	if (maximum_action_count == 0 && unique_drops.empty()) {
+		prepare_complete = true;
+		return;
+	}
+
+	auto next = make_uniq<CommitDropStatePrepared>();
+	next->claim_owner = make_shared_ptr<RowGroupColumnDropClaim>();
+	next->claimed_ownership.reserve(unique_drops.size());
+	vector<block_id_t> claimed_actions;
+	claimed_actions.reserve(maximum_action_count);
+	next->ownership_lock = block_manager->LockOwnershipDrops();
+	try {
+		for (auto &drop : unique_drops) {
+			drop.ownership->FreezeOrVerify(std::move(drop.actions));
+			if (!drop.ownership->Claim(next->claim_owner)) {
+				if (drop.ownership->GetState() != RowGroupColumnDropOwnership::State::DROPPED) {
+					throw InternalException("Unexpected row group column ownership claim result");
+				}
+				continue;
+			}
+			next->claimed_ownership.push_back(drop.ownership);
+			auto &actions = drop.ownership->GetActions();
+			claimed_actions.insert(claimed_actions.end(), actions.begin(), actions.end());
+		}
+		if (!claimed_actions.empty()) {
+			auto batch = block_manager->Cast<SingleFileBlockManager>().PrepareBlockDropsForCommit(claimed_actions);
+			next->block_batch = make_uniq<PreparedBlockModificationBatch>(std::move(batch));
+		}
+	} catch (...) {
+		for (auto &ownership : next->claimed_ownership) {
+			auto reverted = ownership->Revert(*next->claim_owner);
+			D_ASSERT(reverted);
+			(void)reverted;
+		}
+		throw;
+	}
+	prepared = std::move(next);
+	prepare_complete = true;
+}
+
+void CommitDropState::RevertPrepared() noexcept {
+	if (irreversible_finalization_started) {
+		D_ASSERT(!prepared);
+		return;
+	}
+	if (!prepared) {
+		prepare_complete = false;
+		return;
+	}
+	prepared->block_batch.reset();
+	for (auto &ownership : prepared->claimed_ownership) {
+		auto reverted = ownership->Revert(*prepared->claim_owner);
+		D_ASSERT(reverted);
+		(void)reverted;
+	}
+	if (prepared->ownership_lock.owns_lock()) {
+		prepared->ownership_lock.unlock();
+	}
+	prepared.reset();
+	prepare_complete = false;
+}
+
+void CommitDropState::FinalizeCommit() {
+	PrepareFinalize();
+	irreversible_finalization_started =
+	    !pending_column_drops.empty() || !pending_index_removals.empty() || !pending_reclusters.empty();
+	if (prepared) {
+		if (prepared->block_batch) {
+			block_manager->Cast<SingleFileBlockManager>().ApplyPreparedBlockDrops(std::move(*prepared->block_batch));
+			prepared->block_batch.reset();
+		}
+		for (auto &ownership : prepared->claimed_ownership) {
+			auto finalized = ownership->Finalize(*prepared->claim_owner);
+			D_ASSERT(finalized);
+			(void)finalized;
+		}
+		if (prepared->ownership_lock.owns_lock()) {
+			prepared->ownership_lock.unlock();
+		}
+		prepared.reset();
+	}
 
 	for (auto &removal : pending_index_removals) {
 		removal.indexes.get().RemoveIndex(removal.name);
@@ -60,13 +186,14 @@ void CommitDropState::FinalizeCommit() {
 	for (auto &recluster : pending_reclusters) {
 		recluster.get().FinalizeCommit();
 	}
-	dropped_block_ids.clear();
+	pending_column_drops.clear();
 	pending_index_removals.clear();
 	pending_reclusters.clear();
+	prepare_complete = false;
 }
 
 bool CommitDropState::Empty() const {
-	return dropped_block_ids.empty() && pending_index_removals.empty() && pending_reclusters.empty();
+	return pending_column_drops.empty() && pending_index_removals.empty() && pending_reclusters.empty();
 }
 
 //===--------------------------------------------------------------------===//
