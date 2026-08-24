@@ -845,6 +845,9 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 	result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
 	if (result.state == ReclusterExplicitState::FAILED || result.state == ReclusterExplicitState::ALREADY_RUNNING ||
 	    result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE) {
+		if (result.state == ReclusterExplicitState::FAILED) {
+			state->SetLastError(result.message);
+		}
 		return result;
 	}
 	if (result.remaining_recluster_bytes == 0) {

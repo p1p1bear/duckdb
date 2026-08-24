@@ -19,6 +19,7 @@
 #include "duckdb/storage/recluster/recluster_delete_catchup.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
+#include "duckdb/storage/recluster/recluster_status.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
@@ -50,6 +51,15 @@ static ReclusterTaskStartResult StartOutputTask(Connection &con, const string &t
 		REQUIRE(selection.candidate);
 		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(
 		    entry, *selection.candidate);
+	});
+	return result;
+}
+
+static ReclusterTableStatus GetReclusterStatus(Connection &con, const string &table_name) {
+	ReclusterTableStatus result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		result = entry.GetStorage().GetAttached().GetReclusterManager().GetTableStatus(entry);
 	});
 	return result;
 }
@@ -238,6 +248,10 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	auto &block_manager = storage.GetTableIOManager().GetBlockManagerForRowData();
 	auto &metadata_manager = block_manager.GetMetadataManager();
 	auto first_private_block = block_manager.PeekFreeBlockId();
+	auto initial_status = GetReclusterStatus(con, "tbl");
+	REQUIRE(initial_status.active_prepare_tasks == 1);
+	REQUIRE(initial_status.pending_finalize_tasks == 0);
+	REQUIRE(initial_status.prepared_bytes == 0);
 
 	ReclusterOutputWriter writer(*start.task);
 	try {
@@ -249,6 +263,10 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	auto &task_context = start.task->GetTaskContext();
 	REQUIRE(task_context.HasOutput());
 	REQUIRE(!task_context.HasActiveSnapshot());
+	auto output_status = GetReclusterStatus(con, "tbl");
+	REQUIRE(output_status.active_prepare_tasks == 1);
+	REQUIRE(output_status.pending_finalize_tasks == 0);
+	REQUIRE(output_status.prepared_bytes > 0);
 	auto &output = task_context.GetOutput();
 	REQUIRE(output.GetSortOrderId() == task_context.GetSortDefinition().sort_order_id);
 	REQUIRE(output.GetRunId() != INVALID_SORT_RUN_ID);
@@ -342,6 +360,16 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	REQUIRE_NO_FAIL(*main_result);
 	REQUIRE(CHECK_COLUMN(main_result, 0, {4096}));
 	REQUIRE(CHECK_COLUMN(main_result, 1, {4096}));
+	REQUIRE(start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
+	ReclusterDeleteCatchup catchup(*start.task);
+	catchup.Run();
+	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
+	auto checkpoint_lock = storage.GetAttached().GetReclusterManager().GetExclusiveLayoutPublishLock();
+	auto pending_status = GetReclusterStatus(con, "tbl");
+	REQUIRE(pending_status.active_prepare_tasks == 0);
+	REQUIRE(pending_status.pending_finalize_tasks == 1);
+	REQUIRE(pending_status.blocked_reason == "CHECKPOINT_IN_PROGRESS");
+	checkpoint_lock.reset();
 	lazy_collection.reset();
 	output_groups.clear();
 	output_tree.reset();

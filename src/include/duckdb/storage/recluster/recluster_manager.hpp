@@ -30,6 +30,7 @@ class RangeTask;
 class ReclusterAutoTask;
 struct ReclusterAutoSchedulerState;
 class TableReclusterState;
+struct ReclusterTableStatus;
 
 enum class ReclusterExplicitState : uint8_t { COMPLETE, BUDGET_EXHAUSTED, NO_ELIGIBLE_RANGE, ALREADY_RUNNING, FAILED };
 
@@ -86,6 +87,7 @@ public:
 	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
 	ReclusterExplicitResult RunExplicit(ClientContext &context, const QualifiedName &table_name,
 	                                    const ReclusterExplicitOptions &options);
+	ReclusterTableStatus GetTableStatus(DuckTableEntry &table);
 	//! Coalesces a commit/checkpoint wake-up into one background scheduler task.
 	void RequestAutoRecluster() noexcept;
 	//! Stops accepting automatic work and drains any queued/running task before database close.

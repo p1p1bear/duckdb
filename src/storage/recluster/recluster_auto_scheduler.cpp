@@ -290,6 +290,7 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 		try {
 			Connection connection(db.GetDatabase());
 			ReclusterExplicitResult result;
+			shared_ptr<TableReclusterState> table_state;
 			connection.context->RunFunctionInTransaction([&]() {
 				auto &table = Catalog::GetEntry<DuckTableEntry>(*connection.context, table_name);
 				auto state = table.GetStorage().GetDataTableInfo()->GetReclusterState();
@@ -299,6 +300,7 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 				if (!state) {
 					return;
 				}
+				table_state = state;
 				auto checkpoint = state->GetLastCheckpoint();
 				if (!checkpoint || checkpoint->checkpoint_number == 0) {
 					checkpoint_needed |= EstimateRemainingReclusterBytes(table.GetStorage(), *state) > 0;
@@ -310,6 +312,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 				result = RunExplicit(*connection.context, table_name, options);
 			});
 			if (result.state == ReclusterExplicitState::FAILED) {
+				if (table_state) {
+					table_state->SetLastError(result.message);
+				}
 				LogAutoReclusterError(db, table_name.ToString() + ": " + result.message);
 			} else if (result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE &&
 			           result.remaining_recluster_bytes > 0) {
