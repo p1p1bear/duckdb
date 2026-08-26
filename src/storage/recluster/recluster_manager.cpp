@@ -640,11 +640,11 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
 		return result;
 	}
-	auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 	bool checkpoint_created = false;
 	idx_t stale_attempts = 0;
 	while (result.tasks_completed < options.max_tasks) {
 		context.InterruptCheck();
+		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
 		if (&table.GetStorage() != storage.get() || !table.SortEnabled() ||
 		    storage->GetDataTableInfo()->GetReclusterState().get() != state.get()) {
