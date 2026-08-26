@@ -23,6 +23,7 @@
 namespace duckdb {
 
 static constexpr idx_t AUTO_RECLUSTER_MAX_BYTES = 1ULL << 30;
+static constexpr idx_t AUTO_RECLUSTER_MAX_THREADS = 2;
 static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS = 60 * 1000;
 
 struct ReclusterAutoSchedulerState {
@@ -309,6 +310,7 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 				ReclusterExplicitOptions options;
 				options.max_bytes = AUTO_RECLUSTER_MAX_BYTES;
 				options.max_tasks = 1;
+				options.max_threads = AUTO_RECLUSTER_MAX_THREADS;
 				result = RunExplicit(*connection.context, table_name, options);
 			});
 			if (result.state == ReclusterExplicitState::FAILED) {

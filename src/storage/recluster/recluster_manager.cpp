@@ -272,7 +272,7 @@ idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, Tabl
 }
 
 ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
-                                                        optional_ptr<ClientContext> driver_context) {
+                                                        optional_ptr<ClientContext> driver_context, idx_t max_threads) {
 	auto &storage = table.GetStorage();
 	if (&storage.GetDataTableInfo()->GetDB() != &db) {
 		throw InternalException("Cannot start a recluster task through a different attached database");
@@ -312,7 +312,7 @@ ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, c
 		auto task_id = GenerateReclusterTaskId(*state);
 		auto task_context = make_uniq<ReclusterTaskContext>(
 		    metadata.table_id, state->GetInitializationToken(), std::move(*validated), *definition,
-		    std::move(physical_sort_indexes), storage.shared_from_this(), db, driver_context);
+		    std::move(physical_sort_indexes), storage.shared_from_this(), db, driver_context, max_threads);
 		task = make_shared_ptr<RangeTask>(task_id, std::move(task_context));
 		if (!state->TryRegisterTask(task)) {
 			return {ReclusterTaskStartStatus::RANGE_UNAVAILABLE, nullptr};
@@ -715,7 +715,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 			break;
 		}
 
-		auto start = TryStartTask(table, *selection.candidate, context);
+		auto start = TryStartTask(table, *selection.candidate, context, options.max_threads);
 		if (start.status != ReclusterTaskStartStatus::STARTED || !start.task) {
 			if (start.status == ReclusterTaskStartStatus::RANGE_UNAVAILABLE) {
 				result.state = ReclusterExplicitState::ALREADY_RUNNING;

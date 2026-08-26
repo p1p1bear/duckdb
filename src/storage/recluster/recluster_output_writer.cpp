@@ -29,21 +29,26 @@ namespace duckdb {
 
 class ReclusterRowGroupWriteTask : public BaseExecutorTask {
 public:
-	ReclusterRowGroupWriteTask(TaskExecutor &executor, RangeTask &task_p, const RowGroup &row_group_p,
-	                           PartialBlockManager &partial_manager_p,
-	                           const vector<CompressionType> &compression_types_p, RowGroupWriteData &result_p)
-	    : BaseExecutorTask(executor), task(task_p), row_group(row_group_p), partial_manager(partial_manager_p),
-	      compression_types(compression_types_p), result(result_p) {
+	ReclusterRowGroupWriteTask(TaskExecutor &executor, RangeTask &task_p,
+	                           const vector<const_reference<RowGroup>> &row_groups_p,
+	                           vector<unique_ptr<PartialBlockManager>> &partial_managers_p,
+	                           const vector<CompressionType> &compression_types_p, vector<RowGroupWriteData> &results_p,
+	                           idx_t begin_p, idx_t end_p)
+	    : BaseExecutorTask(executor), task(task_p), row_groups(row_groups_p), partial_managers(partial_managers_p),
+	      compression_types(compression_types_p), results(results_p), begin(begin_p), end(end_p) {
 	}
 
 	void ExecuteTask() override {
-		if (task.IsCancelRequested() || task.IsPublishForbidden()) {
-			throw InterruptException("Recluster task was cancelled");
+		for (idx_t row_group_index = begin; row_group_index < end; row_group_index++) {
+			if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+				throw InterruptException("Recluster task was cancelled");
+			}
+			task.GetTaskContext().InterruptCheck();
+			auto &partial_manager = *partial_managers[row_group_index];
+			RowGroupWriteInfo write_info(partial_manager, compression_types);
+			results[row_group_index] = row_groups[row_group_index].get().WriteToDisk(write_info);
+			partial_manager.FlushPartialBlocks();
 		}
-		task.GetTaskContext().InterruptCheck();
-		RowGroupWriteInfo write_info(partial_manager, compression_types);
-		result = row_group.WriteToDisk(write_info);
-		partial_manager.FlushPartialBlocks();
 	}
 
 	string TaskType() const override {
@@ -52,10 +57,12 @@ public:
 
 private:
 	RangeTask &task;
-	const RowGroup &row_group;
-	PartialBlockManager &partial_manager;
+	const vector<const_reference<RowGroup>> &row_groups;
+	vector<unique_ptr<PartialBlockManager>> &partial_managers;
 	const vector<CompressionType> &compression_types;
-	RowGroupWriteData &result;
+	vector<RowGroupWriteData> &results;
+	idx_t begin;
+	idx_t end;
 };
 
 static vector<block_id_t> UniqueSortedBlocks(vector<block_id_t> blocks) {
@@ -420,9 +427,13 @@ void ReclusterOutputWriter::Write() {
 		for (idx_t row_group_index = 0; row_group_index < row_groups.size(); row_group_index++) {
 			partial_managers.push_back(make_uniq<PartialBlockManager>(
 			    QueryContext(), block_manager, PartialBlockType::RECLUSTER_TASK, optional_idx(0), 1));
-			executor.ScheduleTask(make_uniq<ReclusterRowGroupWriteTask>(executor, task, row_groups[row_group_index],
-			                                                            *partial_managers.back(), compression_types,
-			                                                            write_data[row_group_index]));
+		}
+		auto task_count = MinValue(row_groups.size(), task_context.GetThreadLimit(scheduler.NumberOfThreads()));
+		for (idx_t task_index = 0; task_index < task_count; task_index++) {
+			auto begin = row_groups.size() * task_index / task_count;
+			auto end = row_groups.size() * (task_index + 1) / task_count;
+			executor.ScheduleTask(make_uniq<ReclusterRowGroupWriteTask>(executor, task, row_groups, partial_managers,
+			                                                            compression_types, write_data, begin, end));
 		}
 		executor.WorkOnTasks();
 		if (write_data.size() != row_group_indexes.size()) {

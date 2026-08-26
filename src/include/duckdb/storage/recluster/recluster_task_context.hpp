@@ -28,7 +28,7 @@ public:
 	ReclusterTaskContext(persistent_table_id_t table_id, uint64_t initialization_token, ReclusterCandidate candidate,
 	                     SortOrderDefinition sort_definition, vector<idx_t> physical_sort_indexes,
 	                     shared_ptr<DataTable> storage, AttachedDatabase &db,
-	                     optional_ptr<ClientContext> driver_context = nullptr);
+	                     optional_ptr<ClientContext> driver_context = nullptr, idx_t max_threads = 0);
 	~ReclusterTaskContext();
 
 	persistent_table_id_t GetTableId() const {
@@ -62,6 +62,7 @@ public:
 	ClientContext &GetSnapshotContext();
 	DuckTransaction &GetSnapshotTransaction();
 	void InterruptCheck() const;
+	idx_t GetThreadLimit(idx_t available_threads) const;
 	void CloseSnapshot();
 	bool HasOutput() const {
 		return output != nullptr;
@@ -82,6 +83,7 @@ private:
 	shared_ptr<AttachedDatabase> db;
 	unique_ptr<Connection> snapshot_connection;
 	optional_ptr<ClientContext> driver_context;
+	idx_t max_threads;
 	transaction_t snapshot_start_time;
 	unique_ptr<ReclusterOutput> output;
 };

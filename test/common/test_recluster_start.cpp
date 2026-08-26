@@ -37,11 +37,12 @@ static ReclusterCandidate SelectStartCandidate(Connection &con, const string &ta
 }
 
 static ReclusterTaskStartResult StartCandidate(Connection &con, const string &table_name,
-                                               const ReclusterCandidate &candidate) {
+                                               const ReclusterCandidate &candidate, idx_t max_threads = 0) {
 	ReclusterTaskStartResult result;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
-		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(entry, candidate);
+		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(
+		    entry, candidate, nullptr, max_threads);
 	});
 	return result;
 }
@@ -80,7 +81,7 @@ TEST_CASE("Recluster task start revalidates and registers a read snapshot", "[st
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT start_db"));
 
 	auto candidate = SelectStartCandidate(con, "tbl", {4096, 2, 4, 0.25});
-	auto result = StartCandidate(con, "tbl", candidate);
+	auto result = StartCandidate(con, "tbl", candidate, 2);
 	REQUIRE(result.status == ReclusterTaskStartStatus::STARTED);
 	REQUIRE(result.task);
 	REQUIRE(result.task->GetState() == RangeTaskState::PREPARING);
@@ -94,6 +95,8 @@ TEST_CASE("Recluster task start revalidates and registers a read snapshot", "[st
 	REQUIRE(task_context.GetSortDefinition().sort_order_id == candidate.sort_order_id);
 	REQUIRE(task_context.GetPhysicalSortIndexes().size() == 1);
 	REQUIRE(task_context.GetPhysicalSortIndexes()[0] == 0);
+	REQUIRE(task_context.GetThreadLimit(8) == 2);
+	REQUIRE(task_context.GetThreadLimit(1) == 1);
 
 	auto state = GetStartTestState(con, "tbl");
 	REQUIRE(state);

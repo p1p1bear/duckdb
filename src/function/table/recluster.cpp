@@ -31,7 +31,8 @@ struct ReclusterFunctionData : public TableFunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ReclusterFunctionData>();
 		return table_name == other.table_name && options.create_checkpoint == other.options.create_checkpoint &&
-		       options.max_bytes == other.options.max_bytes && options.max_tasks == other.options.max_tasks;
+		       options.max_bytes == other.options.max_bytes && options.max_tasks == other.options.max_tasks &&
+		       options.max_threads == other.options.max_threads;
 	}
 };
 

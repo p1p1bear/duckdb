@@ -129,8 +129,14 @@ void ReclusterSorter::Prepare() {
 		sort = make_uniq<Sort>(context, orders, output_types, vector<idx_t>());
 		global_sink = sort->GetGlobalSinkState(context);
 		TaskExecutor executor(context);
-		for (auto &row_group : task_context.GetCandidate().expected_row_groups) {
-			auto range = RowGroupRange {row_group.start, row_group.start + NumericCast<row_t>(row_group.count)};
+		auto &row_groups = task_context.GetCandidate().expected_row_groups;
+		auto available_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+		auto task_count = MinValue(row_groups.size(), task_context.GetThreadLimit(available_threads));
+		for (idx_t task_index = 0; task_index < task_count; task_index++) {
+			auto begin = row_groups.size() * task_index / task_count;
+			auto end = row_groups.size() * (task_index + 1) / task_count;
+			auto range = RowGroupRange {row_groups[begin].start,
+			                            row_groups[end - 1].start + NumericCast<row_t>(row_groups[end - 1].count)};
 			executor.ScheduleTask(make_uniq<ReclusterSortSinkTask>(executor, *this, range));
 		}
 		executor.WorkOnTasks();

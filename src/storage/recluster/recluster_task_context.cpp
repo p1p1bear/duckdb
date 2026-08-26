@@ -13,11 +13,12 @@ namespace duckdb {
 ReclusterTaskContext::ReclusterTaskContext(persistent_table_id_t table_id_p, uint64_t initialization_token_p,
                                            ReclusterCandidate candidate_p, SortOrderDefinition sort_definition_p,
                                            vector<idx_t> physical_sort_indexes_p, shared_ptr<DataTable> storage_p,
-                                           AttachedDatabase &db_p, optional_ptr<ClientContext> driver_context_p)
+                                           AttachedDatabase &db_p, optional_ptr<ClientContext> driver_context_p,
+                                           idx_t max_threads_p)
     : table_id(table_id_p), initialization_token(initialization_token_p), candidate(std::move(candidate_p)),
       sort_definition(std::move(sort_definition_p)), physical_sort_indexes(std::move(physical_sort_indexes_p)),
       storage(std::move(storage_p)), row_id_remap(candidate.expected_row_groups), db(db_p.shared_from_this()),
-      driver_context(driver_context_p), snapshot_start_time(0) {
+      driver_context(driver_context_p), max_threads(max_threads_p), snapshot_start_time(0) {
 	if (table_id == hugeint_t(0, 0) || initialization_token == 0 || !storage || sort_definition.columns.empty() ||
 	    sort_definition.sort_order_id != candidate.sort_order_id ||
 	    physical_sort_indexes.size() != sort_definition.columns.size()) {
@@ -30,6 +31,13 @@ ReclusterTaskContext::ReclusterTaskContext(persistent_table_id_t table_id_p, uin
 	transaction_context.SetReadOnly();
 	auto &transaction = DuckTransaction::Get(*snapshot_connection->context, db_p);
 	snapshot_start_time = transaction.start_time;
+}
+
+idx_t ReclusterTaskContext::GetThreadLimit(idx_t available_threads) const {
+	if (available_threads == 0) {
+		return 1;
+	}
+	return max_threads == 0 ? available_threads : MinValue(available_threads, max_threads);
 }
 
 ReclusterTaskContext::~ReclusterTaskContext() {

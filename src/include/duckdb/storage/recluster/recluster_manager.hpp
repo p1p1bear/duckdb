@@ -38,6 +38,8 @@ struct ReclusterExplicitOptions {
 	bool create_checkpoint = false;
 	idx_t max_bytes = 0;
 	idx_t max_tasks = 0;
+	//! Internal execution limit. Zero uses the connection's configured thread count.
+	idx_t max_threads = 0;
 };
 
 struct ReclusterExplicitResult {
@@ -83,7 +85,7 @@ public:
 	//! Called after WAL replay to synchronize the final recovered catalog without creating new candidates.
 	void SynchronizeLoadedCatalog();
 	ReclusterTaskStartResult TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
-	                                      optional_ptr<ClientContext> driver_context = nullptr);
+	                                      optional_ptr<ClientContext> driver_context = nullptr, idx_t max_threads = 0);
 	ReclusterTaskFinalizeStatus FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task);
 	ReclusterExplicitResult RunExplicit(ClientContext &context, const QualifiedName &table_name,
 	                                    const ReclusterExplicitOptions &options);
