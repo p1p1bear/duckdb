@@ -5,13 +5,52 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
 
 #include <cmath>
 
 namespace duckdb {
+
+static constexpr idx_t RECLUSTER_REMAP_MEMORY_DIVISOR = 64;
+static constexpr idx_t RECLUSTER_INPUT_MEMORY_DIVISOR = 8;
+
+idx_t GetReclusterRowGroupLimit(DataTable &storage) {
+	auto row_group_size = storage.GetRowGroupSize();
+	if (row_group_size == 0) {
+		throw InternalException("Recluster candidate requires a non-zero row group size");
+	}
+	auto max_memory = BufferManager::GetBufferManager(storage.GetAttached()).GetMaxMemory();
+	auto remap_budget = max_memory / RECLUSTER_REMAP_MEMORY_DIVISOR;
+	auto minimum_rows =
+	    row_group_size > NumericLimits<idx_t>::Maximum() / 2 ? NumericLimits<idx_t>::Maximum() : row_group_size * 2;
+	auto minimum_budget = minimum_rows > NumericLimits<idx_t>::Maximum() / sizeof(row_t)
+	                          ? NumericLimits<idx_t>::Maximum()
+	                          : minimum_rows * sizeof(row_t);
+	remap_budget = MaxValue(remap_budget, minimum_budget);
+	auto max_rows = remap_budget / sizeof(row_t);
+	return MaxValue<idx_t>(max_rows / row_group_size, 2);
+}
+
+idx_t GetReclusterTaskInputByteLimit(DataTable &storage) {
+	auto max_memory = BufferManager::GetBufferManager(storage.GetAttached()).GetMaxMemory();
+	auto block_size = storage.GetTableIOManager().GetBlockManagerForRowData().GetBlockAllocSize();
+	return MaxValue(max_memory / RECLUSTER_INPUT_MEMORY_DIVISOR, block_size);
+}
+
+ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups) {
+	if (max_row_groups == 0) {
+		throw InternalException("Recluster candidate requires a non-zero row group limit");
+	}
+	auto row_group_size = storage.GetRowGroupSize();
+	auto max_rows = row_group_size > NumericLimits<idx_t>::Maximum() / max_row_groups ? NumericLimits<idx_t>::Maximum()
+	                                                                                  : row_group_size * max_row_groups;
+	return {max_rows, max_row_groups, 4, 0.25};
+}
 
 struct CandidateRowGroupState {
 	bool available = false;

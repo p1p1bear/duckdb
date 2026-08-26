@@ -34,6 +34,8 @@
 
 namespace duckdb {
 
+static constexpr idx_t RECLUSTER_CONVERSION_ROW_GROUP_TARGET = 32;
+
 ReclusterManager::ReclusterManager(AttachedDatabase &db_p)
     : db(db_p), wal_block_retention(db_p), retirement_registry(db_p) {
 	InitializeAutoScheduler();
@@ -667,13 +669,6 @@ static void CancelExplicitTask(TableReclusterState &state, const shared_ptr<Rang
 	}
 }
 
-static ReclusterCandidateLimits ExplicitCandidateLimits(DataTable &storage, idx_t max_row_groups) {
-	auto row_group_size = storage.GetRowGroupSize();
-	auto max_rows = row_group_size > NumericLimits<idx_t>::Maximum() / max_row_groups ? NumericLimits<idx_t>::Maximum()
-	                                                                                  : row_group_size * max_row_groups;
-	return {max_rows, max_row_groups, 4, 0.25};
-}
-
 ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, const QualifiedName &table_name,
                                                       const ReclusterExplicitOptions &options) {
 	if (options.max_bytes == 0 || options.max_tasks == 0) {
@@ -726,30 +721,46 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 			break;
 		}
 
-		auto remaining_budget = options.max_bytes - result.input_bytes;
-		idx_t max_row_groups = 32;
+		auto caller_remaining_budget = options.max_bytes - result.input_bytes;
+		auto remaining_budget = MinValue(caller_remaining_budget, GetReclusterTaskInputByteLimit(*storage));
+		auto max_row_group_limit = GetReclusterRowGroupLimit(*storage);
+		auto checkpoint = state->GetLastCheckpoint();
+		if (checkpoint) {
+			max_row_group_limit = MinValue(max_row_group_limit, MaxValue<idx_t>(checkpoint->row_groups.size(), 1));
+		}
+		idx_t max_row_groups = MinValue(max_row_group_limit, RECLUSTER_CONVERSION_ROW_GROUP_TARGET);
+		bool expanded_for_run = false;
 		ReclusterCandidateSelection selection;
 		idx_t candidate_bytes = 0;
 		while (true) {
-			auto limits = ExplicitCandidateLimits(*storage, max_row_groups);
+			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups);
 			selection = SelectReclusterCandidate(*storage->GetRowGroupCollection(), storage->Columns(), *state, limits);
 			if (!selection.candidate) {
+				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
+				    selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT) {
+					max_row_groups = max_row_group_limit;
+					expanded_for_run = true;
+					continue;
+				}
 				break;
 			}
 			candidate_bytes = EstimateReclusterRangeBytes(*storage, selection.candidate->range);
-			if (candidate_bytes <= remaining_budget) {
+			if (candidate_bytes <= remaining_budget ||
+			    (selection.candidate->row_group_count == 1 && candidate_bytes <= caller_remaining_budget)) {
 				break;
 			}
 			if (selection.candidate->row_group_count <= 1) {
 				selection.candidate.reset();
 				break;
 			}
-			max_row_groups = selection.candidate->row_group_count - 1;
+			auto scaled_row_groups = static_cast<idx_t>(
+			    (static_cast<long double>(selection.candidate->row_group_count) * remaining_budget) / candidate_bytes);
+			max_row_groups = MinValue(selection.candidate->row_group_count - 1, MaxValue<idx_t>(scaled_row_groups, 1));
 		}
 
 		if (!selection.candidate) {
 			result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
-			if (candidate_bytes > remaining_budget || result.input_bytes >= options.max_bytes) {
+			if (candidate_bytes > caller_remaining_budget || result.input_bytes >= options.max_bytes) {
 				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
 				result.message = "the remaining byte budget cannot admit another row group";
 				break;

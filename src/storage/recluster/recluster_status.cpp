@@ -261,10 +261,7 @@ static bool IsCheckpointedRowGroup(RowGroup &row_group, row_t row_start, const v
 }
 
 static ReclusterCandidateLimits StatusCandidateLimits(DataTable &storage) {
-	auto row_group_size = storage.GetRowGroupSize();
-	auto max_rows =
-	    row_group_size > NumericLimits<idx_t>::Maximum() / 32 ? NumericLimits<idx_t>::Maximum() : row_group_size * 32;
-	return {max_rows, 32, 4, 0.25};
+	return GetReclusterCandidateLimits(storage, GetReclusterRowGroupLimit(storage));
 }
 
 ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {

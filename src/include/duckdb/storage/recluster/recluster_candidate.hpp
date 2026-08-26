@@ -13,6 +13,7 @@
 
 namespace duckdb {
 
+class DataTable;
 class RowGroupCollection;
 class TableReclusterState;
 
@@ -31,6 +32,10 @@ struct ReclusterCandidateLimits {
 	idx_t max_merge_runs = 0;
 	double delete_cleanup_ratio = 0;
 };
+
+idx_t GetReclusterRowGroupLimit(DataTable &storage);
+idx_t GetReclusterTaskInputByteLimit(DataTable &storage);
+ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups);
 
 struct ReclusterCandidate {
 	ReclusterCandidateType type = ReclusterCandidateType::CONVERSION;

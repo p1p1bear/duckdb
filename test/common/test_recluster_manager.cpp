@@ -171,7 +171,7 @@ TEST_CASE("Successful checkpoints schedule automatic recluster work", "[storage]
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Maintenance commits chain automatic work across task limits", "[storage][recluster_auto]") {
+TEST_CASE("Maintenance commits chain bounded automatic conversion tasks", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_task_chain.db");
 	DeleteDatabase(path);
 	DuckDB db;
