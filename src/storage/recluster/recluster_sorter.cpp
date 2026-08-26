@@ -10,34 +10,12 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_range_scanner.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 
 namespace duckdb {
-
-static vector<BoundOrderByNode> BuildReclusterSortOrders(const ReclusterTaskContext &task_context,
-                                                         const vector<LogicalType> &input_types) {
-	const auto &sort_definition = task_context.GetSortDefinition();
-	const auto &sort_indexes = task_context.GetPhysicalSortIndexes();
-	if (input_types.empty() || sort_definition.columns.size() != sort_indexes.size()) {
-		throw InternalException("Invalid recluster sort definition");
-	}
-
-	vector<BoundOrderByNode> result;
-	result.reserve(sort_indexes.size());
-	for (idx_t sort_index = 0; sort_index < sort_indexes.size(); sort_index++) {
-		auto column_index = sort_indexes[sort_index];
-		if (column_index >= input_types.size() - 1) {
-			throw InternalException("Recluster sort column is outside the physical table columns");
-		}
-		auto &sort_column = sort_definition.columns[sort_index];
-		result.emplace_back(sort_column.order_type, sort_column.null_order,
-		                    make_uniq<BoundReferenceExpression>(input_types[column_index], column_index));
-	}
-	return result;
-}
 
 ReclusterSorter::ReclusterSorter(RangeTask &task_p) : task(task_p), task_context(task.GetTaskContext()) {
 	if (task.GetState() != RangeTaskState::PREPARING || !task_context.HasActiveSnapshot()) {
@@ -146,7 +124,8 @@ void ReclusterSorter::Prepare() {
 		CheckTask();
 		output_types = ReclusterRangeScanner::GetOutputTypes(task_context);
 		auto &context = task_context.GetSnapshotContext();
-		auto orders = BuildReclusterSortOrders(task_context, output_types);
+		auto orders = BuildPersistentSortOrders(task_context.GetSortDefinition(), task_context.GetPhysicalSortIndexes(),
+		                                        output_types, output_types.size() - 1);
 		sort = make_uniq<Sort>(context, orders, output_types, vector<idx_t>());
 		global_sink = sort->GetGlobalSinkState(context);
 		TaskExecutor executor(context);

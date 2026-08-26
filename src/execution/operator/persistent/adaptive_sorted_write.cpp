@@ -8,9 +8,9 @@
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 
@@ -32,32 +32,6 @@ bool InsertOrderToken::operator<(const InsertOrderToken &other) const {
 		return batch_index.GetIndex() < other.batch_index.GetIndex();
 	}
 	return chunk_index < other.chunk_index;
-}
-
-static vector<BoundOrderByNode> BuildAdaptiveSortOrders(const DuckTableEntry &table,
-                                                        const SortOrderDefinition &definition,
-                                                        const vector<LogicalType> &input_types) {
-	vector<BoundOrderByNode> result;
-	auto &columns = table.GetColumns();
-	if (columns.PhysicalColumnCount() != input_types.size()) {
-		throw InternalException("Adaptive sorted write input does not match the target table");
-	}
-	for (auto &sort_column : definition.columns) {
-		optional_idx physical_index;
-		for (idx_t column_idx = 0; column_idx < columns.PhysicalColumnCount(); column_idx++) {
-			if (columns.GetColumn(PhysicalIndex(column_idx)).PersistentColumnId() == sort_column.column_id) {
-				physical_index = column_idx;
-				break;
-			}
-		}
-		if (!physical_index.IsValid()) {
-			throw InternalException("Current SORTED BY definition references a missing column ID");
-		}
-		auto column_idx = physical_index.GetIndex();
-		result.emplace_back(sort_column.order_type, sort_column.null_order,
-		                    make_uniq<BoundReferenceExpression>(input_types[column_idx], column_idx));
-	}
-	return result;
 }
 
 AdaptiveSortedWrite::AdaptiveSortedWrite(ClientContext &context, DuckTableEntry &table_p,
@@ -155,7 +129,8 @@ void AdaptiveSortedWrite::ThrowFailure(unique_lock<mutex> &guard) const {
 }
 
 void AdaptiveSortedWrite::InitializeSort(ClientContext &context) {
-	auto orders = BuildAdaptiveSortOrders(table, sort_definition, input_types);
+	auto physical_indexes = BindPersistentSortIndexes(table.GetStorage().Columns(), sort_definition);
+	auto orders = BuildPersistentSortOrders(sort_definition, physical_indexes, input_types, input_types.size());
 	auto initialized_sort = make_uniq<Sort>(context, orders, input_types, vector<idx_t>());
 	auto initialized_sink = initialized_sort->GetGlobalSinkState(context);
 	{

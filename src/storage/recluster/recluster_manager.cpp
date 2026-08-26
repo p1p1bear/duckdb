@@ -21,6 +21,7 @@
 #include "duckdb/storage/recluster/recluster_output_writer.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
@@ -169,26 +170,6 @@ void ReclusterManager::SynchronizeLoadedCatalog() {
 			SynchronizeTable(table);
 		}
 	});
-}
-
-static vector<idx_t> BindReclusterSortIndexes(const vector<ColumnDefinition> &columns,
-                                              const SortOrderDefinition &definition) {
-	vector<idx_t> result;
-	result.reserve(definition.columns.size());
-	for (auto &sort_column : definition.columns) {
-		optional_idx physical_index;
-		for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
-			if (columns[column_index].PersistentColumnId() == sort_column.column_id) {
-				physical_index = column_index;
-				break;
-			}
-		}
-		if (!physical_index.IsValid()) {
-			throw InternalException("Current SORTED BY definition references a missing storage column ID");
-		}
-		result.push_back(physical_index.GetIndex());
-	}
-	return result;
 }
 
 static recluster_task_id_t GenerateReclusterTaskId(TableReclusterState &state) {
@@ -375,7 +356,7 @@ ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, c
 			return {};
 		}
 
-		auto physical_sort_indexes = BindReclusterSortIndexes(storage.Columns(), *definition);
+		auto physical_sort_indexes = BindPersistentSortIndexes(storage.Columns(), *definition);
 		auto task_id = GenerateReclusterTaskId(*state);
 		auto task_context = make_uniq<ReclusterTaskContext>(
 		    metadata.table_id, state->GetInitializationToken(), std::move(*validated), *definition,

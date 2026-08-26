@@ -11,6 +11,9 @@
 
 namespace duckdb {
 class ColumnList;
+class ColumnDefinition;
+class LogicalType;
+struct BoundOrderByNode;
 struct OrderByNode;
 
 SortOrderDefinition BindPersistentSortDefinition(const vector<OrderByNode> &orders, const ColumnList &columns,
@@ -20,5 +23,9 @@ TableSortCatalogPostImage BuildTableSortPostImage(const TableSortCatalogMetadata
 void ApplyTableSortPostImage(const TableSortCatalogPostImage &post_image, ColumnList &columns,
                              optional<TableSortCatalogMetadata> &metadata);
 void ValidateTableSortCatalogMetadata(const TableSortCatalogMetadata &metadata, const ColumnList &columns);
+vector<idx_t> BindPersistentSortIndexes(const vector<ColumnDefinition> &columns, const SortOrderDefinition &definition);
+vector<BoundOrderByNode> BuildPersistentSortOrders(const SortOrderDefinition &definition,
+                                                   const vector<idx_t> &physical_indexes,
+                                                   const vector<LogicalType> &input_types, idx_t physical_column_count);
 
 } // namespace duckdb

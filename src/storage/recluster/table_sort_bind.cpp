@@ -5,6 +5,8 @@
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
 
@@ -170,6 +172,49 @@ void ValidateTableSortCatalogMetadata(const TableSortCatalogMetadata &metadata, 
 			                             sort_column.column_id);
 		}
 	}
+}
+
+vector<idx_t> BindPersistentSortIndexes(const vector<ColumnDefinition> &columns,
+                                        const SortOrderDefinition &definition) {
+	vector<idx_t> result;
+	result.reserve(definition.columns.size());
+	for (auto &sort_column : definition.columns) {
+		optional_idx physical_index;
+		for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+			if (columns[column_index].PersistentColumnId() == sort_column.column_id) {
+				physical_index = column_index;
+				break;
+			}
+		}
+		if (!physical_index.IsValid()) {
+			throw InternalException("Current SORTED BY definition references a missing storage column ID");
+		}
+		result.push_back(physical_index.GetIndex());
+	}
+	return result;
+}
+
+vector<BoundOrderByNode> BuildPersistentSortOrders(const SortOrderDefinition &definition,
+                                                   const vector<idx_t> &physical_indexes,
+                                                   const vector<LogicalType> &input_types,
+                                                   idx_t physical_column_count) {
+	if (definition.columns.empty() || definition.columns.size() != physical_indexes.size() ||
+	    physical_column_count > input_types.size()) {
+		throw InternalException("Invalid persistent sort definition");
+	}
+
+	vector<BoundOrderByNode> result;
+	result.reserve(physical_indexes.size());
+	for (idx_t sort_index = 0; sort_index < physical_indexes.size(); sort_index++) {
+		auto column_index = physical_indexes[sort_index];
+		if (column_index >= physical_column_count) {
+			throw InternalException("SORTED BY column is outside the physical table columns");
+		}
+		auto &sort_column = definition.columns[sort_index];
+		result.emplace_back(sort_column.order_type, sort_column.null_order,
+		                    make_uniq<BoundReferenceExpression>(input_types[column_index], column_index));
+	}
+	return result;
 }
 
 } // namespace duckdb
