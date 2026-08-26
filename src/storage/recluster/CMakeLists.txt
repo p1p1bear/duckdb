@@ -2,6 +2,7 @@ add_library_unity(
   duckdb_storage_recluster
   OBJECT
   checkpoint_snapshot.cpp
+  recluster_block_metrics.cpp
   recluster_candidate.cpp
   recluster_auto_scheduler.cpp
   recluster_commit.cpp

@@ -15,6 +15,7 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
+#include "duckdb/storage/recluster/recluster_block_metrics.hpp"
 #include "duckdb/storage/recluster/recluster_commit.hpp"
 #include "duckdb/storage/recluster/recluster_delete_catchup.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
@@ -199,73 +200,24 @@ const char *ReclusterExplicitStateToString(ReclusterExplicitState state) {
 	}
 }
 
-class ReclusterByteEstimateCollector : public BlockIdVisitor {
-public:
-	void Visit(block_id_t block_id) override {
+static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange &range) {
+	unordered_set<block_id_t> blocks;
+	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot(), range);
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		AddReclusterRowGroupBlocks(*entry.row_group, blocks);
+	}
+	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
+}
+
+static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block_id_t> &block_ids) {
+	unordered_set<block_id_t> blocks;
+	for (auto block_id : block_ids) {
 		if (block_id >= 0) {
 			blocks.insert(block_id);
 		}
 	}
-
-	void Add(const MetaBlockPointer &pointer) {
-		if (pointer.IsValid()) {
-			Visit(pointer.GetBlockId());
-		}
-	}
-
-	void Add(RowGroup &row_group) {
-		for (idx_t column_index = 0; column_index < row_group.GetColumnCount(); column_index++) {
-			row_group.GetRawColumnData(column_index).VisitBlockIds(*this);
-		}
-		for (auto &pointer : row_group.GetColumnStartPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetExtraMetadataBlockPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetDeleteStartPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetLoadedDeleteStoragePointers()) {
-			Add(pointer);
-		}
-	}
-
-	idx_t GetByteSize(const BlockManager &block_manager) const {
-		auto block_size = block_manager.GetBlockAllocSize();
-		if (block_size != 0 && blocks.size() > NumericLimits<idx_t>::Maximum() / block_size) {
-			return NumericLimits<idx_t>::Maximum();
-		}
-		return blocks.size() * block_size;
-	}
-
-private:
-	unordered_set<block_id_t> blocks;
-};
-
-static idx_t AddReclusterBytes(idx_t left, idx_t right) {
-	if (right > NumericLimits<idx_t>::Maximum() - left) {
-		return NumericLimits<idx_t>::Maximum();
-	}
-	return left + right;
-}
-
-static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange &range) {
-	ReclusterByteEstimateCollector collector;
-	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot(), range);
-	LayoutRowGroupEntry entry;
-	while (cursor.Next(entry)) {
-		collector.Add(*entry.row_group);
-	}
-	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
-}
-
-static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block_id_t> &block_ids) {
-	ReclusterByteEstimateCollector collector;
-	for (auto block_id : block_ids) {
-		collector.Visit(block_id);
-	}
-	return collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 }
 
 idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
@@ -294,7 +246,7 @@ idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, Tabl
 		row_groups.push_back(entry);
 	}
 
-	ReclusterByteEstimateCollector collector;
+	unordered_set<block_id_t> blocks;
 	idx_t transient_bytes = 0;
 	bool has_remaining_work = false;
 	auto include_current_runs = current_run_count > 1 || (has_old_organization && current_run_count > 0);
@@ -308,11 +260,11 @@ idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, Tabl
 		    static_cast<long double>(physical_rows - live_rows) >= static_cast<long double>(physical_rows) * 0.25;
 		if (!is_current || include_current_runs || needs_delete_cleanup) {
 			has_remaining_work = true;
-			transient_bytes = AddReclusterBytes(transient_bytes, row_group.GetAllocationSize());
-			collector.Add(row_group);
+			transient_bytes = SaturatingAddReclusterValue(transient_bytes, row_group.GetAllocationSize());
+			AddReclusterRowGroupBlocks(row_group, blocks);
 		}
 	}
-	auto persistent_bytes = collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+	auto persistent_bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 	if (persistent_bytes > 0 || !has_remaining_work) {
 		return persistent_bytes;
 	}
@@ -689,7 +641,6 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		return result;
 	}
 	auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
-
 	bool checkpoint_created = false;
 	idx_t stale_attempts = 0;
 	while (result.tasks_completed < options.max_tasks) {
@@ -809,8 +760,8 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
 			result.tasks_completed++;
-			result.input_bytes = AddReclusterBytes(result.input_bytes, candidate_bytes);
-			result.output_bytes = AddReclusterBytes(result.output_bytes, task_output_bytes);
+			result.input_bytes = SaturatingAddReclusterValue(result.input_bytes, candidate_bytes);
+			result.output_bytes = SaturatingAddReclusterValue(result.output_bytes, task_output_bytes);
 		} catch (...) {
 			auto error = std::current_exception();
 			CancelExplicitTask(*state, start.task);

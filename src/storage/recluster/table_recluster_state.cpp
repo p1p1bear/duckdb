@@ -198,10 +198,6 @@ vector<RowGroupRange> TableReclusterState::GetReservedRanges() const {
 	return result;
 }
 
-static idx_t AddStatusCount(idx_t left, idx_t right) {
-	return right > NumericLimits<idx_t>::Maximum() - left ? NumericLimits<idx_t>::Maximum() : left + right;
-}
-
 TableReclusterTaskStatus TableReclusterState::GetTaskStatus() const {
 	lock_guard<mutex> guard(task_lock);
 	TableReclusterTaskStatus result;
@@ -221,8 +217,9 @@ TableReclusterTaskStatus TableReclusterState::GetTaskStatus() const {
 		default:
 			break;
 		}
-		result.pending_delete_rows = AddStatusCount(result.pending_delete_rows, task_status.pending_delete_rows);
-		result.prepared_bytes = AddStatusCount(result.prepared_bytes, task_status.prepared_bytes);
+		result.pending_delete_rows =
+		    SaturatingAddReclusterValue(result.pending_delete_rows, task_status.pending_delete_rows);
+		result.prepared_bytes = SaturatingAddReclusterValue(result.prepared_bytes, task_status.prepared_bytes);
 	}
 	return result;
 }

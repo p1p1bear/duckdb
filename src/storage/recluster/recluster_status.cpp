@@ -10,6 +10,7 @@
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
+#include "duckdb/storage/recluster/recluster_block_metrics.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
@@ -25,58 +26,10 @@
 
 namespace duckdb {
 
-static idx_t AddStatusBytes(idx_t left, idx_t right) {
-	return right > NumericLimits<idx_t>::Maximum() - left ? NumericLimits<idx_t>::Maximum() : left + right;
-}
-
-class ReclusterStatusBlockCollector : public BlockIdVisitor {
-public:
-	void Visit(block_id_t block_id) override {
-		if (block_id >= 0) {
-			blocks.insert(block_id);
-		}
-	}
-
-	void Add(const MetaBlockPointer &pointer) {
-		if (pointer.IsValid()) {
-			Visit(pointer.GetBlockId());
-		}
-	}
-
-	void Add(RowGroup &row_group) {
-		for (idx_t column_index = 0; column_index < row_group.GetColumnCount(); column_index++) {
-			row_group.GetRawColumnData(column_index).VisitBlockIds(*this);
-		}
-		for (auto &pointer : row_group.GetColumnStartPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetExtraMetadataBlockPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetDeleteStartPointers()) {
-			Add(pointer);
-		}
-		for (auto &pointer : row_group.GetLoadedDeleteStoragePointers()) {
-			Add(pointer);
-		}
-	}
-
-	idx_t GetByteSize(const BlockManager &block_manager) const {
-		auto block_size = block_manager.GetBlockAllocSize();
-		if (block_size != 0 && blocks.size() > NumericLimits<idx_t>::Maximum() / block_size) {
-			return NumericLimits<idx_t>::Maximum();
-		}
-		return blocks.size() * block_size;
-	}
-
-private:
-	unordered_set<block_id_t> blocks;
-};
-
 static idx_t EstimateRowGroupBytes(DataTable &storage, RowGroup &row_group) {
-	ReclusterStatusBlockCollector collector;
-	collector.Add(row_group);
-	auto bytes = collector.GetByteSize(storage.GetTableIOManager().GetBlockManagerForRowData());
+	unordered_set<block_id_t> blocks;
+	AddReclusterRowGroupBlocks(row_group, blocks);
+	auto bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 	if (bytes > 0) {
 		return bytes;
 	}
@@ -321,27 +274,27 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		auto live_rows = row_group.GetCommittedRowCount();
 		auto physical_bytes = EstimateRowGroupBytes(storage, row_group);
 		auto live_bytes = EstimateLiveBytes(physical_bytes, physical_rows, live_rows);
-		total_live_bytes = AddStatusBytes(total_live_bytes, live_bytes);
+		total_live_bytes = SaturatingAddReclusterValue(total_live_bytes, live_bytes);
 		auto organization = row_group.GetSortMetadata();
 		auto is_current = organization.sort_order_id == result.current_sort_order_id;
 		if (is_current) {
-			current_live_bytes = AddStatusBytes(current_live_bytes, live_bytes);
+			current_live_bytes = SaturatingAddReclusterValue(current_live_bytes, live_bytes);
 			if (runs.empty() || runs.back().run_id != organization.run_id) {
 				ReclusterRunStatus run;
 				run.run_id = organization.run_id;
 				runs.push_back(std::move(run));
 			}
 			auto &run = runs.back();
-			run.live_bytes = AddStatusBytes(run.live_bytes, live_bytes);
+			run.live_bytes = SaturatingAddReclusterValue(run.live_bytes, live_bytes);
 			AddRunStatistics(run, row_group, first_sort_index.GetIndex(), live_rows);
 		}
 
 		if (!organization.IsSorted()) {
-			result.unsorted_bytes = AddStatusBytes(result.unsorted_bytes, physical_bytes);
+			result.unsorted_bytes = SaturatingAddReclusterValue(result.unsorted_bytes, physical_bytes);
 			auto checkpointed = IsCheckpointedRowGroup(row_group, entry.row_start, storage.Columns(), checkpoint_index);
 			if (!checkpointed) {
 				result.not_checkpointed_unsorted_bytes =
-				    AddStatusBytes(result.not_checkpointed_unsorted_bytes, physical_bytes);
+				    SaturatingAddReclusterValue(result.not_checkpointed_unsorted_bytes, physical_bytes);
 			}
 			if (row_group.IsSealed() || checkpointed || physical_rows >= storage.GetRowGroupSize()) {
 				result.unsorted_row_groups++;
