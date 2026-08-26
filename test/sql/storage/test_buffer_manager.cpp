@@ -7,10 +7,209 @@
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/temporary_file_manager.hpp"
 #include "duckdb/common/enums/memory_tag.hpp"
 #include "test_helpers.hpp"
+#include "zstd.h"
+
+#include <array>
+#include <cstring>
 
 using namespace duckdb;
+
+namespace duckdb {
+
+class TemporaryFileCompressionTest {
+public:
+	struct Result {
+		Result(TemporaryBufferSize size_p, TemporaryCompressionLevel level_p, AllocatedData data_p)
+		    : size(size_p), level(level_p), data(std::move(data_p)) {
+		}
+
+		TemporaryBufferSize size;
+		TemporaryCompressionLevel level;
+		AllocatedData data;
+	};
+
+	static Result Compress(TemporaryFileManager &manager, TemporaryCompressionLevel level, FileBuffer &buffer) {
+		AllocatedData compressed_buffer;
+		auto result = manager.CompressBuffer(level, buffer, compressed_buffer);
+		return {result.size, result.level, std::move(compressed_buffer)};
+	}
+
+	static void UpdateAdaptivity(TemporaryFileCompressionAdaptivity &adaptivity, TemporaryCompressionLevel level,
+	                             TemporaryBufferSize size, int64_t duration) {
+		adaptivity.UpdateInternal(level, size, duration);
+	}
+
+	static int64_t GetDuration(const TemporaryFileCompressionAdaptivity &adaptivity, TemporaryCompressionLevel level) {
+		if (level == TemporaryCompressionLevel::UNCOMPRESSED) {
+			return adaptivity.last_uncompressed_write_ns;
+		}
+		return adaptivity.last_compressed_writes_ns[adaptivity.LevelToIndex(level)];
+	}
+
+	static idx_t GetStoredSize(const TemporaryFileCompressionAdaptivity &adaptivity, TemporaryCompressionLevel level) {
+		return adaptivity.last_compressed_sizes[adaptivity.LevelToIndex(level)];
+	}
+
+	static double GetCompressionAcceptance(const TemporaryFileCompressionAdaptivity &adaptivity,
+	                                       TemporaryCompressionLevel level) {
+		return adaptivity.last_compression_acceptance[adaptivity.LevelToIndex(level)];
+	}
+
+	static bool CompressionLevelIsBeneficial(const TemporaryFileCompressionAdaptivity &adaptivity,
+	                                         TemporaryCompressionLevel level) {
+		return adaptivity.CompressionLevelIsBeneficial(adaptivity.LevelToIndex(level));
+	}
+};
+
+} // namespace duckdb
+
+static unique_ptr<FileBuffer> CreateTemporaryCompressionBuffer(DatabaseInstance &db) {
+	auto &buffer_manager = BufferManager::GetBufferManager(db);
+	return buffer_manager.ConstructManagedBuffer(buffer_manager.GetBlockSize(), Storage::DEFAULT_BLOCK_HEADER_SIZE,
+	                                             nullptr);
+}
+
+static void FillPseudoRandom(FileBuffer &buffer, uint64_t state) {
+	auto data = buffer.InternalBuffer();
+	for (idx_t offset = 0; offset < buffer.AllocSize(); offset++) {
+		state ^= state >> 12;
+		state ^= state << 25;
+		state ^= state >> 27;
+		data[offset] = static_cast<uint8_t>(state * 2685821657736338717ULL);
+	}
+}
+
+static bool TemporaryCompressionRoundTrips(FileBuffer &input, const TemporaryFileCompressionTest::Result &result) {
+	if (!result.data.get() || result.data.GetSize() < sizeof(idx_t)) {
+		return false;
+	}
+	const auto compressed_size = Load<idx_t>(result.data.get());
+	if (compressed_size > result.data.GetSize() - sizeof(idx_t) ||
+	    compressed_size + sizeof(idx_t) > static_cast<idx_t>(result.size)) {
+		return false;
+	}
+	vector<uint8_t> decompressed(input.AllocSize());
+	const auto decompressed_size = duckdb_zstd::ZSTD_decompress(decompressed.data(), decompressed.size(),
+	                                                            result.data.get() + sizeof(idx_t), compressed_size);
+	return !duckdb_zstd::ZSTD_isError(decompressed_size) && decompressed_size == input.AllocSize() &&
+	       memcmp(decompressed.data(), input.InternalBuffer(), input.AllocSize()) == 0;
+}
+
+TEST_CASE("Temporary file compression caps output and round-trips", "[storage]") {
+	DuckDB db(nullptr);
+	atomic<idx_t> size_on_disk(0);
+	TemporaryFileManager manager(*db.instance, string(), size_on_disk);
+	auto buffer = CreateTemporaryCompressionBuffer(*db.instance);
+
+	auto uncompressed =
+	    TemporaryFileCompressionTest::Compress(manager, TemporaryCompressionLevel::UNCOMPRESSED, *buffer);
+	CHECK(uncompressed.size == TemporaryBufferSize::DEFAULT);
+	CHECK(uncompressed.level == TemporaryCompressionLevel::UNCOMPRESSED);
+	CHECK_FALSE(uncompressed.data.IsSet());
+
+	FillPseudoRandom(*buffer, 42);
+	auto rejected =
+	    TemporaryFileCompressionTest::Compress(manager, TemporaryCompressionLevel::ZSTD_MINUS_FIVE, *buffer);
+	CHECK(rejected.size == TemporaryBufferSize::DEFAULT);
+	CHECK(rejected.level == TemporaryCompressionLevel::ZSTD_MINUS_FIVE);
+	CHECK_FALSE(rejected.data.IsSet());
+
+	memset(buffer->InternalBuffer(), 0, buffer->AllocSize());
+	for (auto level : {TemporaryCompressionLevel::ZSTD_MINUS_FIVE, TemporaryCompressionLevel::ZSTD_FIVE,
+	                   TemporaryCompressionLevel::ZSTD_MINUS_FIVE}) {
+		auto compressed = TemporaryFileCompressionTest::Compress(manager, level, *buffer);
+		CHECK(compressed.size != TemporaryBufferSize::DEFAULT);
+		CHECK(compressed.level == level);
+		CHECK(compressed.data.GetSize() == static_cast<idx_t>(TemporaryBufferSize::S224K));
+		CHECK(TemporaryCompressionRoundTrips(*buffer, compressed));
+	}
+}
+
+TEST_CASE("Temporary file compression adaptivity warms up and tracks disk benefit", "[storage]") {
+	TemporaryFileCompressionAdaptivity adaptivity;
+	const array<TemporaryCompressionLevel, 7> levels {
+	    TemporaryCompressionLevel::UNCOMPRESSED,     TemporaryCompressionLevel::ZSTD_MINUS_FIVE,
+	    TemporaryCompressionLevel::ZSTD_MINUS_THREE, TemporaryCompressionLevel::ZSTD_MINUS_ONE,
+	    TemporaryCompressionLevel::ZSTD_ONE,         TemporaryCompressionLevel::ZSTD_THREE,
+	    TemporaryCompressionLevel::ZSTD_FIVE};
+	const array<TemporaryBufferSize, 7> sizes {TemporaryBufferSize::DEFAULT, TemporaryBufferSize::DEFAULT,
+	                                           TemporaryBufferSize::S224K,   TemporaryBufferSize::S128K,
+	                                           TemporaryBufferSize::S64K,    TemporaryBufferSize::S32K,
+	                                           TemporaryBufferSize::S32K};
+	const array<int64_t, 7> durations {100, 200, 180, 160, 140, 120, 110};
+
+	for (idx_t i = 0; i < levels.size(); i++) {
+		CHECK(adaptivity.GetCompressionLevel() == levels[i]);
+		TemporaryFileCompressionTest::UpdateAdaptivity(adaptivity, levels[i], sizes[i], durations[i]);
+		CHECK(TemporaryFileCompressionTest::GetDuration(adaptivity, levels[i]) == durations[i]);
+		if (levels[i] != TemporaryCompressionLevel::UNCOMPRESSED) {
+			CHECK(TemporaryFileCompressionTest::GetStoredSize(adaptivity, levels[i]) == static_cast<idx_t>(sizes[i]));
+		}
+	}
+
+	CHECK(TemporaryFileCompressionTest::GetCompressionAcceptance(
+	          adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_FIVE) == Approx(0.0));
+	CHECK(TemporaryFileCompressionTest::GetCompressionAcceptance(
+	          adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_THREE) == Approx(1.0));
+	CHECK_FALSE(TemporaryFileCompressionTest::CompressionLevelIsBeneficial(adaptivity,
+	                                                                       TemporaryCompressionLevel::ZSTD_MINUS_FIVE));
+	CHECK_FALSE(TemporaryFileCompressionTest::CompressionLevelIsBeneficial(
+	    adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_THREE));
+	CHECK(TemporaryFileCompressionTest::CompressionLevelIsBeneficial(adaptivity,
+	                                                                 TemporaryCompressionLevel::ZSTD_MINUS_ONE));
+
+	TemporaryFileCompressionAdaptivity noisy_rejection;
+	TemporaryFileCompressionTest::UpdateAdaptivity(noisy_rejection, TemporaryCompressionLevel::UNCOMPRESSED,
+	                                               TemporaryBufferSize::DEFAULT, 100);
+	TemporaryFileCompressionTest::UpdateAdaptivity(noisy_rejection, TemporaryCompressionLevel::ZSTD_MINUS_FIVE,
+	                                               TemporaryBufferSize::DEFAULT, 50);
+	CHECK_FALSE(TemporaryFileCompressionTest::CompressionLevelIsBeneficial(noisy_rejection,
+	                                                                       TemporaryCompressionLevel::ZSTD_MINUS_FIVE));
+
+	TemporaryFileCompressionTest::UpdateAdaptivity(adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_FIVE,
+	                                               TemporaryBufferSize::S128K, 360);
+	CHECK(TemporaryFileCompressionTest::GetDuration(adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_FIVE) == 210);
+	CHECK(TemporaryFileCompressionTest::GetStoredSize(adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_FIVE) ==
+	      253952);
+	CHECK(TemporaryFileCompressionTest::GetCompressionAcceptance(
+	          adaptivity, TemporaryCompressionLevel::ZSTD_MINUS_FIVE) == Approx(1.0 / 16.0));
+}
+
+TEST_CASE("Capped temporary compression matches full-bound compression", "[storage]") {
+	DuckDB db(nullptr);
+	atomic<idx_t> size_on_disk(0);
+	TemporaryFileManager manager(*db.instance, string(), size_on_disk);
+	auto buffer = CreateTemporaryCompressionBuffer(*db.instance);
+	vector<uint8_t> full_output(duckdb_zstd::ZSTD_compressBound(buffer->AllocSize()));
+	const auto maximum_compressed_size = static_cast<idx_t>(TemporaryBufferSize::S224K);
+
+	for (idx_t compressible_parts = 0; compressible_parts <= 16; compressible_parts++) {
+		FillPseudoRandom(*buffer, 42 + compressible_parts);
+		memset(buffer->InternalBuffer(), 0, buffer->AllocSize() / 16 * compressible_parts);
+		for (auto level : {TemporaryCompressionLevel::ZSTD_MINUS_FIVE, TemporaryCompressionLevel::ZSTD_MINUS_THREE,
+		                   TemporaryCompressionLevel::ZSTD_MINUS_ONE, TemporaryCompressionLevel::ZSTD_ONE,
+		                   TemporaryCompressionLevel::ZSTD_THREE, TemporaryCompressionLevel::ZSTD_FIVE}) {
+			const auto zstd_size =
+			    duckdb_zstd::ZSTD_compress(full_output.data(), full_output.size(), buffer->InternalBuffer(),
+			                               buffer->AllocSize(), static_cast<int>(level));
+			REQUIRE_FALSE(duckdb_zstd::ZSTD_isError(zstd_size));
+			const auto expected_compressed = sizeof(idx_t) + zstd_size <= maximum_compressed_size;
+			auto result = TemporaryFileCompressionTest::Compress(manager, level, *buffer);
+			CHECK(result.level == level);
+			CHECK((result.size != TemporaryBufferSize::DEFAULT) == expected_compressed);
+			if (expected_compressed) {
+				REQUIRE(result.data.get());
+				CHECK(Load<idx_t>(result.data.get()) == zstd_size);
+				CHECK(memcmp(result.data.get() + sizeof(idx_t), full_output.data(), zstd_size) == 0);
+			} else {
+				CHECK_FALSE(result.data.get());
+			}
+		}
+	}
+}
 
 TEST_CASE("Test storing a big string that exceeds buffer manager size", "[storage][.]") {
 	duckdb::unique_ptr<MaterializedQueryResult> result;

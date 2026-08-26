@@ -218,6 +218,8 @@ enum class TemporaryCompressionLevel : int {
 };
 
 class TemporaryFileCompressionAdaptivity {
+	friend class TemporaryFileCompressionTest;
+
 public:
 	TemporaryFileCompressionAdaptivity();
 
@@ -225,7 +227,7 @@ public:
 	//! Get the compression level to use based on current write times
 	TemporaryCompressionLevel GetCompressionLevel();
 	//! Update write time for given compression level
-	void Update(TemporaryCompressionLevel level, const TimePoint &time_before);
+	void Update(TemporaryCompressionLevel level, TemporaryBufferSize size, const TimePoint &time_before);
 
 private:
 	//! Convert from level to index into write time array and back
@@ -234,16 +236,16 @@ private:
 	//! Min/max compression levels
 	static TemporaryCompressionLevel MinimumCompressionLevel();
 	static TemporaryCompressionLevel MaximumCompressionLevel();
+	bool CompressionLevelIsBeneficial(idx_t compression_idx) const;
+	void UpdateInternal(TemporaryCompressionLevel level, TemporaryBufferSize size, int64_t duration);
 
 private:
-	//! The value to initialize the atomic write counters to
-	static constexpr int64_t INITIAL_NS = 50000;
 	//! How many compression levels we adapt between
 	static constexpr idx_t LEVELS = 6;
-	//! Bias towards compressed writes: we only choose uncompressed if it is more than 2x faster than compressed
+	//! Maximum bias towards compressed writes, scaled by the actual on-disk savings
 	static constexpr double DURATION_RATIO_THRESHOLD = 2.0;
 	//! Probability to deviate from the current best write behavior (1 in 20)
-	static constexpr double COMPRESSION_DEVIATION = 0.5;
+	static constexpr double COMPRESSION_DEVIATION = 0.05;
 	//! Weight to use for moving weighted average
 	static constexpr int64_t WEIGHT = 16;
 
@@ -253,6 +255,10 @@ private:
 	int64_t last_uncompressed_write_ns;
 	//! Duration of the last compressed writes
 	int64_t last_compressed_writes_ns[LEVELS];
+	//! Average on-disk size produced by each compression level
+	idx_t last_compressed_sizes[LEVELS];
+	//! Fraction of attempts accepted into a compressed size class
+	double last_compression_acceptance[LEVELS];
 };
 
 //===--------------------------------------------------------------------===//
@@ -261,6 +267,7 @@ private:
 class TemporaryFileManager {
 	friend struct BlockIndexManager;
 	friend class TemporaryFileHandle;
+	friend class TemporaryFileCompressionTest;
 
 public:
 	TemporaryFileManager(DatabaseInstance &db, const string &temp_directory_p, atomic<idx_t> &size_on_disk);
@@ -305,7 +312,7 @@ public:
 
 private:
 	//! Compress buffer, write it in compressed_buffer and return the size/level
-	CompressionResult CompressBuffer(TemporaryFileCompressionAdaptivity &compression_adaptivity, FileBuffer &buffer,
+	CompressionResult CompressBuffer(TemporaryCompressionLevel level, FileBuffer &buffer,
 	                                 AllocatedData &compressed_buffer);
 
 	//! Create file name for given size/index
@@ -341,7 +348,8 @@ private:
 	//! How many compression adaptivities we have so that threads don't all share the same one
 	static constexpr idx_t COMPRESSION_ADAPTIVITIES = 64;
 	//! Class that oversees when/how much to compress
-	array<TemporaryFileCompressionAdaptivity, COMPRESSION_ADAPTIVITIES> compression_adaptivities;
+	array<array<TemporaryFileCompressionAdaptivity, COMPRESSION_ADAPTIVITIES>, TEMPORARY_FILE_COMPRESSION_DOMAIN_COUNT>
+	    compression_adaptivities;
 };
 
 //===--------------------------------------------------------------------===//

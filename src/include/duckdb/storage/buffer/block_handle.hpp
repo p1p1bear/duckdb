@@ -90,6 +90,12 @@ public:
 	MemoryTag GetMemoryTag() const {
 		return tag;
 	}
+	TemporaryFileCompressionDomain GetTemporaryFileCompressionDomain() const {
+		return temporary_file_compression_domain.load();
+	}
+	void SetTemporaryFileCompressionDomain(TemporaryFileCompressionDomain domain) {
+		temporary_file_compression_domain = domain;
+	}
 	//! Returns the file buffer type.
 	FileBufferType GetBufferType() const {
 		return buffer_type;
@@ -222,6 +228,8 @@ private:
 	atomic<int32_t> readers;
 	//! The memory tag.
 	const MemoryTag tag;
+	//! Selects an independent adaptive policy for temporary-file compression.
+	atomic<TemporaryFileCompressionDomain> temporary_file_compression_domain;
 	//! The file buffer type.
 	const FileBufferType buffer_type;
 	//! A pointer to the loaded data, if any.

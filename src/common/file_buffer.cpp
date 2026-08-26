@@ -33,6 +33,7 @@ void FileBuffer::Init() {
 	internal_buffer = nullptr;
 	internal_size = 0;
 	owns_internal_buffer = true;
+	temporary_file_compression_domain = TemporaryFileCompressionDomain::DEFAULT;
 }
 
 FileBuffer::FileBuffer(FileBuffer &source, FileBufferType type_p, idx_t block_header_size)
@@ -43,6 +44,7 @@ FileBuffer::FileBuffer(FileBuffer &source, FileBufferType type_p, idx_t block_he
 	internal_buffer = source.internal_buffer;
 	internal_size = source.internal_size;
 	owns_internal_buffer = source.owns_internal_buffer;
+	temporary_file_compression_domain = source.temporary_file_compression_domain;
 
 	source.Init();
 }

@@ -800,6 +800,7 @@ void TupleDataAllocator::CreateRowBlock(TupleDataSegment &segment, TupleDataPinS
 void TupleDataAllocator::CreateHeapBlock(TupleDataSegment &segment, TupleDataPinState &pin_state, idx_t size) {
 	auto buffer_handle = buffer_manager.Allocate(context, tag, size, false);
 	auto block_handle = buffer_handle.GetBlockHandle();
+	block_handle->GetMemory().SetTemporaryFileCompressionDomain(TemporaryFileCompressionDomain::VARIABLE_SIZE);
 	if (partition_index.IsValid()) {
 		block_handle->GetMemory().SetEvictionQueueIndex(RadixPartitioning::RadixBits(partition_index.GetIndex()));
 	}

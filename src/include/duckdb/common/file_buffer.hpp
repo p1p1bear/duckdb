@@ -22,7 +22,10 @@ struct FileHandle;
 
 enum class FileBufferType : uint8_t { BLOCK = 1, MANAGED_BUFFER = 2, TINY_BUFFER = 3, EXTERNAL_FILE = 4 };
 
+enum class TemporaryFileCompressionDomain : uint8_t { DEFAULT = 0, VARIABLE_SIZE = 1 };
+
 static constexpr idx_t FILE_BUFFER_TYPE_COUNT = 4;
+static constexpr idx_t TEMPORARY_FILE_COMPRESSION_DOMAIN_COUNT = 2;
 
 //! The FileBuffer represents a buffer that can be read or written to a Direct IO FileHandle.
 class FileBuffer {
@@ -81,6 +84,12 @@ public:
 	bool OwnsInternalBuffer() const {
 		return owns_internal_buffer;
 	}
+	TemporaryFileCompressionDomain GetTemporaryFileCompressionDomain() const {
+		return temporary_file_compression_domain;
+	}
+	void SetTemporaryFileCompressionDomain(TemporaryFileCompressionDomain domain) {
+		temporary_file_compression_domain = domain;
+	}
 	data_ptr_t InternalBuffer() {
 		return internal_buffer;
 	}
@@ -110,6 +119,8 @@ protected:
 	uint64_t internal_size;
 	//! False when internal_buffer was adopted from a MemoryMappedFile (don't free in dtor).
 	bool owns_internal_buffer = true;
+	//! Selects an independent adaptive policy for temporary-file compression.
+	TemporaryFileCompressionDomain temporary_file_compression_domain = TemporaryFileCompressionDomain::DEFAULT;
 
 	void ReallocBuffer(idx_t new_size);
 	void Init();
