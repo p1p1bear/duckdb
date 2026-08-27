@@ -15,13 +15,18 @@
 namespace duckdb {
 
 static constexpr row_t INVALID_REMAP_ROW_ID = NumericLimits<row_t>::Maximum();
+static constexpr uint32_t INVALID_REMAP_ROW_OFFSET = NumericLimits<uint32_t>::Maximum();
 
 struct RowIdRemapChunk {
 	row_t old_start;
+	vector<uint32_t> new_rowid_offsets;
 	vector<row_t> new_rowids;
 
+	idx_t Count() const {
+		return new_rowid_offsets.empty() ? new_rowids.size() : new_rowid_offsets.size();
+	}
 	row_t GetOldEnd() const {
-		return old_start + NumericCast<row_t>(new_rowids.size());
+		return old_start + NumericCast<row_t>(Count());
 	}
 };
 
@@ -38,6 +43,11 @@ public:
 		return physical_row_count;
 	}
 	idx_t GetAllocationSize() const;
+	bool UsesCompactOffsets() const {
+		return compact_offsets;
+	}
+	static idx_t GetEntrySize(idx_t physical_row_count);
+	static idx_t GetMaxEntries(idx_t byte_budget);
 	const vector<RowIdRemapChunk> &GetChunks() const {
 		return chunks;
 	}
@@ -49,8 +59,10 @@ private:
 
 private:
 	vector<RowIdRemapChunk> chunks;
+	row_t new_rowid_base = 0;
 	idx_t mapped_count = 0;
 	idx_t physical_row_count = 0;
+	bool compact_offsets = false;
 };
 
 } // namespace duckdb

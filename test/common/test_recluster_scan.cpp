@@ -24,7 +24,11 @@ TEST_CASE("Recluster row ID remaps preserve physical row group ranges", "[storag
 	row_groups[1].count = 2;
 	RowIdRemapStore remap(row_groups);
 	REQUIRE(remap.GetPhysicalRowCount() == 5);
-	REQUIRE(remap.GetAllocationSize() == 5 * sizeof(row_t));
+	REQUIRE(remap.GetAllocationSize() == 5 * sizeof(uint32_t));
+	REQUIRE(remap.UsesCompactOffsets());
+	REQUIRE(RowIdRemapStore::GetEntrySize(5) == sizeof(uint32_t));
+	REQUIRE(RowIdRemapStore::GetEntrySize(INVALID_REMAP_ROW_OFFSET) == sizeof(row_t));
+	REQUIRE(RowIdRemapStore::GetMaxEntries(100) == 25);
 	REQUIRE(remap.GetMappedCount() == 0);
 	REQUIRE(remap.GetNewRowId(10) == INVALID_REMAP_ROW_ID);
 	REQUIRE(remap.GetNewRowId(21) == INVALID_REMAP_ROW_ID);
@@ -39,6 +43,7 @@ TEST_CASE("Recluster row ID remaps preserve physical row group ranges", "[storag
 	REQUIRE(remap.GetMappedCount() == 2);
 	REQUIRE_THROWS_AS(remap.SetNewRowId(10, 102), InternalException);
 	REQUIRE_THROWS_AS(remap.SetNewRowId(11, INVALID_REMAP_ROW_ID), InternalException);
+	REQUIRE_THROWS_AS(remap.SetNewRowId(11, 9), InternalException);
 
 	row_groups[1].start = 12;
 	REQUIRE_THROWS_AS(RowIdRemapStore(row_groups), InternalException);
@@ -80,7 +85,7 @@ TEST_CASE("Recluster range scans use the STARTING snapshot and include old row I
 	REQUIRE(start.task);
 	auto &task_context = start.task->GetTaskContext();
 	REQUIRE(task_context.GetRowIdRemap().GetPhysicalRowCount() == 4096);
-	REQUIRE(task_context.GetRowIdRemap().GetAllocationSize() == 4096 * sizeof(row_t));
+	REQUIRE(task_context.GetRowIdRemap().GetAllocationSize() == 4096 * sizeof(uint32_t));
 
 	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE i = 1"));
 	ReclusterRangeScanner scanner(task_context);

@@ -8,6 +8,7 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/recluster/row_id_remap_store.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -28,11 +29,12 @@ idx_t GetReclusterRowGroupLimit(DataTable &storage) {
 	auto remap_budget = max_memory / RECLUSTER_REMAP_MEMORY_DIVISOR;
 	auto minimum_rows =
 	    row_group_size > NumericLimits<idx_t>::Maximum() / 2 ? NumericLimits<idx_t>::Maximum() : row_group_size * 2;
-	auto minimum_budget = minimum_rows > NumericLimits<idx_t>::Maximum() / sizeof(row_t)
+	auto remap_entry_size = RowIdRemapStore::GetEntrySize(minimum_rows);
+	auto minimum_budget = minimum_rows > NumericLimits<idx_t>::Maximum() / remap_entry_size
 	                          ? NumericLimits<idx_t>::Maximum()
-	                          : minimum_rows * sizeof(row_t);
+	                          : minimum_rows * remap_entry_size;
 	remap_budget = MaxValue(remap_budget, minimum_budget);
-	auto max_rows = remap_budget / sizeof(row_t);
+	auto max_rows = RowIdRemapStore::GetMaxEntries(remap_budget);
 	return MaxValue<idx_t>(max_rows / row_group_size, 2);
 }
 
