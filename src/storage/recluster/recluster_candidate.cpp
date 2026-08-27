@@ -18,15 +18,18 @@
 namespace duckdb {
 
 static constexpr idx_t RECLUSTER_REMAP_MEMORY_DIVISOR = 64;
+static constexpr idx_t FULL_RECLUSTER_REMAP_MEMORY_DIVISOR = 8;
 static constexpr idx_t RECLUSTER_INPUT_MEMORY_DIVISOR = 8;
-
-idx_t GetReclusterRowGroupLimit(DataTable &storage) {
+static idx_t GetReclusterRowGroupLimit(DataTable &storage, idx_t memory_divisor) {
+	if (memory_divisor == 0) {
+		throw InternalException("Recluster candidate requires a non-zero remap memory divisor");
+	}
 	auto row_group_size = storage.GetRowGroupSize();
 	if (row_group_size == 0) {
 		throw InternalException("Recluster candidate requires a non-zero row group size");
 	}
 	auto max_memory = BufferManager::GetBufferManager(storage.GetAttached()).GetMaxMemory();
-	auto remap_budget = max_memory / RECLUSTER_REMAP_MEMORY_DIVISOR;
+	auto remap_budget = max_memory / memory_divisor;
 	auto minimum_rows =
 	    row_group_size > NumericLimits<idx_t>::Maximum() / 2 ? NumericLimits<idx_t>::Maximum() : row_group_size * 2;
 	auto remap_entry_size = RowIdRemapStore::GetEntrySize(minimum_rows);
@@ -38,20 +41,28 @@ idx_t GetReclusterRowGroupLimit(DataTable &storage) {
 	return MaxValue<idx_t>(max_rows / row_group_size, 2);
 }
 
+idx_t GetReclusterRowGroupLimit(DataTable &storage) {
+	return GetReclusterRowGroupLimit(storage, RECLUSTER_REMAP_MEMORY_DIVISOR);
+}
+
+idx_t GetFullReclusterRowGroupLimit(DataTable &storage) {
+	return GetReclusterRowGroupLimit(storage, FULL_RECLUSTER_REMAP_MEMORY_DIVISOR);
+}
+
 idx_t GetReclusterTaskInputByteLimit(DataTable &storage) {
 	auto max_memory = BufferManager::GetBufferManager(storage.GetAttached()).GetMaxMemory();
 	auto block_size = storage.GetTableIOManager().GetBlockManagerForRowData().GetBlockAllocSize();
 	return MaxValue(max_memory / RECLUSTER_INPUT_MEMORY_DIVISOR, block_size);
 }
 
-ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups) {
-	if (max_row_groups == 0) {
-		throw InternalException("Recluster candidate requires a non-zero row group limit");
+ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups, idx_t max_merge_runs) {
+	if (max_row_groups == 0 || max_merge_runs < 2 || max_merge_runs > FULL_RECLUSTER_MAX_MERGE_RUNS) {
+		throw InternalException("Recluster candidate requires valid row group and merge-run limits");
 	}
 	auto row_group_size = storage.GetRowGroupSize();
 	auto max_rows = row_group_size > NumericLimits<idx_t>::Maximum() / max_row_groups ? NumericLimits<idx_t>::Maximum()
 	                                                                                  : row_group_size * max_row_groups;
-	return {max_rows, max_row_groups, 4, 0.25};
+	return {max_rows, max_row_groups, max_merge_runs, 0.25};
 }
 
 struct CandidateRowGroupState {
@@ -115,8 +126,8 @@ static bool IsPatchCovered(const RowGroupCollectionSnapshot &snapshot, const Row
 
 static void ValidateLimits(const ReclusterCandidateLimits &limits) {
 	if (limits.max_physical_rows == 0 || limits.max_row_groups == 0 || limits.max_merge_runs < 2 ||
-	    limits.max_merge_runs > 4 || !std::isfinite(limits.delete_cleanup_ratio) || limits.delete_cleanup_ratio <= 0 ||
-	    limits.delete_cleanup_ratio > 1) {
+	    limits.max_merge_runs > FULL_RECLUSTER_MAX_MERGE_RUNS || !std::isfinite(limits.delete_cleanup_ratio) ||
+	    limits.delete_cleanup_ratio <= 0 || limits.delete_cleanup_ratio > 1) {
 		throw InternalException("Invalid recluster candidate limits");
 	}
 }

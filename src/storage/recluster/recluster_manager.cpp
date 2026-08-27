@@ -641,6 +641,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		return result;
 	}
 	bool checkpoint_created = false;
+	idx_t tasks_at_last_checkpoint = 0;
 	idx_t stale_attempts = 0;
 	while (result.tasks_completed < options.max_tasks) {
 		context.InterruptCheck();
@@ -655,7 +656,10 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 
 		auto caller_remaining_budget = options.max_bytes - result.input_bytes;
 		auto remaining_budget = MinValue(caller_remaining_budget, GetReclusterTaskInputByteLimit(*storage));
-		auto max_row_group_limit = GetReclusterRowGroupLimit(*storage);
+		auto full_mode = options.mode == ReclusterMode::FULL;
+		auto max_row_group_limit =
+		    full_mode ? GetFullReclusterRowGroupLimit(*storage) : GetReclusterRowGroupLimit(*storage);
+		auto max_merge_runs = full_mode ? FULL_RECLUSTER_MAX_MERGE_RUNS : DEFAULT_RECLUSTER_MAX_MERGE_RUNS;
 		auto checkpoint = state->GetLastCheckpoint();
 		if (checkpoint) {
 			max_row_group_limit = MinValue(max_row_group_limit, MaxValue<idx_t>(checkpoint->row_groups.size(), 1));
@@ -665,7 +669,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		ReclusterCandidateSelection selection;
 		idx_t candidate_bytes = 0;
 		while (true) {
-			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups);
+			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups, max_merge_runs);
 			selection = SelectReclusterCandidate(*storage->GetRowGroupCollection(), storage->Columns(), *state, limits);
 			if (!selection.candidate) {
 				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
@@ -677,8 +681,15 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				break;
 			}
 			candidate_bytes = EstimateReclusterRangeBytes(*storage, selection.candidate->range);
-			if (candidate_bytes <= remaining_budget ||
+			auto candidate_budget = full_mode && selection.candidate->type != ReclusterCandidateType::CONVERSION
+			                            ? caller_remaining_budget
+			                            : remaining_budget;
+			if (candidate_bytes <= candidate_budget ||
 			    (selection.candidate->row_group_count == 1 && candidate_bytes <= caller_remaining_budget)) {
+				break;
+			}
+			if (full_mode && selection.candidate->type != ReclusterCandidateType::CONVERSION) {
+				selection.candidate.reset();
 				break;
 			}
 			if (selection.candidate->row_group_count <= 1) {
@@ -686,7 +697,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				break;
 			}
 			auto scaled_row_groups = static_cast<idx_t>(
-			    (static_cast<long double>(selection.candidate->row_group_count) * remaining_budget) / candidate_bytes);
+			    (static_cast<long double>(selection.candidate->row_group_count) * candidate_budget) / candidate_bytes);
 			max_row_groups = MinValue(selection.candidate->row_group_count - 1, MaxValue<idx_t>(scaled_row_groups, 1));
 		}
 
@@ -702,15 +713,22 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				result.message = "no recluster work remains";
 				break;
 			}
-			if (!checkpoint_created && options.create_checkpoint &&
-			    selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE) {
+			auto made_progress_since_checkpoint = result.tasks_completed > tasks_at_last_checkpoint;
+			auto checkpoint_can_refresh_full = full_mode && made_progress_since_checkpoint &&
+			                                   selection.status == ReclusterCandidateSelectionStatus::NO_ELIGIBLE_RANGE;
+			auto can_create_checkpoint = !checkpoint_created || (full_mode && made_progress_since_checkpoint);
+			if (can_create_checkpoint && options.create_checkpoint &&
+			    (selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE ||
+			     checkpoint_can_refresh_full)) {
 				TransactionManager::Get(db).Checkpoint(context, false);
 				checkpoint_created = true;
+				tasks_at_last_checkpoint = result.tasks_completed;
 				continue;
 			}
 			result.state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
 			result.message = selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT
-			                     ? "the next sorted run exceeds the per-task row-group limit"
+			                     ? (full_mode ? "the next sorted run exceeds the FULL remap memory limit"
+			                                  : "the next sorted run exceeds the per-task row-group limit")
 			                     : "remaining work is waiting for a successful checkpoint";
 			break;
 		}

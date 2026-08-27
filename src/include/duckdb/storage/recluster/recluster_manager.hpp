@@ -33,9 +33,11 @@ class TableReclusterState;
 struct ReclusterTableStatus;
 
 enum class ReclusterExplicitState : uint8_t { COMPLETE, BUDGET_EXHAUSTED, NO_ELIGIBLE_RANGE, ALREADY_RUNNING, FAILED };
+enum class ReclusterMode : uint8_t { INCREMENTAL, FULL };
 
 struct ReclusterExplicitOptions {
 	bool create_checkpoint = false;
+	ReclusterMode mode = ReclusterMode::INCREMENTAL;
 	idx_t max_bytes = 0;
 	idx_t max_tasks = 0;
 	//! Internal execution limit. Zero uses the connection's configured thread count.

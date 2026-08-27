@@ -17,6 +17,9 @@ class DataTable;
 class RowGroupCollection;
 class TableReclusterState;
 
+static constexpr idx_t DEFAULT_RECLUSTER_MAX_MERGE_RUNS = 4;
+static constexpr idx_t FULL_RECLUSTER_MAX_MERGE_RUNS = 32;
+
 enum class ReclusterCandidateType : uint8_t { CONVERSION, DELETE_CLEANUP, RUN_MERGE };
 
 enum class ReclusterCandidateSelectionStatus : uint8_t {
@@ -34,8 +37,10 @@ struct ReclusterCandidateLimits {
 };
 
 idx_t GetReclusterRowGroupLimit(DataTable &storage);
+idx_t GetFullReclusterRowGroupLimit(DataTable &storage);
 idx_t GetReclusterTaskInputByteLimit(DataTable &storage);
-ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups);
+ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t max_row_groups,
+                                                     idx_t max_merge_runs = DEFAULT_RECLUSTER_MAX_MERGE_RUNS);
 
 struct ReclusterCandidate {
 	ReclusterCandidateType type = ReclusterCandidateType::CONVERSION;

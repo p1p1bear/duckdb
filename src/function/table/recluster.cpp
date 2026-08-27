@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry_retriever.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -31,8 +32,8 @@ struct ReclusterFunctionData : public TableFunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ReclusterFunctionData>();
 		return table_name == other.table_name && options.create_checkpoint == other.options.create_checkpoint &&
-		       options.max_bytes == other.options.max_bytes && options.max_tasks == other.options.max_tasks &&
-		       options.max_threads == other.options.max_threads;
+		       options.mode == other.options.mode && options.max_bytes == other.options.max_bytes &&
+		       options.max_tasks == other.options.max_tasks && options.max_threads == other.options.max_threads;
 	}
 };
 
@@ -55,6 +56,20 @@ static idx_t ParseReclusterByteBudget(const Value &value) {
 	return result;
 }
 
+static ReclusterMode ParseReclusterMode(const Value &value) {
+	if (value.IsNull()) {
+		throw InvalidInputException("mode cannot be NULL");
+	}
+	auto mode = value.GetValue<string>();
+	if (StringUtil::CIEquals(mode, "incremental")) {
+		return ReclusterMode::INCREMENTAL;
+	}
+	if (StringUtil::CIEquals(mode, "full")) {
+		return ReclusterMode::FULL;
+	}
+	throw InvalidInputException("mode must be either 'incremental' or 'full'");
+}
+
 static unique_ptr<FunctionData> ReclusterBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
@@ -71,14 +86,19 @@ static unique_ptr<FunctionData> ReclusterBind(ClientContext &context, TableFunct
 	ReclusterExplicitOptions options;
 	options.max_bytes = DBConfig::ParseMemoryLimit("1GB");
 	options.max_tasks = 1;
+	bool checkpoint_specified = false;
+	bool max_bytes_specified = false;
+	bool max_tasks_specified = false;
 	for (auto &parameter : input.named_parameters) {
 		if (parameter.first == "create_checkpoint") {
 			if (parameter.second.IsNull()) {
 				throw InvalidInputException("create_checkpoint cannot be NULL");
 			}
 			options.create_checkpoint = parameter.second.GetValue<bool>();
+			checkpoint_specified = true;
 		} else if (parameter.first == "max_bytes") {
 			options.max_bytes = ParseReclusterByteBudget(parameter.second);
+			max_bytes_specified = true;
 		} else if (parameter.first == "max_tasks") {
 			if (parameter.second.IsNull()) {
 				throw InvalidInputException("max_tasks cannot be NULL");
@@ -87,6 +107,20 @@ static unique_ptr<FunctionData> ReclusterBind(ClientContext &context, TableFunct
 			if (options.max_tasks == 0) {
 				throw InvalidInputException("max_tasks must be greater than zero");
 			}
+			max_tasks_specified = true;
+		} else if (parameter.first == "mode") {
+			options.mode = ParseReclusterMode(parameter.second);
+		}
+	}
+	if (options.mode == ReclusterMode::FULL) {
+		if (!checkpoint_specified) {
+			options.create_checkpoint = true;
+		}
+		if (!max_bytes_specified) {
+			options.max_bytes = NumericLimits<idx_t>::Maximum();
+		}
+		if (!max_tasks_specified) {
+			options.max_tasks = NumericLimits<idx_t>::Maximum();
 		}
 	}
 
@@ -136,6 +170,7 @@ void ReclusterTableFunction::RegisterFunction(BuiltinFunctions &set) {
 	function.named_parameters["create_checkpoint"] = LogicalType::BOOLEAN;
 	function.named_parameters["max_bytes"] = LogicalType::VARCHAR;
 	function.named_parameters["max_tasks"] = LogicalType::UBIGINT;
+	function.named_parameters["mode"] = LogicalType::VARCHAR;
 	set.AddFunction(function);
 }
 

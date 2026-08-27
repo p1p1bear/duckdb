@@ -139,6 +139,99 @@ CALL recluster('r.main.events', max_bytes='-1MB')
 ----
 <REGEX>:.*max_bytes must be a positive byte size.*
 
+statement error
+CALL recluster('r.main.events', mode='invalid')
+----
+<REGEX>:.*mode must be either 'incremental' or 'full'.*
+
+# Incremental mode rejects indivisible sorted runs above its conservative remap
+# budget. FULL raises only the explicit remap budget and streams the input.
+statement ok
+CREATE TABLE full_merge(k BIGINT, payload BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO full_merge SELECT x * 2 + 1, x FROM range(81920) t(x)
+
+statement ok
+INSERT INTO full_merge SELECT x * 2, 81920 + x FROM range(81920) t(x)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+SET memory_limit='16MB'
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.full_merge')
+----
+0	NO_ELIGIBLE_RANGE
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.full_merge', mode='full', max_bytes='1B')
+----
+0	BUDGET_EXHAUSTED
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.full_merge', mode='full')
+----
+1	0	COMPLETE
+
+query II
+SELECT run_count::BIGINT, (remaining_recluster_bytes = 0)::BIGINT
+FROM duckdb_recluster_status() WHERE table_name = 'full_merge'
+----
+1	1
+
+query II
+SELECT count(*), sum(payload) FROM full_merge
+----
+163840	13421690880
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_merge
+) WHERE k < previous_k
+----
+0
+
+statement ok
+SET memory_limit='1GB'
+
+# FULL checkpoints only after making progress, then continues with the next
+# merge level. Thirty-three input runs require a 32-way merge followed by a
+# second two-way merge.
+statement ok
+CREATE TABLE full_hierarchy(k BIGINT) SORTED BY (k)
+
+loop i 0 33
+
+statement ok
+INSERT INTO full_hierarchy SELECT x * 33 + (32 - {i}) FROM range(2048) t(x)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.full_hierarchy', mode='full')
+----
+2	0	COMPLETE
+
+query I
+SELECT run_count::BIGINT FROM duckdb_recluster_status() WHERE table_name = 'full_hierarchy'
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_hierarchy
+) WHERE k < previous_k
+----
+0
+
 statement ok
 BEGIN
 
@@ -149,6 +242,21 @@ CALL recluster('r.main.events')
 
 statement ok
 ROLLBACK
+
+# A recovered checkpoint snapshot uses checkpoint number zero. FORCE CHECKPOINT
+# must be a separate statement because CALL itself owns an active read
+# transaction.
+statement ok
+CREATE TABLE recovered_full(k BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO recovered_full SELECT x * 2 + 1 FROM range(4096) t(x)
+
+statement ok
+INSERT INTO recovered_full SELECT x * 2 FROM range(4096) t(x)
+
+statement ok
+CHECKPOINT r
 
 # Reopen with the maintenance WAL still present and verify replayed layouts.
 statement ok
@@ -175,6 +283,39 @@ SELECT count(*), sum(payload) FROM merged
 query I
 SELECT count(*) FROM (
     SELECT k, lag(k) OVER () AS previous_k FROM merged
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM full_merge
+----
+163840	13421690880
+
+query I
+SELECT count(*) FROM full_hierarchy
+----
+67584
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_hierarchy
+) WHERE k < previous_k
+----
+0
+
+statement ok
+FORCE CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.recovered_full', mode='full')
+----
+1	0	COMPLETE
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM recovered_full
 ) WHERE k < previous_k
 ----
 0
