@@ -1971,6 +1971,33 @@ PersistentRowGroupData RowGroup::SerializeRowGroupInfo(idx_t row_group_start) co
 	return result;
 }
 
+void RowGroup::SetPersistentMetadataPointers(const RowGroupPointer &pointer) {
+	if (pointer.tuple_count != count || pointer.data_pointers.size() != columns.size() ||
+	    pointer.sort_metadata != sort_metadata || !IsPersistent()) {
+		throw InternalException("Cannot install mismatched persistent row group metadata pointers");
+	}
+
+	lock_guard<mutex> guard(row_group_lock);
+	column_pointers = pointer.data_pointers;
+	deletes_pointers = pointer.deletes_pointers;
+	has_metadata_blocks = pointer.has_metadata_blocks;
+	extra_metadata_blocks = pointer.extra_metadata_blocks;
+	has_per_column_metadata_blocks = pointer.has_per_column_metadata_blocks;
+	per_column_metadata_blocks = pointer.per_column_metadata_blocks;
+	if (!is_loaded) {
+		is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[columns.size()]);
+	}
+	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+		is_loaded[column_index] = false;
+		columns[column_index].reset();
+	}
+	allocation_size = 0;
+	row_id_column_data.reset();
+	row_id_is_loaded = false;
+	row_number_column_data.reset();
+	row_number_is_loaded = false;
+}
+
 void RowGroup::CompressVersionInfo(transaction_t lowest_active_start) {
 	if (HasUnloadedDeletes()) {
 		// deletes were not loaded - they are still stored in their compact serialized form

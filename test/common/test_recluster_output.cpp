@@ -286,6 +286,7 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	for (auto &row_group : output_groups) {
 		REQUIRE(row_group->IsPersistent());
 		REQUIRE(row_group->IsSealed());
+		REQUIRE(row_group->GetAllocationSize() == 0);
 		REQUIRE(row_group->GetSortMetadata() == RowGroupSortMetadata {output.GetSortOrderId(), output.GetRunId()});
 		REQUIRE(!row_group->GetOrCreateVersionInfo().HasUncommittedChanges());
 	}

@@ -216,6 +216,8 @@ public:
 	                           idx_t row_group_start);
 	bool IsPersistent() const;
 	PersistentRowGroupData SerializeRowGroupInfo(idx_t row_group_start) const;
+	//! Installs durable metadata pointers and releases loaded persistent columns.
+	void SetPersistentMetadataPointers(const RowGroupPointer &pointer);
 
 	static void InitializeAppend(SegmentNode<RowGroup> &row_group, RowGroupAppendState &append_state);
 	void Append(RowGroupAppendState &append_state, DataChunk &chunk, idx_t append_count);

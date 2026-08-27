@@ -899,8 +899,8 @@ bool RowGroupCollection::CanFetch(TransactionData transaction, const row_t row_i
 // Append
 //===--------------------------------------------------------------------===//
 TableAppendState::TableAppendState()
-    : row_group_append_state(*this), total_append_count(0), start_row_group(nullptr), transaction(0, 0),
-      hashes(LogicalType::HASH) {
+    : row_group_append_state(*this), total_append_count(0), prefinalized_append_count(0), start_row_group(nullptr),
+      transaction(0, 0), hashes(LogicalType::HASH) {
 }
 
 TableAppendState::~TableAppendState() {
@@ -927,6 +927,7 @@ void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppe
 	state.row_start = UnsafeNumericCast<row_t>(next_row_id);
 	state.current_row = state.row_start;
 	state.total_append_count = 0;
+	state.prefinalized_append_count = 0;
 
 	// start writing to the row_groups
 	state.row_groups = GetRowGroups();
@@ -1030,6 +1031,20 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 	return flushed_row_group_idx;
 }
 
+void RowGroupCollection::FinalizeCompletedAppendRowGroup(TableAppendState &state, idx_t row_group_index) {
+	if (!state.organization_initialized || state.prefinalized_append_count > state.total_append_count ||
+	    row_group_size > state.total_append_count - state.prefinalized_append_count) {
+		throw InternalException("Cannot pre-finalize an invalid row group append");
+	}
+	auto row_group = GetRowGroup(NumericCast<int64_t>(row_group_index));
+	if (!row_group || row_group->GetColumnCount() == 0 || row_group->count.load() != 0 ||
+	    row_group->GetRawColumnData(0).count != row_group_size) {
+		throw InternalException("Cannot pre-finalize an incomplete row group append");
+	}
+	row_group->AppendVersionInfo(state.transaction, row_group_size);
+	state.prefinalized_append_count += row_group_size;
+}
+
 void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppendState &state) {
 	if (!state.organization_initialized) {
 		throw InternalException("Table append state is not initialized");
@@ -1042,7 +1057,10 @@ void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppend
 	}
 
 	// now push version info into all row groups
-	auto remaining = state.total_append_count;
+	if (state.prefinalized_append_count > state.total_append_count) {
+		throw InternalException("Pre-finalized append count exceeds the total append count");
+	}
+	auto remaining = state.total_append_count - state.prefinalized_append_count;
 	auto row_group = state.start_row_group;
 	while (remaining > 0) {
 		auto &current_row_group = row_group->GetNode();
@@ -1056,6 +1074,7 @@ void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppend
 	D_ASSERT(next_row_id.load() >= total_rows.load());
 
 	state.total_append_count = 0;
+	state.prefinalized_append_count = 0;
 	state.start_row_group = nullptr;
 	state.organization_initialized = false;
 

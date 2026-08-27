@@ -148,6 +148,8 @@ struct TableAppendState {
 	row_t current_row;
 	//! The total number of rows appended by the append operation
 	idx_t total_append_count;
+	//! Rows whose version information was finalized before the append completed.
+	idx_t prefinalized_append_count;
 	idx_t row_group_start;
 	//! The row group segment tree we are appending to
 	shared_ptr<RowGroupSegmentTree> row_groups;

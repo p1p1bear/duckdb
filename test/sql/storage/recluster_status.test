@@ -74,7 +74,7 @@ SELECT layout_version::BIGINT, round(current_order_coverage, 3), run_count::BIGI
 FROM duckdb_recluster_status()
 WHERE table_name = 'events'
 ----
-1	1.0	2	2	2	1	0.667	NO_CHECKPOINTED_RANGE	1
+1	1.0	2	2	2	1	0.8	NO_CHECKPOINTED_RANGE	1
 
 statement ok
 CHECKPOINT r
