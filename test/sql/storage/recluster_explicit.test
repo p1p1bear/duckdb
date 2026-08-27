@@ -66,6 +66,44 @@ SELECT count(*), sum(payload) FROM events
 ----
 4096	8386560
 
+# Existing sorted runs use the streaming merge path and publish through the
+# same replacement manifest and WAL protocol.
+statement ok
+CREATE TABLE merged(k BIGINT, payload BIGINT) SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO merged SELECT x * 3 + (2 - {i}), {i} * 10000 + x FROM range(4096) t(x)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.merged', max_bytes='64MB', max_tasks=1)
+----
+1	0	COMPLETE
+
+query I
+SELECT run_count::BIGINT FROM duckdb_recluster_status() WHERE table_name = 'merged'
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM merged
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM merged
+----
+12288	148039680
+
 statement ok
 CREATE TABLE budgeted(k INTEGER, payload VARCHAR)
 
@@ -128,6 +166,18 @@ query II
 SELECT count(*), sum(payload) FROM events
 ----
 4096	8386560
+
+query II
+SELECT count(*), sum(payload) FROM merged
+----
+12288	148039680
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM merged
+) WHERE k < previous_k
+----
+0
 
 query I
 SELECT count(*) FROM (

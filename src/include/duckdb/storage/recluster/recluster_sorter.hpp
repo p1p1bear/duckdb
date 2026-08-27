@@ -21,6 +21,7 @@ class GlobalSinkState;
 class GlobalSourceState;
 class LocalSourceState;
 class RangeTask;
+class ReclusterRunMerger;
 class ReclusterTaskContext;
 class Sort;
 class ThreadContext;
@@ -48,6 +49,9 @@ public:
 	bool IsFinished() const {
 		return finished;
 	}
+	bool UsesStreamingMerge() const {
+		return streaming_merge;
+	}
 
 private:
 	void CheckTask() const;
@@ -61,6 +65,7 @@ private:
 	vector<LogicalType> output_types;
 	unique_ptr<ThreadContext> thread_context;
 	unique_ptr<Sort> sort;
+	unique_ptr<ReclusterRunMerger> run_merger;
 	unique_ptr<GlobalSinkState> global_sink;
 	unique_ptr<GlobalSourceState> global_source;
 	unique_ptr<LocalSourceState> local_source;
@@ -68,6 +73,7 @@ private:
 	idx_t sorted_row_count = 0;
 	bool prepared = false;
 	bool finished = false;
+	bool streaming_merge = false;
 };
 
 } // namespace duckdb

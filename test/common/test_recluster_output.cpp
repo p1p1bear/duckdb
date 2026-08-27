@@ -39,14 +39,15 @@
 
 using namespace duckdb; // NOLINT
 
-static ReclusterTaskStartResult StartOutputTask(Connection &con, const string &table_name) {
+static ReclusterTaskStartResult StartOutputTask(Connection &con, const string &table_name,
+                                                ReclusterCandidateLimits limits = {4096, 2, 4, 0.25}) {
 	ReclusterTaskStartResult result;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
 		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *state, {4096, 2, 4, 0.25});
+		                                          entry.GetStorage().Columns(), *state, limits);
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(
@@ -423,6 +424,47 @@ TEST_CASE("Recluster output supports an empty replacement", "[storage][recluster
 	REQUIRE(manifest.old_groups == start.task->GetTaskContext().GetCandidate().expected_row_groups);
 
 	RemoveOutputTask(con, start, "tbl");
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster run merge catches up concurrent deletes", "[storage][recluster_delete_catchup]") {
+	auto path = TestCreatePath("recluster_run_merge_delete.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS merge_delete_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE merge_delete_db"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k BIGINT, payload BIGINT) SORTED BY (k)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i * 2 + 1, i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i * 2, 4096 + i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT merge_delete_db"));
+
+	auto start = StartOutputTask(con, "tbl", {16384, 8, 4, 0.25});
+	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
+	REQUIRE(start.task);
+	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
+	REQUIRE(start.task->GetTaskContext().GetCandidate().type == ReclusterCandidateType::RUN_MERGE);
+	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload = 17"));
+	REQUIRE(start.task->GetLatestDeleteSequence() == 1);
+	PrepareOutputTask(start);
+	REQUIRE(start.task->GetTaskContext().GetOutput().GetRowCount() == 8192);
+	REQUIRE(start.task->GetTaskContext().GetOutput().GetManifest().header.last_applied_delete_sequence == 1);
+
+	ReclusterTaskFinalizeStatus status = ReclusterTaskFinalizeStatus::STALE_TASK;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		status = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
+	});
+	REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
+	auto result = con.Query("SELECT count(*), count(*) FILTER (WHERE payload = 17) FROM tbl");
+	REQUIRE(CHECK_COLUMN(result, 0, {8191}));
+	REQUIRE(CHECK_COLUMN(result, 1, {0}));
+	auto inversions =
+	    con.Query("SELECT count(*) FROM (SELECT k, lag(k) OVER () previous_k FROM tbl) WHERE k < previous_k");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	start.task.reset();
 	DeleteDatabase(path);
 }
 

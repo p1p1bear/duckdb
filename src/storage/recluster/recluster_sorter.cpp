@@ -12,6 +12,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_range_scanner.hpp"
+#include "duckdb/storage/recluster/recluster_run_merger.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
 
@@ -39,6 +40,7 @@ void ReclusterSorter::CheckTask() const {
 }
 
 void ReclusterSorter::ResetSortResources() {
+	run_merger.reset();
 	local_source.reset();
 	global_source.reset();
 	global_sink.reset();
@@ -123,6 +125,17 @@ void ReclusterSorter::Prepare() {
 	try {
 		CheckTask();
 		output_types = ReclusterRangeScanner::GetOutputTypes(task_context);
+		if (task_context.GetCandidate().type != ReclusterCandidateType::CONVERSION) {
+			run_merger = make_uniq<ReclusterRunMerger>(task);
+			run_merger->Prepare();
+			input_row_count.store(task_context.GetCandidate().input_live_rows);
+			prepared = true;
+			streaming_merge = true;
+			if (input_row_count.load() == 0) {
+				Finish();
+			}
+			return;
+		}
 		auto &context = task_context.GetSnapshotContext();
 		auto orders = BuildPersistentSortOrders(task_context.GetSortDefinition(), task_context.GetPhysicalSortIndexes(),
 		                                        output_types, output_types.size() - 1);
@@ -192,29 +205,36 @@ bool ReclusterSorter::Scan(DataChunk &chunk) {
 		if (chunk.ColumnCount() != output_types.size()) {
 			throw InternalException("Recluster sort output chunk has an invalid column count");
 		}
-		ExecutionContext execution(task_context.GetSnapshotContext(), *thread_context, nullptr);
-		SourceResultType result;
-		while (true) {
-			auto signal = make_shared_ptr<InterruptDoneSignalState>();
-			InterruptState interrupt {weak_ptr<InterruptDoneSignalState>(signal)};
-			OperatorSourceInput source_input {*global_source, *local_source, interrupt};
-			chunk.Reset();
-			result = sort->GetData(execution, chunk, source_input);
-			if (result != SourceResultType::BLOCKED) {
-				break;
+		if (run_merger) {
+			if (!run_merger->Scan(chunk)) {
+				Finish();
+				return false;
 			}
-			signal->Await();
-			CheckTask();
-		}
-		if (result == SourceResultType::FINISHED) {
-			if (chunk.size() != 0) {
-				throw InternalException("Finished recluster sorter returned output");
+		} else {
+			ExecutionContext execution(task_context.GetSnapshotContext(), *thread_context, nullptr);
+			SourceResultType result;
+			while (true) {
+				auto signal = make_shared_ptr<InterruptDoneSignalState>();
+				InterruptState interrupt {weak_ptr<InterruptDoneSignalState>(signal)};
+				OperatorSourceInput source_input {*global_source, *local_source, interrupt};
+				chunk.Reset();
+				result = sort->GetData(execution, chunk, source_input);
+				if (result != SourceResultType::BLOCKED) {
+					break;
+				}
+				signal->Await();
+				CheckTask();
 			}
-			Finish();
-			return false;
-		}
-		if (result != SourceResultType::HAVE_MORE_OUTPUT || chunk.size() == 0) {
-			throw InternalException("Recluster sorter returned an invalid source result");
+			if (result == SourceResultType::FINISHED) {
+				if (chunk.size() != 0) {
+					throw InternalException("Finished recluster sorter returned output");
+				}
+				Finish();
+				return false;
+			}
+			if (result != SourceResultType::HAVE_MORE_OUTPUT || chunk.size() == 0) {
+				throw InternalException("Recluster sorter returned an invalid source result");
+			}
 		}
 		CheckTask();
 

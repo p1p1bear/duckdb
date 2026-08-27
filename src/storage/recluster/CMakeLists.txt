@@ -14,6 +14,7 @@ add_library_unity(
   recluster_output_writer.cpp
   recluster_retirement.cpp
   recluster_range_scanner.cpp
+  recluster_run_merger.cpp
   recluster_sorter.cpp
   recluster_status.cpp
   recluster_task_context.cpp
