@@ -67,48 +67,92 @@ private:
 	idx_t end;
 };
 
-static void WriteReclusterRowGroupBatch(RangeTask &task, DataTable &storage, RowGroupCollection &collection,
-                                        vector<int64_t> &row_group_indexes,
-                                        const vector<CompressionType> &compression_types,
-                                        vector<unique_ptr<PartialBlockManager>> &partial_managers) {
-	if (row_group_indexes.empty()) {
-		return;
-	}
-
-	vector<const_reference<RowGroup>> row_groups;
-	row_groups.reserve(row_group_indexes.size());
-	for (auto row_group_index : row_group_indexes) {
-		auto row_group = collection.GetRowGroup(row_group_index);
-		if (!row_group || row_group->IsPersistent()) {
-			throw InternalException("Missing in-memory recluster output row group");
+class ReclusterRowGroupWriteBatch {
+public:
+	ReclusterRowGroupWriteBatch(RangeTask &task_p, DataTable &storage, RowGroupCollection &collection_p,
+	                            vector<int64_t> row_group_indexes_p, const vector<CompressionType> &compression_types_p,
+	                            vector<unique_ptr<PartialBlockManager>> &partial_managers_p)
+	    : task(task_p), collection(collection_p), row_group_indexes(std::move(row_group_indexes_p)),
+	      partial_managers(partial_managers_p), compression_types(compression_types_p) {
+		if (row_group_indexes.empty()) {
+			throw InternalException("Cannot schedule an empty recluster row group write batch");
 		}
-		row_groups.push_back(*row_group);
+
+		row_groups.reserve(row_group_indexes.size());
+		for (auto row_group_index : row_group_indexes) {
+			auto row_group = collection.GetRowGroup(row_group_index);
+			if (!row_group || row_group->IsPersistent()) {
+				throw InternalException("Missing in-memory recluster output row group");
+			}
+			row_groups.push_back(*row_group);
+		}
+
+		manager_offset = partial_managers.size();
+		partial_managers.reserve(manager_offset + row_groups.size());
+		auto &block_manager = storage.GetTableIOManager().GetBlockManagerForRowData();
+		for (idx_t row_group_index = 0; row_group_index < row_groups.size(); row_group_index++) {
+			partial_managers.push_back(make_uniq<PartialBlockManager>(
+			    QueryContext(), block_manager, PartialBlockType::RECLUSTER_TASK, optional_idx(0), 1));
+		}
+
+		write_data.resize(row_groups.size());
+		auto &scheduler = TaskScheduler::GetScheduler(storage.GetAttached().GetDatabase());
+		executor = make_uniq<TaskExecutor>(scheduler);
+		auto task_count =
+		    MinValue(row_groups.size(), task.GetTaskContext().GetThreadLimit(scheduler.NumberOfThreads()));
+		D_ASSERT(task_count > 0);
+		try {
+			for (idx_t task_index = 0; task_index < task_count; task_index++) {
+				auto begin = row_groups.size() * task_index / task_count;
+				auto end = row_groups.size() * (task_index + 1) / task_count;
+				executor->ScheduleTask(make_uniq<ReclusterRowGroupWriteTask>(*executor, task, row_groups,
+				                                                             partial_managers, compression_types,
+				                                                             write_data, manager_offset, begin, end));
+			}
+		} catch (...) {
+			executor->CancelAndDrain();
+			throw;
+		}
 	}
 
-	auto manager_offset = partial_managers.size();
-	partial_managers.reserve(manager_offset + row_groups.size());
-	auto &block_manager = storage.GetTableIOManager().GetBlockManagerForRowData();
-	for (idx_t row_group_index = 0; row_group_index < row_groups.size(); row_group_index++) {
-		partial_managers.push_back(make_uniq<PartialBlockManager>(
-		    QueryContext(), block_manager, PartialBlockType::RECLUSTER_TASK, optional_idx(0), 1));
+	~ReclusterRowGroupWriteBatch() {
+		if (executor) {
+			executor->CancelAndDrain();
+		}
 	}
 
-	vector<RowGroupWriteData> write_data(row_groups.size());
-	auto &scheduler = TaskScheduler::GetScheduler(storage.GetAttached().GetDatabase());
-	TaskExecutor executor(scheduler);
-	auto task_count = MinValue(row_groups.size(), task.GetTaskContext().GetThreadLimit(scheduler.NumberOfThreads()));
-	for (idx_t task_index = 0; task_index < task_count; task_index++) {
-		auto begin = row_groups.size() * task_index / task_count;
-		auto end = row_groups.size() * (task_index + 1) / task_count;
-		executor.ScheduleTask(make_uniq<ReclusterRowGroupWriteTask>(
-		    executor, task, row_groups, partial_managers, compression_types, write_data, manager_offset, begin, end));
+	void Finish() {
+		if (!executor) {
+			throw InternalException("Recluster row group write batch was already finished");
+		}
+		try {
+			executor->WorkOnTasks();
+		} catch (...) {
+			executor.reset();
+			throw;
+		}
+		executor.reset();
+		for (idx_t row_group_index = 0; row_group_index < write_data.size(); row_group_index++) {
+			collection.SetRowGroup(row_group_indexes[row_group_index],
+			                       std::move(write_data[row_group_index].result_row_group));
+		}
 	}
-	executor.WorkOnTasks();
-	for (idx_t row_group_index = 0; row_group_index < write_data.size(); row_group_index++) {
-		collection.SetRowGroup(row_group_indexes[row_group_index],
-		                       std::move(write_data[row_group_index].result_row_group));
+
+	const vector<int64_t> &GetRowGroupIndexes() const {
+		return row_group_indexes;
 	}
-}
+
+private:
+	RangeTask &task;
+	RowGroupCollection &collection;
+	vector<int64_t> row_group_indexes;
+	vector<const_reference<RowGroup>> row_groups;
+	vector<unique_ptr<PartialBlockManager>> &partial_managers;
+	const vector<CompressionType> &compression_types;
+	vector<RowGroupWriteData> write_data;
+	idx_t manager_offset = 0;
+	unique_ptr<TaskExecutor> executor;
+};
 
 static vector<block_id_t> UniqueSortedBlocks(vector<block_id_t> blocks) {
 	std::sort(blocks.begin(), blocks.end());
@@ -168,15 +212,12 @@ static RowGroupPointer WriteReclusterRowGroupMetadata(DataTable &storage, const 
 	return pointer;
 }
 
-static void FlushReclusterRowGroupBatch(RangeTask &task, DataTable &storage, RowGroupCollection &collection,
-                                        vector<int64_t> &row_group_indexes, const vector<LogicalType> &types,
-                                        const vector<CompressionType> &compression_types,
-                                        vector<unique_ptr<PartialBlockManager>> &partial_managers,
-                                        const AppendOrganization &organization,
-                                        ReclusterTaskMetadataWriter &metadata_writer,
-                                        PersistentCollectionData &persistent_data,
-                                        vector<RowGroupPointer> &replacement_groups) {
-	WriteReclusterRowGroupBatch(task, storage, collection, row_group_indexes, compression_types, partial_managers);
+static void FinalizeReclusterRowGroupBatch(DataTable &storage, RowGroupCollection &collection,
+                                           const vector<int64_t> &row_group_indexes, const vector<LogicalType> &types,
+                                           const AppendOrganization &organization,
+                                           ReclusterTaskMetadataWriter &metadata_writer,
+                                           PersistentCollectionData &persistent_data,
+                                           vector<RowGroupPointer> &replacement_groups) {
 	for (auto row_group_index : row_group_indexes) {
 		auto segment = collection.GetRowGroups()->GetSegmentByIndex(row_group_index);
 		if (!segment || !segment->GetNode().IsPersistent()) {
@@ -190,7 +231,6 @@ static void FlushReclusterRowGroupBatch(RangeTask &task, DataTable &storage, Row
 		persistent_data.row_group_data.push_back(std::move(row_group_data));
 		replacement_groups.push_back(std::move(pointer));
 	}
-	row_group_indexes.clear();
 }
 
 ReclusterOutput::ReclusterOutput(BlockManager &block_manager_p, shared_ptr<RowGroupCollection> collection_p,
@@ -504,6 +544,25 @@ void ReclusterOutputWriter::Write() {
 			vector<int64_t> pending_row_groups;
 			auto &scheduler = TaskScheduler::GetScheduler(storage.GetAttached().GetDatabase());
 			auto flush_batch_size = task_context.GetThreadLimit(scheduler.NumberOfThreads());
+			unique_ptr<ReclusterRowGroupWriteBatch> write_batch;
+			auto finish_write_batch = [&]() {
+				if (!write_batch) {
+					return;
+				}
+				write_batch->Finish();
+				FinalizeReclusterRowGroupBatch(storage, *collection, write_batch->GetRowGroupIndexes(), types,
+				                               organization, metadata_writer, *persistent_data, replacement_groups);
+				write_batch.reset();
+			};
+			auto schedule_write_batch = [&]() {
+				if (pending_row_groups.empty()) {
+					return;
+				}
+				finish_write_batch();
+				write_batch = make_uniq<ReclusterRowGroupWriteBatch>(
+				    task, storage, *collection, std::move(pending_row_groups), compression_types, partial_managers);
+				pending_row_groups.clear();
+			};
 			while (sorter.Scan(sorted_chunk)) {
 				CheckTask();
 				DataChunk table_chunk;
@@ -519,18 +578,15 @@ void ReclusterOutputWriter::Write() {
 					pending_row_groups.push_back(NumericCast<int64_t>(completed_row_group.GetIndex()));
 				}
 				if (pending_row_groups.size() >= flush_batch_size) {
-					FlushReclusterRowGroupBatch(task, storage, *collection, pending_row_groups, types,
-					                            compression_types, partial_managers, organization, metadata_writer,
-					                            *persistent_data, replacement_groups);
+					schedule_write_batch();
 				}
 			}
 			if (append_initialized) {
 				collection->FinalizeAppend(TransactionData(0, 0), append_state);
 				pending_row_groups.push_back(NumericCast<int64_t>(collection->GetRowGroupCount() - 1));
 			}
-			FlushReclusterRowGroupBatch(task, storage, *collection, pending_row_groups, types, compression_types,
-			                            partial_managers, organization, metadata_writer, *persistent_data,
-			                            replacement_groups);
+			schedule_write_batch();
+			finish_write_batch();
 			if (collection->GetTotalRows() != sorter.GetSortedRowCount()) {
 				throw InternalException("Recluster private output row count does not match sorted input");
 			}
