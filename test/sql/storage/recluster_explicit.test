@@ -232,6 +232,29 @@ SELECT count(*) FROM (
 ----
 0
 
+# An existing runtime state must follow a RESET/SET transition instead of
+# treating the preceding sort order and checkpoint as current.
+statement ok
+CREATE TABLE respecified(k BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO respecified SELECT i FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE respecified RESET SORTED BY
+
+statement ok
+ALTER TABLE respecified SET SORTED BY (k)
+
+query IIT
+SELECT tasks_completed, (remaining_recluster_bytes > 0)::BIGINT, state
+FROM recluster('r.main.respecified', create_checkpoint=false)
+----
+0	1	NO_ELIGIBLE_RANGE
+
 statement ok
 BEGIN
 

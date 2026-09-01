@@ -26,8 +26,9 @@ static ReclusterCandidate SelectStartCandidate(Connection &con, const string &ta
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *state, limits);
+		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
+		                                 *state);
+		auto selection = analysis.SelectCandidate(limits);
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		result = std::move(*selection.candidate);

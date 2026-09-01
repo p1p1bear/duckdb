@@ -24,6 +24,15 @@ struct TableReclusterTaskStatus {
 	idx_t prepared_bytes = 0;
 };
 
+struct TableReclusterSchedulingSnapshot {
+	bool accepts_new_tasks = false;
+	persistent_table_id_t table_id = hugeint_t(0, 0);
+	sort_order_id_t sort_order_id = INVALID_SORT_ORDER_ID;
+	uint64_t storage_generation_id = 0;
+	shared_ptr<const CheckpointLayoutSnapshot> checkpoint;
+	vector<RowGroupRange> reserved_ranges;
+};
+
 class TableReclusterState {
 public:
 	explicit TableReclusterState(uint64_t initialization_token);
@@ -40,9 +49,10 @@ public:
 	sort_order_id_t GetCurrentSortOrderId() const;
 	uint64_t GetCurrentStorageGenerationId() const;
 	bool TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
-	                                  CheckpointLayoutSnapshot snapshot) noexcept;
+	                                  shared_ptr<const CheckpointLayoutSnapshot> snapshot) noexcept;
 	bool HasUsableCheckpoint() const;
-	optional<CheckpointLayoutSnapshot> GetLastCheckpoint() const;
+	shared_ptr<const CheckpointLayoutSnapshot> GetLastCheckpoint() const;
+	TableReclusterSchedulingSnapshot GetSchedulingSnapshot() const;
 	void ClearLastCheckpoint();
 	bool TryRegisterTask(shared_ptr<RangeTask> task);
 	bool OwnsTask(const shared_ptr<RangeTask> &task) const;
@@ -52,7 +62,8 @@ public:
 	void RemoveTask(recluster_task_id_t task_id);
 	vector<RowGroupRange> GetReservedRanges() const;
 	TableReclusterTaskStatus GetTaskStatus() const;
-	optional<int64_t> ObserveRemainingWorkAgeMs(bool has_remaining_work);
+	optional<int64_t> ObserveRemainingWorkAgeMsIfMatches(persistent_table_id_t table_id, sort_order_id_t sort_order_id,
+	                                                     uint64_t storage_generation_id, bool has_remaining_work);
 	void SetLastError(string error);
 	optional<string> GetLastError() const;
 
@@ -82,7 +93,7 @@ private:
 	persistent_table_id_t table_id = hugeint_t(0, 0);
 	sort_order_id_t current_sort_order_id = INVALID_SORT_ORDER_ID;
 	uint64_t current_storage_generation_id = 0;
-	optional<CheckpointLayoutSnapshot> last_checkpoint;
+	shared_ptr<const CheckpointLayoutSnapshot> last_checkpoint;
 	map<row_t, RangeReservation> reserved_ranges;
 	unordered_map<recluster_task_id_t, row_t> reservation_starts;
 	unordered_map<recluster_task_id_t, shared_ptr<RangeTask>> tasks;

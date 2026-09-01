@@ -2,14 +2,13 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/sql_identifier.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/recluster_block_metrics.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
@@ -17,7 +16,6 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
-#include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -26,18 +24,9 @@
 
 namespace duckdb {
 
-static idx_t EstimateRowGroupBytes(DataTable &storage, RowGroup &row_group) {
-	unordered_set<block_id_t> blocks;
-	AddReclusterRowGroupBlocks(row_group, blocks);
-	auto bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
-	if (bytes > 0) {
-		return bytes;
-	}
-	bytes = row_group.GetAllocationSize();
-	if (bytes > 0) {
-		return bytes;
-	}
-	return row_group.count.load();
+static idx_t EstimateRowGroupBytes(DataTable &storage, idx_t transient_bytes, const unordered_set<block_id_t> &blocks) {
+	auto persistent_bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
+	return SaturatingAddReclusterValue(persistent_bytes, transient_bytes);
 }
 
 static idx_t EstimateLiveBytes(idx_t bytes, idx_t physical_rows, idx_t live_rows) {
@@ -190,29 +179,6 @@ static void ComputeOverlapDepth(const vector<ReclusterRunStatus> &runs, idx_t &m
 	p95 = observed_depths[rank - 1];
 }
 
-static unordered_map<row_t, const RowGroupPhysicalIdentity *>
-BuildCheckpointIndex(const optional<CheckpointLayoutSnapshot> &checkpoint) {
-	unordered_map<row_t, const RowGroupPhysicalIdentity *> result;
-	if (!checkpoint) {
-		return result;
-	}
-	result.reserve(checkpoint->row_groups.size());
-	for (auto &identity : checkpoint->row_groups) {
-		result.emplace(identity.start, &identity);
-	}
-	return result;
-}
-
-static bool IsCheckpointedRowGroup(RowGroup &row_group, row_t row_start, const vector<ColumnDefinition> &columns,
-                                   const unordered_map<row_t, const RowGroupPhysicalIdentity *> &checkpoint_index) {
-	auto entry = checkpoint_index.find(row_start);
-	if (entry == checkpoint_index.end()) {
-		return false;
-	}
-	auto identity = ComputeRowGroupPhysicalIdentityV1(row_group, row_start, columns);
-	return identity && *identity == *entry->second;
-}
-
 static ReclusterCandidateLimits StatusCandidateLimits(DataTable &storage) {
 	return GetReclusterCandidateLimits(storage, GetReclusterRowGroupLimit(storage));
 }
@@ -225,27 +191,45 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	if (&storage.GetAttached() != &db) {
 		throw InternalException("Cannot build SORTED BY status through a different attached database");
 	}
-	auto state = storage.GetDataTableInfo()->GetReclusterState();
-	if (!state) {
-		state = SynchronizeTable(table);
-	}
-	if (!state) {
-		throw InternalException("SORTED BY status could not initialize table state");
-	}
 	auto layout_publish_lock = TryGetSharedLayoutPublishLock();
 	auto checkpoint_in_progress = !layout_publish_lock;
 	layout_publish_lock.reset();
 
 	ReclusterTableStatus result;
 	auto &metadata = *table.GetSortMetadata();
+	auto &table_info = *storage.GetDataTableInfo();
+	auto row_groups = storage.GetRowGroupCollection();
+	auto storage_generation_id = row_groups->GetStorageGenerationId();
+	auto shared_state = table_info.GetReclusterState();
+	TableReclusterSchedulingSnapshot scheduling;
+	if (shared_state) {
+		scheduling = shared_state->GetSchedulingSnapshot();
+	}
+	auto state_matches_catalog = shared_state && scheduling.table_id == metadata.table_id &&
+	                             scheduling.sort_order_id == metadata.current_sort_order_id &&
+	                             scheduling.storage_generation_id == storage_generation_id;
+	if (!state_matches_catalog && table.timestamp.load() < TRANSACTION_ID_START) {
+		auto ddl_coordination_lock = table_info.GetReclusterDDLCoordinationLock();
+		if (storage.IsMainTable()) {
+			shared_state = SynchronizeTable(table);
+			D_ASSERT(shared_state);
+			scheduling = shared_state->GetSchedulingSnapshot();
+			state_matches_catalog = scheduling.table_id == metadata.table_id &&
+			                        scheduling.sort_order_id == metadata.current_sort_order_id &&
+			                        scheduling.storage_generation_id == storage_generation_id;
+		}
+	}
 	result.table_id = metadata.table_id;
 	result.enabled = metadata.IsEnabled();
 	result.current_sort_order_id = metadata.current_sort_order_id;
-	result.layout_version = storage.GetDataTableInfo()->GetSortStorage().current_layout_version.load();
-	result.retired_layout_bytes = retirement_registry.GetRetiredBytes(*storage.GetDataTableInfo());
-	result.last_error = state->GetLastError();
+	result.layout_version = table_info.GetSortStorage().current_layout_version.load();
+	result.retired_layout_bytes = retirement_registry.GetRetiredBytes(table_info);
 	if (!result.enabled) {
-		state->ObserveRemainingWorkAgeMs(false);
+		if (shared_state) {
+			result.last_error = shared_state->GetLastError();
+			shared_state->ObserveRemainingWorkAgeMsIfMatches(metadata.table_id, metadata.current_sort_order_id,
+			                                                 storage_generation_id, false);
+		}
 		return result;
 	}
 
@@ -261,25 +245,41 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		throw InternalException("SORTED BY status could not bind its first sort column");
 	}
 
-	auto checkpoint = state->GetLastCheckpoint();
-	auto checkpoint_index = BuildCheckpointIndex(checkpoint);
+	if (!state_matches_catalog) {
+		scheduling = TableReclusterSchedulingSnapshot();
+		scheduling.table_id = metadata.table_id;
+		scheduling.sort_order_id = metadata.current_sort_order_id;
+		scheduling.storage_generation_id = storage_generation_id;
+	}
+	ReclusterLayoutAnalysis analysis(*row_groups, storage.Columns(), std::move(scheduling));
+	if (state_matches_catalog) {
+		result.last_error = shared_state->GetLastError();
+	}
+	result.layout_version = analysis.GetLayoutVersion();
 	vector<ReclusterRunStatus> runs;
 	idx_t total_live_bytes = 0;
 	idx_t current_live_bytes = 0;
-	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot());
-	LayoutRowGroupEntry entry;
-	while (cursor.Next(entry)) {
-		auto &row_group = *entry.row_group;
-		auto physical_rows = row_group.count.load();
-		auto live_rows = row_group.GetCommittedRowCount();
-		auto physical_bytes = EstimateRowGroupBytes(storage, row_group);
+	bool previous_was_current = false;
+	bool has_remaining_work = false;
+	idx_t transient_remaining_bytes = 0;
+	unordered_set<block_id_t> remaining_blocks;
+	unordered_set<block_id_t> row_group_blocks;
+	for (idx_t row_group_index = 0; row_group_index < analysis.GetRowGroups().size(); row_group_index++) {
+		auto &row_group_analysis = analysis.GetRowGroups()[row_group_index];
+		auto &row_group = *row_group_analysis.entry.row_group;
+		row_group_blocks.clear();
+		auto has_persistent_blocks = AddReclusterRowGroupBlocks(row_group, row_group_blocks);
+		auto physical_rows = row_group_analysis.physical_rows;
+		auto live_rows = row_group_analysis.live_rows;
+		auto transient_bytes = GetReclusterRowGroupTransientBytes(row_group, physical_rows, has_persistent_blocks);
+		auto physical_bytes = EstimateRowGroupBytes(storage, transient_bytes, row_group_blocks);
 		auto live_bytes = EstimateLiveBytes(physical_bytes, physical_rows, live_rows);
 		total_live_bytes = SaturatingAddReclusterValue(total_live_bytes, live_bytes);
-		auto organization = row_group.GetSortMetadata();
+		auto organization = row_group_analysis.sort_metadata;
 		auto is_current = organization.sort_order_id == result.current_sort_order_id;
 		if (is_current) {
 			current_live_bytes = SaturatingAddReclusterValue(current_live_bytes, live_bytes);
-			if (runs.empty() || runs.back().run_id != organization.run_id) {
+			if (!previous_was_current || runs.empty() || runs.back().run_id != organization.run_id) {
 				ReclusterRunStatus run;
 				run.run_id = organization.run_id;
 				runs.push_back(std::move(run));
@@ -289,15 +289,23 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 			AddRunStatistics(run, row_group, first_sort_index.GetIndex(), live_rows);
 		}
 
+		previous_was_current = is_current;
 		if (!organization.IsSorted()) {
 			result.unsorted_bytes = SaturatingAddReclusterValue(result.unsorted_bytes, physical_bytes);
-			auto checkpointed = IsCheckpointedRowGroup(row_group, entry.row_start, storage.Columns(), checkpoint_index);
+			auto checkpointed = analysis.IsCheckpointedRowGroup(row_group_index);
 			if (!checkpointed) {
 				result.not_checkpointed_unsorted_bytes =
 				    SaturatingAddReclusterValue(result.not_checkpointed_unsorted_bytes, physical_bytes);
 			}
 			if (row_group.IsSealed() || checkpointed || physical_rows >= storage.GetRowGroupSize()) {
 				result.unsorted_row_groups++;
+			}
+		}
+		if (analysis.RequiresRewrite(row_group_analysis)) {
+			has_remaining_work = true;
+			transient_remaining_bytes = SaturatingAddReclusterValue(transient_remaining_bytes, transient_bytes);
+			if (has_persistent_blocks) {
+				remaining_blocks.insert(row_group_blocks.begin(), row_group_blocks.end());
 			}
 		}
 	}
@@ -316,14 +324,25 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		result.largest_run_fraction = static_cast<double>(largest_run_bytes) / static_cast<double>(total_live_bytes);
 	}
 	ComputeOverlapDepth(runs, result.max_overlap_depth, result.p95_overlap_depth);
-	result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(storage, *state);
-	result.oldest_unsorted_age_ms = state->ObserveRemainingWorkAgeMs(result.unsorted_row_groups > 0);
+	auto persistent_remaining_bytes =
+	    GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), remaining_blocks);
+	result.remaining_recluster_bytes =
+	    SaturatingAddReclusterValue(persistent_remaining_bytes, transient_remaining_bytes);
+	if (has_remaining_work && result.remaining_recluster_bytes == 0) {
+		result.remaining_recluster_bytes = 1;
+	}
+	if (state_matches_catalog) {
+		result.oldest_unsorted_age_ms = shared_state->ObserveRemainingWorkAgeMsIfMatches(
+		    metadata.table_id, metadata.current_sort_order_id, storage_generation_id, result.unsorted_row_groups > 0);
+	}
 
-	auto task_status = state->GetTaskStatus();
-	result.active_prepare_tasks = task_status.active_prepare_tasks;
-	result.pending_finalize_tasks = task_status.pending_finalize_tasks;
-	result.pending_delete_rows = task_status.pending_delete_rows;
-	result.prepared_bytes = task_status.prepared_bytes;
+	if (state_matches_catalog) {
+		auto task_status = shared_state->GetTaskStatus();
+		result.active_prepare_tasks = task_status.active_prepare_tasks;
+		result.pending_finalize_tasks = task_status.pending_finalize_tasks;
+		result.pending_delete_rows = task_status.pending_delete_rows;
+		result.prepared_bytes = task_status.prepared_bytes;
+	}
 	if (result.pending_finalize_tasks > 0 && result.pending_delete_rows > 0) {
 		result.blocked_reason = "FINAL_DELETE_BACKLOG";
 		return result;
@@ -335,17 +354,15 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	if (result.remaining_recluster_bytes == 0 || result.active_prepare_tasks > 0 || result.pending_finalize_tasks > 0) {
 		return result;
 	}
-	auto layout = storage.GetRowGroupCollection()->GetCurrentLayout();
-	if (layout && layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT) {
+	if (analysis.GetLayoutPatchCount() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT) {
 		result.blocked_reason = "LAYOUT_PATCH_LIMIT";
 		return result;
 	}
-	if (!checkpoint || checkpoint->checkpoint_number == 0) {
+	if (!analysis.HasUsableCheckpoint()) {
 		result.blocked_reason = "NO_CHECKPOINTED_RANGE";
 		return result;
 	}
-	auto selection = SelectReclusterCandidate(*storage.GetRowGroupCollection(), storage.Columns(), *state,
-	                                          StatusCandidateLimits(storage));
+	auto selection = analysis.SelectCandidate(StatusCandidateLimits(storage));
 	if (selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT) {
 		result.blocked_reason = "RUN_EXCEEDS_TASK_LIMIT";
 	} else if (!selection.candidate) {

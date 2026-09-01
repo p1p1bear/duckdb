@@ -130,6 +130,46 @@ WHERE table_name = 'events'
 DISABLED	0	(empty)	2	0.0	0	0	0	0	0	0.0	0	0	0	0	1
 
 statement ok
+BEGIN TRANSACTION
+
+statement ok
+ALTER TABLE events SET SORTED BY (event_id)
+
+query RII
+SELECT current_order_coverage, (remaining_recluster_bytes > 0)::BIGINT,
+       (blocked_reason = 'NO_CHECKPOINTED_RANGE')::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+0.0	1	1
+
+statement ok
+ROLLBACK
+
+query TI
+SELECT sort_state, current_sort_order_id::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+DISABLED	0
+
+# Re-enabling SORTED BY must invalidate the runtime state and checkpoint from
+# the preceding sort order.
+statement ok
+ALTER TABLE events SET SORTED BY (event_id)
+
+query RII
+SELECT current_order_coverage, (remaining_recluster_bytes > 0)::BIGINT,
+       (blocked_reason = 'NO_CHECKPOINTED_RANGE')::BIGINT
+FROM duckdb_recluster_status()
+WHERE table_name = 'events'
+----
+0.0	1	1
+
+statement ok
+ALTER TABLE events RESET SORTED BY
+
+statement ok
 CREATE TABLE backlog(i BIGINT)
 
 statement ok
@@ -146,6 +186,15 @@ FROM duckdb_recluster_status()
 WHERE table_name = 'backlog'
 ----
 0.0	2	1	1	1	1	1
+
+sleep 5 milliseconds
+
+query I
+SELECT oldest_unsorted_age > INTERVAL '0 milliseconds'
+FROM duckdb_recluster_status()
+WHERE table_name = 'backlog'
+----
+true
 
 statement ok
 CHECKPOINT r
@@ -178,6 +227,75 @@ query T
 SELECT state FROM recluster('r.main.backlog', max_tasks=1, max_bytes='1GB')
 ----
 COMPLETE
+
+statement ok
+ALTER TABLE backlog RESET SORTED BY
+
+query I
+SELECT last_error IS NOT NULL FROM duckdb_recluster_status() WHERE table_name = 'backlog'
+----
+true
+
+# A transient tail must add to persistent backlog instead of being discarded
+# as soon as any persistent block is present.
+statement ok
+CREATE TABLE mixed_backlog(i BIGINT)
+
+statement ok
+INSERT INTO mixed_backlog SELECT (x * 37) % 4096 FROM range(4096) t(x)
+
+statement ok
+ALTER TABLE mixed_backlog SET SORTED BY (i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+CREATE TEMP TABLE mixed_backlog_before AS
+SELECT remaining_recluster_bytes AS bytes
+FROM duckdb_recluster_status() WHERE table_name = 'mixed_backlog'
+
+statement ok
+INSERT INTO mixed_backlog VALUES (5000)
+
+query II
+SELECT s.remaining_recluster_bytes > b.bytes,
+       s.not_checkpointed_unsorted_bytes > 0
+FROM duckdb_recluster_status() s, mixed_backlog_before b
+WHERE s.table_name = 'mixed_backlog'
+----
+true	true
+
+# DELETE cleanup becomes pending at exactly 25% deleted rows.
+statement ok
+CREATE TABLE delete_threshold(i BIGINT) SORTED BY (i)
+
+statement ok
+INSERT INTO delete_threshold SELECT i FROM range(2048) t(i)
+
+statement ok
+CHECKPOINT r
+
+query I
+SELECT remaining_recluster_bytes FROM duckdb_recluster_status() WHERE table_name = 'delete_threshold'
+----
+0
+
+statement ok
+DELETE FROM delete_threshold WHERE i < 511
+
+query I
+SELECT remaining_recluster_bytes FROM duckdb_recluster_status() WHERE table_name = 'delete_threshold'
+----
+0
+
+statement ok
+DELETE FROM delete_threshold WHERE i = 511
+
+query I
+SELECT remaining_recluster_bytes > 0 FROM duckdb_recluster_status() WHERE table_name = 'delete_threshold'
+----
+true
 
 query I
 SELECT count(*) FROM duckdb_recluster_status() WHERE table_name = 'plain'

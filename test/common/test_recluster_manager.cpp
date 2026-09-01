@@ -9,6 +9,9 @@
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "test_helpers.hpp"
 
+#include <chrono>
+#include <future>
+
 using namespace duckdb; // NOLINT
 
 static duckdb::shared_ptr<TableReclusterState> GetReclusterState(Connection &con, const string &table_name) {
@@ -51,7 +54,7 @@ TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage]
 	auto path = TestCreatePath("recluster_manager_checkpoint.db");
 	DeleteDatabase(path);
 	duckdb::shared_ptr<TableReclusterState> state;
-	optional<CheckpointLayoutSnapshot> successful_snapshot;
+	duckdb::shared_ptr<const CheckpointLayoutSnapshot> successful_snapshot;
 	{
 		DuckDB db;
 		Connection con(db);
@@ -116,6 +119,11 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 		REQUIRE(checkpoint_snapshot->row_groups.size() == 2);
 		auto count_result = con.Query("SELECT count(*) FROM checkpoint_sorted");
 		REQUIRE(CHECK_COLUMN(count_result, 0, {6144}));
+		auto recovery_status =
+		    con.Query("SELECT remaining_recluster_bytes > 0, blocked_reason = 'NO_CHECKPOINTED_RANGE' "
+		              "FROM duckdb_recluster_status() WHERE table_name = 'checkpoint_sorted'");
+		REQUIRE(CHECK_COLUMN(recovery_status, 0, {true}));
+		REQUIRE(CHECK_COLUMN(recovery_status, 1, {true}));
 
 		auto wal_state = GetReclusterState(con, "wal_sorted");
 		REQUIRE(wal_state);
@@ -142,6 +150,122 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 		}
 		REQUIRE(wal_rows == 2048);
 	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster status keeps old catalog snapshots out of shared state", "[storage][recluster_manager]") {
+	auto path = TestCreatePath("recluster_status_catalog_snapshot.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection setup(db);
+	Connection old_reader(db);
+	Connection ddl(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(
+	    setup.Query("ATTACH '" + path + "' AS status_snapshot (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(setup.Query("USE status_snapshot"));
+	REQUIRE_NO_FAIL(old_reader.Query("USE status_snapshot"));
+	REQUIRE_NO_FAIL(ddl.Query("USE status_snapshot"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE initialized(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(setup.Query("INSERT INTO initialized SELECT i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(setup.Query("CHECKPOINT status_snapshot"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE uninitialized(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(setup.Query("INSERT INTO uninitialized SELECT i FROM range(4096) t(i)"));
+	REQUIRE(!GetReclusterState(setup, "uninitialized"));
+
+	REQUIRE_NO_FAIL(old_reader.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(old_reader.Query("SELECT count(*) FROM initialized"));
+	sort_order_id_t old_sort_order_id = INVALID_SORT_ORDER_ID;
+	old_reader.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*old_reader.context, QualifiedName(Identifier("initialized")));
+		old_sort_order_id = entry.GetSortMetadata()->current_sort_order_id;
+	});
+	REQUIRE(old_sort_order_id != INVALID_SORT_ORDER_ID);
+
+	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE initialized RESET SORTED BY"));
+	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE initialized SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE uninitialized RESET SORTED BY"));
+	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE uninitialized SET SORTED BY (i)"));
+	auto current_result =
+	    ddl.Query("SELECT state FROM recluster('status_snapshot.main.initialized', create_checkpoint=false)");
+	REQUIRE(CHECK_COLUMN(current_result, 0, {"NO_ELIGIBLE_RANGE"}));
+	auto current_state = GetReclusterState(ddl, "initialized");
+	REQUIRE(current_state);
+	auto current_sort_order_id = current_state->GetCurrentSortOrderId();
+	REQUIRE(current_sort_order_id != INVALID_SORT_ORDER_ID);
+	REQUIRE(current_sort_order_id != old_sort_order_id);
+	REQUIRE(!GetReclusterState(ddl, "uninitialized"));
+
+	auto old_status = old_reader.Query("SELECT current_sort_order_id, remaining_recluster_bytes "
+	                                   "FROM duckdb_recluster_status() WHERE table_name = 'initialized'");
+	REQUIRE(old_status);
+	REQUIRE(old_status->RowCount() == 1);
+	REQUIRE(old_status->GetValue(0, 0).GetValue<uint64_t>() == old_sort_order_id);
+	REQUIRE(old_status->GetValue(1, 0).GetValue<uint64_t>() == 0);
+	auto uninitialized_status =
+	    old_reader.Query("SELECT count(*) FROM duckdb_recluster_status() WHERE table_name = 'uninitialized'");
+	REQUIRE(CHECK_COLUMN(uninitialized_status, 0, {1}));
+	REQUIRE(current_state->GetCurrentSortOrderId() == current_sort_order_id);
+	REQUIRE(!GetReclusterState(ddl, "uninitialized"));
+	REQUIRE_NO_FAIL(old_reader.Query("ROLLBACK"));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Explicit recluster rejects an old catalog snapshot before synchronizing shared state",
+          "[storage][recluster_manager]") {
+	auto path = TestCreatePath("recluster_explicit_catalog_snapshot.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection setup(db);
+	Connection ddl(db);
+	Connection caller(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(
+	    setup.Query("ATTACH '" + path + "' AS explicit_snapshot (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(setup.Query("USE explicit_snapshot"));
+	REQUIRE_NO_FAIL(ddl.Query("USE explicit_snapshot"));
+	REQUIRE_NO_FAIL(caller.Query("USE explicit_snapshot"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(setup.Query("INSERT INTO tbl SELECT i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(setup.Query("CHECKPOINT explicit_snapshot"));
+
+	auto state = GetReclusterState(setup, "tbl");
+	REQUIRE(state);
+	auto table_id = state->GetTableId();
+	auto storage_generation_id = state->GetCurrentStorageGenerationId();
+	REQUIRE(state->GetCurrentSortOrderId() != INVALID_SORT_ORDER_ID);
+
+	ddl.BeginTransaction();
+	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE tbl RESET SORTED BY"));
+	// Model the current catalog state while the concurrent caller still sees the committed pre-DDL entry.
+	state->SynchronizeCatalog(table_id, INVALID_SORT_ORDER_ID, storage_generation_id, false);
+
+	std::promise<void> caller_started;
+	auto caller_started_future = caller_started.get_future();
+	auto recluster_future = std::async(std::launch::async, [&]() {
+		caller_started.set_value();
+		return caller.Query("SELECT state FROM recluster('explicit_snapshot.main.tbl', create_checkpoint=false)");
+	});
+	caller_started_future.wait();
+	auto blocked_status = recluster_future.wait_for(std::chrono::milliseconds(100));
+	auto sort_order_while_blocked = state->GetCurrentSortOrderId();
+	auto accepts_tasks_while_blocked = state->AcceptsNewTasks();
+	ddl.Commit();
+
+	auto finished_status = recluster_future.wait_for(std::chrono::seconds(5));
+	if (finished_status != std::future_status::ready) {
+		caller.Interrupt();
+	}
+	REQUIRE(blocked_status == std::future_status::timeout);
+	REQUIRE(sort_order_while_blocked == INVALID_SORT_ORDER_ID);
+	REQUIRE(!accepts_tasks_while_blocked);
+	REQUIRE(finished_status == std::future_status::ready);
+	auto result = recluster_future.get();
+	REQUIRE(result);
+	REQUIRE(result->HasError());
+	REQUIRE(result->GetError().find("old catalog snapshot") != string::npos);
+	REQUIRE(state->GetCurrentSortOrderId() == INVALID_SORT_ORDER_ID);
+	REQUIRE(!state->AcceptsNewTasks());
 	DeleteDatabase(path);
 }
 
@@ -227,8 +351,7 @@ TEST_CASE("Unrelated commits do not schedule automatic recluster or checkpoints"
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Sorted commits without a checkpoint do not schedule unusable work by default",
-          "[storage][recluster_auto]") {
+TEST_CASE("Sorted commits without a checkpoint do not schedule unusable work by default", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_no_checkpoint.db");
 	DeleteDatabase(path);
 	DuckDB db;

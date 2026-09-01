@@ -14,37 +14,55 @@ public:
 
 	void Visit(block_id_t block_id) override {
 		if (block_id >= 0) {
+			has_blocks = true;
 			blocks.insert(block_id);
 		}
 	}
 
+	bool HasBlocks() const {
+		return has_blocks;
+	}
+
 private:
 	unordered_set<block_id_t> &blocks;
+	bool has_blocks = false;
 };
 
-static void AddMetadataPointer(unordered_set<block_id_t> &blocks, const MetaBlockPointer &pointer) {
+static bool AddMetadataPointer(unordered_set<block_id_t> &blocks, const MetaBlockPointer &pointer) {
 	if (pointer.IsValid()) {
 		blocks.insert(pointer.GetBlockId());
+		return true;
 	}
+	return false;
 }
 
-void AddReclusterRowGroupBlocks(RowGroup &row_group, unordered_set<block_id_t> &blocks) {
+bool AddReclusterRowGroupBlocks(RowGroup &row_group, unordered_set<block_id_t> &blocks) {
 	ReclusterBlockCollector collector(blocks);
 	for (idx_t column_index = 0; column_index < row_group.GetColumnCount(); column_index++) {
 		row_group.GetRawColumnData(column_index).VisitBlockIds(collector);
 	}
+	bool has_blocks = collector.HasBlocks();
 	for (auto &pointer : row_group.GetColumnStartPointers()) {
-		AddMetadataPointer(blocks, pointer);
+		has_blocks |= AddMetadataPointer(blocks, pointer);
 	}
 	for (auto &pointer : row_group.GetExtraMetadataBlockPointers()) {
-		AddMetadataPointer(blocks, pointer);
+		has_blocks |= AddMetadataPointer(blocks, pointer);
 	}
 	for (auto &pointer : row_group.GetDeleteStartPointers()) {
-		AddMetadataPointer(blocks, pointer);
+		has_blocks |= AddMetadataPointer(blocks, pointer);
 	}
 	for (auto &pointer : row_group.GetLoadedDeleteStoragePointers()) {
-		AddMetadataPointer(blocks, pointer);
+		has_blocks |= AddMetadataPointer(blocks, pointer);
 	}
+	return has_blocks;
+}
+
+idx_t GetReclusterRowGroupTransientBytes(RowGroup &row_group, idx_t physical_rows, bool has_persistent_blocks) {
+	auto allocation_size = row_group.GetAllocationSize();
+	if (allocation_size > 0 || has_persistent_blocks) {
+		return allocation_size;
+	}
+	return physical_rows;
 }
 
 idx_t GetReclusterBlockBytes(const BlockManager &block_manager, const unordered_set<block_id_t> &blocks) {

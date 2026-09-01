@@ -15,7 +15,8 @@ namespace duckdb {
 class BlockManager;
 class RowGroup;
 
-void AddReclusterRowGroupBlocks(RowGroup &row_group, unordered_set<block_id_t> &blocks);
+bool AddReclusterRowGroupBlocks(RowGroup &row_group, unordered_set<block_id_t> &blocks);
+idx_t GetReclusterRowGroupTransientBytes(RowGroup &row_group, idx_t physical_rows, bool has_persistent_blocks);
 idx_t GetReclusterBlockBytes(const BlockManager &block_manager, const unordered_set<block_id_t> &blocks);
 
 } // namespace duckdb

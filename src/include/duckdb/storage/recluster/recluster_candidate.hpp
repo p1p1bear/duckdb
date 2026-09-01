@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 
@@ -16,6 +17,7 @@ namespace duckdb {
 class DataTable;
 class RowGroupCollection;
 class TableReclusterState;
+struct TableReclusterSchedulingSnapshot;
 
 static constexpr idx_t DEFAULT_RECLUSTER_MAX_MERGE_RUNS = 4;
 static constexpr idx_t FULL_RECLUSTER_MAX_MERGE_RUNS = 32;
@@ -62,10 +64,35 @@ struct ReclusterCandidateSelection {
 	optional<ReclusterCandidate> candidate;
 };
 
-ReclusterCandidateSelection SelectReclusterCandidate(RowGroupCollection &collection,
-                                                     const vector<ColumnDefinition> &columns,
-                                                     TableReclusterState &state,
-                                                     const ReclusterCandidateLimits &limits);
+struct ReclusterAnalyzedRowGroup {
+	LayoutRowGroupEntry entry;
+	RowGroupSortMetadata sort_metadata;
+	idx_t physical_rows = 0;
+	idx_t live_rows = 0;
+};
+
+class ReclusterLayoutAnalysisState;
+
+class ReclusterLayoutAnalysis {
+public:
+	ReclusterLayoutAnalysis(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
+	                        TableReclusterState &state);
+	ReclusterLayoutAnalysis(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
+	                        TableReclusterSchedulingSnapshot scheduling);
+	~ReclusterLayoutAnalysis();
+
+	ReclusterCandidateSelection SelectCandidate(const ReclusterCandidateLimits &limits);
+	idx_t GetCheckpointRowGroupCount() const;
+	bool HasUsableCheckpoint() const;
+	const vector<ReclusterAnalyzedRowGroup> &GetRowGroups() const;
+	bool IsCheckpointedRowGroup(idx_t row_group_index);
+	layout_version_t GetLayoutVersion() const;
+	idx_t GetLayoutPatchCount() const;
+	bool RequiresRewrite(const ReclusterAnalyzedRowGroup &row_group) const;
+
+private:
+	unique_ptr<ReclusterLayoutAnalysisState> analysis;
+};
 
 optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &collection,
                                                           const vector<ColumnDefinition> &columns,

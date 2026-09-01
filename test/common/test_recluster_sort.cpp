@@ -22,8 +22,9 @@ static ReclusterTaskStartResult StartSortTask(Connection &con, const string &tab
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *state, {4096, 2, 4, 0.25});
+		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
+		                                 *state);
+		auto selection = analysis.SelectCandidate({4096, 2, 4, 0.25});
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(
@@ -38,8 +39,9 @@ static ReclusterTaskStartResult StartRunMergeTask(Connection &con, const string 
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *state, {32768, 16, 4, 0.25});
+		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
+		                                 *state);
+		auto selection = analysis.SelectCandidate({32768, 16, 4, 0.25});
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		REQUIRE(selection.candidate->type == ReclusterCandidateType::RUN_MERGE);

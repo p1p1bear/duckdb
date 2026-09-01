@@ -2,6 +2,7 @@
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 
+#include <atomic>
 #include <thread>
 
 using namespace duckdb; // NOLINT
@@ -106,16 +107,43 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	REQUIRE(state.GetCurrentStorageGenerationId() == 17);
 	REQUIRE(!state.GetLastCheckpoint());
 
-	CheckpointLayoutSnapshot snapshot;
-	snapshot.checkpoint_number = 8;
-	snapshot.storage_generation_id = 17;
+	CheckpointLayoutSnapshot snapshot_data;
+	snapshot_data.checkpoint_number = 8;
+	snapshot_data.storage_generation_id = 17;
+	auto snapshot = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(snapshot_data));
+	REQUIRE(!state.TryInstallCheckpointSnapshot(3, 17, nullptr));
 	REQUIRE(!state.TryInstallCheckpointSnapshot(4, 17, snapshot));
 	REQUIRE(!state.TryInstallCheckpointSnapshot(3, 18, snapshot));
 	REQUIRE(state.TryInstallCheckpointSnapshot(3, 17, snapshot));
-	REQUIRE(state.GetLastCheckpoint() == snapshot);
+	auto installed = state.GetLastCheckpoint();
+	REQUIRE(installed.get() == snapshot.get());
+	REQUIRE(installed->checkpoint_number == 8);
+
+	auto scheduling = state.GetSchedulingSnapshot();
+	REQUIRE(scheduling.accepts_new_tasks);
+	REQUIRE(scheduling.table_id == table_id);
+	REQUIRE(scheduling.sort_order_id == 3);
+	REQUIRE(scheduling.storage_generation_id == 17);
+	REQUIRE(scheduling.checkpoint.get() == snapshot.get());
+	REQUIRE(scheduling.reserved_ranges.empty());
+
+	auto task = MakeRangeTask(77, 10, 20);
+	REQUIRE(state.TryRegisterTask(task));
+	scheduling = state.GetSchedulingSnapshot();
+	REQUIRE(scheduling.reserved_ranges.size() == 1);
+	REQUIRE(scheduling.reserved_ranges[0].start == 10);
+	REQUIRE(scheduling.reserved_ranges[0].end == 20);
+	state.RemoveTask(task->GetTaskId());
 
 	state.SynchronizeCatalog(table_id, 3, 17, true);
-	REQUIRE(state.GetLastCheckpoint() == snapshot);
+	REQUIRE(state.GetLastCheckpoint().get() == snapshot.get());
+	CheckpointLayoutSnapshot replacement_data;
+	replacement_data.checkpoint_number = 9;
+	replacement_data.storage_generation_id = 17;
+	auto replacement = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(replacement_data));
+	REQUIRE(state.TryInstallCheckpointSnapshot(3, 17, replacement));
+	REQUIRE(state.GetLastCheckpoint().get() == replacement.get());
+	REQUIRE(installed->checkpoint_number == 8);
 	state.SynchronizeCatalog(table_id, 3, 18, true);
 	REQUIRE(!state.GetLastCheckpoint());
 	state.SynchronizeCatalog(table_id, INVALID_SORT_ORDER_ID, 18, true);
@@ -123,9 +151,49 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	REQUIRE_THROWS_AS(state.SynchronizeCatalog(hugeint_t(8, 11), 3, 18, true), InternalException);
 }
 
+TEST_CASE("Table recluster scheduling snapshots remain coherent during checkpoint installation",
+          "[storage][recluster_state]") {
+	TableReclusterState state(100);
+	auto table_id = hugeint_t(7, 12);
+	state.SynchronizeCatalog(table_id, 3, 17, true);
+
+	std::atomic<bool> finished(false);
+	std::atomic<bool> inconsistent(false);
+	std::atomic<bool> install_failed(false);
+	std::thread installer([&]() {
+		for (idx_t iteration = 0; iteration < 1000; iteration++) {
+			auto generation = static_cast<uint64_t>(17 + iteration % 2);
+			state.SynchronizeCatalog(table_id, 3, generation, true);
+			CheckpointLayoutSnapshot checkpoint_data;
+			checkpoint_data.checkpoint_number = iteration + 1;
+			checkpoint_data.storage_generation_id = generation;
+			auto checkpoint = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(checkpoint_data));
+			if (!state.TryInstallCheckpointSnapshot(3, generation, std::move(checkpoint))) {
+				install_failed.store(true);
+				break;
+			}
+		}
+		finished.store(true);
+	});
+
+	while (!finished.load()) {
+		auto current = state.GetSchedulingSnapshot();
+		if (current.checkpoint &&
+		    (current.checkpoint->storage_generation_id != current.storage_generation_id || current.sort_order_id != 3 ||
+		     current.table_id != table_id || !current.accepts_new_tasks)) {
+			inconsistent.store(true);
+			break;
+		}
+	}
+	installer.join();
+	REQUIRE(!install_failed.load());
+	REQUIRE(!inconsistent.load());
+}
+
 TEST_CASE("Table recluster state snapshots task metrics and observations", "[storage][recluster_state]") {
 	TableReclusterState state(101);
-	state.SetAcceptNewTasks(true);
+	auto table_id = hugeint_t(7, 13);
+	state.SynchronizeCatalog(table_id, 3, 17, true);
 	auto task = MakeRangeTask(1, 0, 100);
 	auto first = task->TryReserveDeleteSlot({1, 2});
 	auto second = task->TryReserveDeleteSlot({3});
@@ -154,10 +222,13 @@ TEST_CASE("Table recluster state snapshots task metrics and observations", "[sto
 	REQUIRE(status.pending_delete_rows == 1);
 	REQUIRE(status.prepared_bytes == 8192);
 
-	auto age = state.ObserveRemainingWorkAgeMs(true);
+	auto age = state.ObserveRemainingWorkAgeMsIfMatches(table_id, 3, 17, true);
 	REQUIRE(age);
 	REQUIRE(*age >= 0);
-	REQUIRE(!state.ObserveRemainingWorkAgeMs(false));
+	REQUIRE(!state.ObserveRemainingWorkAgeMsIfMatches(table_id, 4, 17, false));
+	age = state.ObserveRemainingWorkAgeMsIfMatches(table_id, 3, 17, true);
+	REQUIRE(age);
+	REQUIRE(!state.ObserveRemainingWorkAgeMsIfMatches(table_id, 3, 17, false));
 	state.SetLastError("test failure");
 	REQUIRE(state.GetLastError() == "test failure");
 }

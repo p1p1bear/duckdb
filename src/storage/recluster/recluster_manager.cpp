@@ -104,7 +104,7 @@ optional<PendingCheckpointTableState> ReclusterManager::PrepareCheckpoint(DuckTa
 	result.initialization_token = state->GetInitializationToken();
 	result.state = std::move(state);
 	result.storage = storage.shared_from_this();
-	result.candidate_snapshot = std::move(*snapshot);
+	result.candidate_snapshot = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(*snapshot));
 	return result;
 }
 
@@ -112,7 +112,7 @@ void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &
 	ClearAutoCheckpointRequest();
 	vector<QualifiedName> installed_tables;
 	for (auto &pending : states) {
-		if (!pending.storage || !pending.storage->IsMainTable()) {
+		if (!pending.storage || !pending.storage->IsMainTable() || !pending.candidate_snapshot) {
 			continue;
 		}
 		auto current_state = pending.storage->GetDataTableInfo()->GetReclusterState();
@@ -122,7 +122,7 @@ void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &
 			continue;
 		}
 		auto storage_generation_id = pending.storage->GetRowGroupCollection()->GetStorageGenerationId();
-		if (storage_generation_id != pending.candidate_snapshot.storage_generation_id) {
+		if (storage_generation_id != pending.candidate_snapshot->storage_generation_id) {
 			continue;
 		}
 		if (pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
@@ -165,7 +165,8 @@ void ReclusterManager::InitializeCheckpointTables() {
 			return;
 		}
 		state->TryInstallCheckpointSnapshot(table.GetSortMetadata()->current_sort_order_id,
-		                                    snapshot->storage_generation_id, std::move(*snapshot));
+		                                    snapshot->storage_generation_id,
+		                                    make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(*snapshot)));
 	});
 }
 
@@ -228,55 +229,32 @@ static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block
 	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 }
 
-idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
-	auto current_sort_order = state.GetCurrentSortOrderId();
-	if (current_sort_order == INVALID_SORT_ORDER_ID) {
-		return 0;
-	}
-
-	vector<LayoutRowGroupEntry> row_groups;
-	bool has_old_organization = false;
-	idx_t current_run_count = 0;
-	sort_run_id_t previous_run_id = INVALID_SORT_RUN_ID;
-	bool previous_was_current = false;
-	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot());
-	LayoutRowGroupEntry entry;
-	while (cursor.Next(entry)) {
-		auto metadata = entry.row_group->GetSortMetadata();
-		auto is_current = metadata.sort_order_id == current_sort_order;
-		if (!is_current) {
-			has_old_organization = true;
-		} else if (!previous_was_current || metadata.run_id != previous_run_id) {
-			current_run_count++;
-		}
-		previous_was_current = is_current;
-		previous_run_id = is_current ? metadata.run_id : INVALID_SORT_RUN_ID;
-		row_groups.push_back(entry);
-	}
-
+static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const ReclusterLayoutAnalysis &analysis) {
 	unordered_set<block_id_t> blocks;
 	idx_t transient_bytes = 0;
 	bool has_remaining_work = false;
-	auto include_current_runs = current_run_count > 1 || (has_old_organization && current_run_count > 0);
-	for (auto &row_group_entry : row_groups) {
-		auto &row_group = *row_group_entry.row_group;
-		auto is_current = row_group.GetSortMetadata().sort_order_id == current_sort_order;
-		auto physical_rows = row_group.count.load();
-		auto live_rows = row_group.GetCommittedRowCount();
-		auto needs_delete_cleanup =
-		    physical_rows > 0 && live_rows < physical_rows &&
-		    static_cast<long double>(physical_rows - live_rows) >= static_cast<long double>(physical_rows) * 0.25;
-		if (!is_current || include_current_runs || needs_delete_cleanup) {
-			has_remaining_work = true;
-			transient_bytes = SaturatingAddReclusterValue(transient_bytes, row_group.GetAllocationSize());
-			AddReclusterRowGroupBlocks(row_group, blocks);
+	for (auto &row_group_analysis : analysis.GetRowGroups()) {
+		if (!analysis.RequiresRewrite(row_group_analysis)) {
+			continue;
 		}
+		has_remaining_work = true;
+		auto &row_group = *row_group_analysis.entry.row_group;
+		auto has_persistent_blocks = AddReclusterRowGroupBlocks(row_group, blocks);
+		auto row_group_transient_bytes =
+		    GetReclusterRowGroupTransientBytes(row_group, row_group_analysis.physical_rows, has_persistent_blocks);
+		transient_bytes = SaturatingAddReclusterValue(transient_bytes, row_group_transient_bytes);
 	}
 	auto persistent_bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
-	if (persistent_bytes > 0 || !has_remaining_work) {
-		return persistent_bytes;
+	auto total_bytes = SaturatingAddReclusterValue(persistent_bytes, transient_bytes);
+	if (total_bytes > 0 || !has_remaining_work) {
+		return total_bytes;
 	}
-	return transient_bytes > 0 ? transient_bytes : 1;
+	return 1;
+}
+
+idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
+	ReclusterLayoutAnalysis analysis(*storage.GetRowGroupCollection(), storage.Columns(), state);
+	return EstimateAnalyzedRemainingReclusterBytes(storage, analysis);
 }
 
 ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
@@ -623,15 +601,20 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 	}
 
 	auto &initial_table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
-	if (&initial_table.GetStorage().GetDataTableInfo()->GetDB() != &db) {
+	auto storage = initial_table.GetStorage().shared_from_this();
+	if (&storage->GetDataTableInfo()->GetDB() != &db) {
 		throw InternalException("Cannot explicitly recluster a table through a different attached database");
 	}
-	if (!initial_table.SortEnabled()) {
-		throw InvalidInputException("Table %s does not have SORTED BY enabled", table_name.ToString());
-	}
-	auto storage = initial_table.GetStorage().shared_from_this();
-	auto state = storage->GetDataTableInfo()->GetReclusterState();
-	if (!state) {
+	shared_ptr<TableReclusterState> state;
+	{
+		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
+		if (!storage->IsMainTable()) {
+			throw TransactionException("Transaction conflict: cannot recluster table %s from an old catalog snapshot",
+			                           table_name.ToString());
+		}
+		if (!initial_table.SortEnabled()) {
+			throw InvalidInputException("Table %s does not have SORTED BY enabled", table_name.ToString());
+		}
 		state = SynchronizeTable(initial_table);
 	}
 	if (!state) {
@@ -655,7 +638,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		context.InterruptCheck();
 		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
-		if (&table.GetStorage() != storage.get() || !table.SortEnabled() ||
+		if (!storage->IsMainTable() || &table.GetStorage() != storage.get() || !table.SortEnabled() ||
 		    storage->GetDataTableInfo()->GetReclusterState().get() != state.get()) {
 			result.state = ReclusterExplicitState::FAILED;
 			result.message = "the table definition changed while recluster was running";
@@ -668,9 +651,10 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		auto max_row_group_limit =
 		    full_mode ? GetFullReclusterRowGroupLimit(*storage) : GetReclusterRowGroupLimit(*storage);
 		auto max_merge_runs = full_mode ? FULL_RECLUSTER_MAX_MERGE_RUNS : DEFAULT_RECLUSTER_MAX_MERGE_RUNS;
-		auto checkpoint = state->GetLastCheckpoint();
-		if (checkpoint) {
-			max_row_group_limit = MinValue(max_row_group_limit, MaxValue<idx_t>(checkpoint->row_groups.size(), 1));
+		ReclusterLayoutAnalysis analysis(*storage->GetRowGroupCollection(), storage->Columns(), *state);
+		auto checkpoint_row_groups = analysis.GetCheckpointRowGroupCount();
+		if (checkpoint_row_groups > 0) {
+			max_row_group_limit = MinValue(max_row_group_limit, checkpoint_row_groups);
 		}
 		idx_t max_row_groups = MinValue(max_row_group_limit, RECLUSTER_CONVERSION_ROW_GROUP_TARGET);
 		bool expanded_for_run = false;
@@ -678,7 +662,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		idx_t candidate_bytes = 0;
 		while (true) {
 			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups, max_merge_runs);
-			selection = SelectReclusterCandidate(*storage->GetRowGroupCollection(), storage->Columns(), *state, limits);
+			selection = analysis.SelectCandidate(limits);
 			if (!selection.candidate) {
 				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
 				    selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT) {
@@ -710,7 +694,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		}
 
 		if (!selection.candidate) {
-			result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+			result.remaining_recluster_bytes = EstimateAnalyzedRemainingReclusterBytes(*storage, analysis);
 			if (candidate_bytes > caller_remaining_budget || result.input_bytes >= options.max_bytes) {
 				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
 				result.message = "the remaining byte budget cannot admit another row group";

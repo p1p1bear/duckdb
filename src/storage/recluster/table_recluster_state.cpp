@@ -35,6 +35,7 @@ void TableReclusterState::SynchronizeCatalog(persistent_table_id_t table_id_p, s
 	table_id = table_id_p;
 	if (current_sort_order_id != sort_order_id || current_storage_generation_id != storage_generation_id) {
 		last_checkpoint.reset();
+		remaining_work_observed_ms.reset();
 	}
 	current_sort_order_id = sort_order_id;
 	current_storage_generation_id = storage_generation_id;
@@ -57,11 +58,11 @@ uint64_t TableReclusterState::GetCurrentStorageGenerationId() const {
 }
 
 bool TableReclusterState::TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
-                                                       CheckpointLayoutSnapshot snapshot) noexcept {
+                                                       shared_ptr<const CheckpointLayoutSnapshot> snapshot) noexcept {
 	lock_guard<mutex> guard(task_lock);
-	if (!accept_new_tasks || current_sort_order_id != sort_order_id ||
+	if (!snapshot || !accept_new_tasks || current_sort_order_id != sort_order_id ||
 	    current_storage_generation_id != storage_generation_id ||
-	    snapshot.storage_generation_id != storage_generation_id) {
+	    snapshot->storage_generation_id != storage_generation_id) {
 		return false;
 	}
 	last_checkpoint = std::move(snapshot);
@@ -73,9 +74,24 @@ bool TableReclusterState::HasUsableCheckpoint() const {
 	return last_checkpoint && last_checkpoint->checkpoint_number > 0;
 }
 
-optional<CheckpointLayoutSnapshot> TableReclusterState::GetLastCheckpoint() const {
+shared_ptr<const CheckpointLayoutSnapshot> TableReclusterState::GetLastCheckpoint() const {
 	lock_guard<mutex> guard(task_lock);
 	return last_checkpoint;
+}
+
+TableReclusterSchedulingSnapshot TableReclusterState::GetSchedulingSnapshot() const {
+	lock_guard<mutex> guard(task_lock);
+	TableReclusterSchedulingSnapshot result;
+	result.accepts_new_tasks = accept_new_tasks;
+	result.table_id = table_id;
+	result.sort_order_id = current_sort_order_id;
+	result.storage_generation_id = current_storage_generation_id;
+	result.checkpoint = last_checkpoint;
+	result.reserved_ranges.reserve(reserved_ranges.size());
+	for (auto &entry : reserved_ranges) {
+		result.reserved_ranges.push_back(entry.second.range);
+	}
+	return result;
 }
 
 void TableReclusterState::ClearLastCheckpoint() {
@@ -229,17 +245,28 @@ TableReclusterTaskStatus TableReclusterState::GetTaskStatus() const {
 	return result;
 }
 
-optional<int64_t> TableReclusterState::ObserveRemainingWorkAgeMs(bool has_remaining_work) {
-	lock_guard<mutex> guard(task_lock);
+static optional<int64_t> UpdateRemainingWorkAgeMs(optional<int64_t> &observed_ms, bool has_remaining_work) {
 	if (!has_remaining_work) {
-		remaining_work_observed_ms.reset();
+		observed_ms.reset();
 		return nullopt;
 	}
 	auto now_ms = TimePoint::GetTickMs();
-	if (!remaining_work_observed_ms) {
-		remaining_work_observed_ms = now_ms;
+	if (!observed_ms) {
+		observed_ms = now_ms;
 	}
-	return now_ms - *remaining_work_observed_ms;
+	return now_ms - *observed_ms;
+}
+
+optional<int64_t> TableReclusterState::ObserveRemainingWorkAgeMsIfMatches(persistent_table_id_t table_id_p,
+                                                                          sort_order_id_t sort_order_id,
+                                                                          uint64_t storage_generation_id,
+                                                                          bool has_remaining_work) {
+	lock_guard<mutex> guard(task_lock);
+	if (table_id != table_id_p || current_sort_order_id != sort_order_id ||
+	    current_storage_generation_id != storage_generation_id) {
+		return nullopt;
+	}
+	return UpdateRemainingWorkAgeMs(remaining_work_observed_ms, has_remaining_work);
 }
 
 void TableReclusterState::SetLastError(string error) {

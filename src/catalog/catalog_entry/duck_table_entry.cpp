@@ -381,12 +381,6 @@ void DuckTableEntry::HoldReclusterDDLWriteGate(DuckTransaction &transaction, con
 	if (!storage->IsMainTable()) {
 		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);
 	}
-	auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
-	if (current_layout && transaction.start_time < current_layout->visible_from) {
-		throw TransactionException(
-		    "Transaction conflict: cannot %s table \"%s\" from before its current storage layout was published",
-		    operation, name);
-	}
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
@@ -513,6 +507,12 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 	auto hold_write_gate = [&]() {
 		auto &transaction = DuckTransaction::Get(context, storage->db);
 		HoldReclusterDDLWriteGate(transaction, "alter");
+		auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+		if (current_layout && transaction.start_time < current_layout->visible_from) {
+			throw TransactionException(
+			    "Transaction conflict: cannot alter table \"%s\" from before its current storage layout was published",
+			    name);
+		}
 	};
 
 	if (info.bind_mode == AlterBindMode::SKIP_BINDING) {

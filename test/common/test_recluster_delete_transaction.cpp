@@ -27,8 +27,9 @@ static DeleteTransactionTask StartDeleteTransactionTask(Connection &con) {
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
 		result.state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(result.state);
-		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *result.state, {4096, 2, 4, 0.25});
+		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
+		                                 *result.state);
+		auto selection = analysis.SelectCandidate({4096, 2, 4, 0.25});
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		result.start = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(

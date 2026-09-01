@@ -55,8 +55,9 @@ static ReclusterTaskStartResult StartScanTask(Connection &con, const string &tab
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		auto selection = SelectReclusterCandidate(*entry.GetStorage().GetRowGroupCollection(),
-		                                          entry.GetStorage().Columns(), *state, {4096, 2, 4, 0.25});
+		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
+		                                 *state);
+		auto selection = analysis.SelectCandidate({4096, 2, 4, 0.25});
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		result = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().TryStartTask(

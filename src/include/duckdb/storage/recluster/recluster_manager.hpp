@@ -70,7 +70,7 @@ struct PendingCheckpointTableState {
 	uint64_t initialization_token = 0;
 	shared_ptr<TableReclusterState> state;
 	shared_ptr<DataTable> storage;
-	CheckpointLayoutSnapshot candidate_snapshot;
+	shared_ptr<const CheckpointLayoutSnapshot> candidate_snapshot;
 };
 
 class ReclusterManager {

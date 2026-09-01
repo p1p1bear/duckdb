@@ -28,7 +28,30 @@ static ReclusterCandidateSelection SelectCandidateForTest(Connection &con, const
 		auto collection = entry.GetStorage().GetRowGroupCollection();
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		result = SelectReclusterCandidate(*collection, entry.GetStorage().Columns(), *state, limits);
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state);
+		result = analysis.SelectCandidate(limits);
+	});
+	return result;
+}
+
+static duckdb::vector<ReclusterCandidateSelection>
+SelectCandidatesFromOneAnalysisForTest(Connection &con, const string &table_name,
+                                       const duckdb::vector<ReclusterCandidateLimits> &limits) {
+	duckdb::vector<ReclusterCandidateSelection> result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
+		REQUIRE(state);
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), state->GetSchedulingSnapshot());
+		for (auto &candidate_limits : limits) {
+			result.push_back(analysis.SelectCandidate(candidate_limits));
+		}
+		REQUIRE(analysis.GetCheckpointRowGroupCount() == collection->GetRowGroupCount());
+		REQUIRE(analysis.GetRowGroups().size() == collection->GetRowGroupCount());
+		for (auto &row_group : analysis.GetRowGroups()) {
+			REQUIRE(row_group.live_rows <= row_group.physical_rows);
+		}
 	});
 	return result;
 }
@@ -49,8 +72,9 @@ static void InstallCandidateTestRuns(Connection &con, const string &table_name,
 		}
 		auto snapshot = BuildCheckpointLayoutSnapshot(*collection, entry.GetStorage().Columns(), 99);
 		REQUIRE(snapshot);
-		REQUIRE(state->TryInstallCheckpointSnapshot(sort_order_id, collection->GetStorageGenerationId(),
-		                                            std::move(*snapshot)));
+		REQUIRE(
+		    state->TryInstallCheckpointSnapshot(sort_order_id, collection->GetStorageGenerationId(),
+		                                        make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(*snapshot))));
 	});
 }
 
@@ -101,11 +125,29 @@ TEST_CASE("Recluster candidates convert the earliest checkpointed inputs", "[sto
 	selection = SelectCandidateForTest(con, "tbl", limits);
 	REQUIRE(selection.candidate);
 	REQUIRE(selection.candidate->range.start == 2048);
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state);
+		REQUIRE(analysis.GetRowGroups().size() >= 2);
+		REQUIRE(!analysis.IsCheckpointedRowGroup(0));
+		REQUIRE(analysis.IsCheckpointedRowGroup(1));
+	});
 
 	state->ClearLastCheckpoint();
 	selection = SelectCandidateForTest(con, "tbl", limits);
 	REQUIRE(selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE);
 	REQUIRE(!selection.candidate);
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state);
+		REQUIRE(analysis.GetCheckpointRowGroupCount() == 0);
+		REQUIRE(analysis.GetRowGroups().size() == collection->GetRowGroupCount());
+		for (auto &row_group : analysis.GetRowGroups()) {
+			REQUIRE(analysis.RequiresRewrite(row_group));
+		}
+	});
 	DeleteDatabase(path);
 }
 
@@ -123,11 +165,26 @@ TEST_CASE("Recluster candidates preserve runs and prioritize delete cleanup", "[
 
 	InstallCandidateTestRuns(con, "tbl", {41, 41, 41, 41, 41, 41});
 	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE i < 2048"));
-	auto selection = SelectCandidateForTest(con, "tbl", {8192, 4, 4, 0.10});
+	auto selections = SelectCandidatesFromOneAnalysisForTest(
+	    con, "tbl", {{8192, 4, 4, 0.10}, {12288, 6, 4, 0.10}, {8192, 4, 4, 0.10}, {12288, 6, 4, 0.10}});
+	REQUIRE(selections[0].status == selections[2].status);
+	REQUIRE(!selections[2].candidate);
+	REQUIRE(selections[1].status == selections[3].status);
+	REQUIRE(selections[1].candidate);
+	REQUIRE(selections[3].candidate);
+	REQUIRE(selections[1].candidate->type == selections[3].candidate->type);
+	REQUIRE(selections[1].candidate->range.start == selections[3].candidate->range.start);
+	REQUIRE(selections[1].candidate->range.end == selections[3].candidate->range.end);
+	REQUIRE(selections[1].candidate->input_physical_rows == selections[3].candidate->input_physical_rows);
+	REQUIRE(selections[1].candidate->input_live_rows == selections[3].candidate->input_live_rows);
+	REQUIRE(selections[1].candidate->input_deleted_rows == selections[3].candidate->input_deleted_rows);
+	REQUIRE(selections[1].candidate->row_group_count == selections[3].candidate->row_group_count);
+	REQUIRE(selections[1].candidate->run_count == selections[3].candidate->run_count);
+	auto selection = std::move(selections[0]);
 	REQUIRE(selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT);
 	REQUIRE(!selection.candidate);
 
-	selection = SelectCandidateForTest(con, "tbl", {12288, 6, 4, 0.10});
+	selection = std::move(selections[1]);
 	REQUIRE(selection.candidate);
 	REQUIRE(selection.candidate->type == ReclusterCandidateType::DELETE_CLEANUP);
 	REQUIRE(selection.candidate->range.start == 0);
