@@ -416,7 +416,14 @@ void DuckSchemaEntry::OnDropEntry(CatalogTransaction transaction, CatalogEntry &
 	}
 	// if we have transaction local insertions for this table - clear them
 	auto &table_entry = entry.Cast<TableCatalogEntry>();
-	auto &local_storage = LocalStorage::Get(transaction.transaction->Cast<DuckTransaction>());
+	auto &duck_transaction = transaction.transaction->Cast<DuckTransaction>();
+	if (table_entry.IsDuckTable()) {
+		auto &duck_table = table_entry.Cast<DuckTableEntry>();
+		if (duck_table.HasSortHistory()) {
+			duck_table.HoldReclusterDDLWriteGate(duck_transaction, "drop");
+		}
+	}
+	auto &local_storage = LocalStorage::Get(duck_transaction);
 	local_storage.DropTable(table_entry.GetStorage());
 }
 

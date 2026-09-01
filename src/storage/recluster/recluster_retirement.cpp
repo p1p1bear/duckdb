@@ -132,6 +132,7 @@ static void CollectRowGroupRetirement(RowGroup &row_group, vector<RetirementOwne
                                       reference_map_t<RowGroupColumnDropOwnership, idx_t> &ownership_indexes,
                                       vector<block_id_t> &resources) {
 	for (idx_t column_index = 0; column_index < row_group.GetColumnCount(); column_index++) {
+		row_group.GetColumnDropOwnershipBundle(column_index);
 		auto tree = CaptureColumnDropOwnershipRuntimeTree(row_group.GetRawColumnData(column_index));
 		for (auto &node_ref : tree.nodes) {
 			auto &node = node_ref.get();

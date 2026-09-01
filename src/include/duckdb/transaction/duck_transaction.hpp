@@ -33,6 +33,7 @@ class ReclusterDeleteSlot;
 class DuckTransactionManager;
 class StorageLockKey;
 class StorageCommitState;
+struct QualifiedName;
 struct DataTableInfo;
 struct UndoBufferProperties;
 
@@ -117,6 +118,7 @@ public:
 	void HoldExclusiveReclusterWriteLock(DataTableInfo &info);
 	void HoldReclusterDDLCoordinationLock(DataTableInfo &info);
 	bool HoldsReclusterWriteLock(DataTableInfo &info);
+	vector<QualifiedName> GetModifiedReclusterTables(bool include_without_checkpoint) noexcept;
 	void ReleaseReclusterWriteLocks() noexcept;
 
 	void SetIsCheckpointTransaction() {

@@ -17,6 +17,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 
@@ -37,8 +38,10 @@ struct ReclusterAutoSchedulerState {
 	bool active = false;
 	bool rerun_requested = false;
 	bool checkpoint_requested = false;
+	bool discover_tables = false;
 	bool auto_checkpoint_completed = false;
 	int64_t last_auto_checkpoint_ms = 0;
+	vector<QualifiedName> pending_tables;
 };
 
 class ReclusterAutoTask final : public Task {
@@ -88,6 +91,8 @@ void ReclusterManager::StopAutoRecluster() noexcept {
 		auto_scheduler_state->closing = true;
 		auto_scheduler_state->rerun_requested = false;
 		auto_scheduler_state->checkpoint_requested = false;
+		auto_scheduler_state->discover_tables = false;
+		auto_scheduler_state->pending_tables.clear();
 	}
 	try {
 		WaitForAutoRecluster();
@@ -208,11 +213,44 @@ void ReclusterManager::RequestAutoRecluster() noexcept {
 		if (auto_scheduler_state->closing) {
 			return;
 		}
+		auto_scheduler_state->discover_tables = true;
 		if (auto_scheduler_state->active) {
 			auto_scheduler_state->rerun_requested = true;
 			return;
 		}
 		auto_scheduler_state->active = true;
+	}
+	ScheduleAutoReclusterTask();
+}
+
+void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_names) noexcept {
+	if (!AutoReclusterEnabled()) {
+		return;
+	}
+	try {
+		{
+			lock_guard<mutex> guard(auto_scheduler_state->lock);
+			if (auto_scheduler_state->closing) {
+				return;
+			}
+			if (table_names.empty() && auto_scheduler_state->pending_tables.empty() &&
+			    !auto_scheduler_state->checkpoint_requested) {
+				return;
+			}
+			for (auto &table_name : table_names) {
+				if (std::find(auto_scheduler_state->pending_tables.begin(), auto_scheduler_state->pending_tables.end(),
+				              table_name) == auto_scheduler_state->pending_tables.end()) {
+					auto_scheduler_state->pending_tables.push_back(table_name);
+				}
+			}
+			if (auto_scheduler_state->active) {
+				auto_scheduler_state->rerun_requested = true;
+				return;
+			}
+			auto_scheduler_state->active = true;
+		}
+	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
+		return;
 	}
 	ScheduleAutoReclusterTask();
 }
@@ -252,38 +290,50 @@ void ReclusterManager::WaitForAutoRecluster() {
 }
 
 void ReclusterManager::RunAutoReclusterPass() noexcept {
+	vector<QualifiedName> table_names;
+	bool discover_tables;
+	bool retry_checkpoint;
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		if (auto_scheduler_state->closing) {
 			return;
 		}
+		table_names.swap(auto_scheduler_state->pending_tables);
+		discover_tables = auto_scheduler_state->discover_tables;
+		auto_scheduler_state->discover_tables = false;
+		retry_checkpoint = auto_scheduler_state->checkpoint_requested;
 	}
 	if (!AutoReclusterEnabled()) {
 		return;
 	}
 
-	vector<QualifiedName> table_names;
-	try {
-		auto &catalog = db.GetCatalog().Cast<DuckCatalog>();
-		catalog.ScanSchemas([&](SchemaCatalogEntry &schema) {
-			schema.Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-				if (!entry.internal && entry.type == CatalogType::TABLE_ENTRY) {
-					auto &table = entry.Cast<DuckTableEntry>();
-					if (table.SortEnabled()) {
-						table_names.push_back(schema.GetQualifiedName(table.name));
+	if (discover_tables) {
+		try {
+			auto &catalog = db.GetCatalog().Cast<DuckCatalog>();
+			catalog.ScanSchemas([&](SchemaCatalogEntry &schema) {
+				schema.Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+					if (!entry.internal && entry.type == CatalogType::TABLE_ENTRY) {
+						auto &table = entry.Cast<DuckTableEntry>();
+						if (table.SortEnabled()) {
+							auto table_name = schema.GetQualifiedName(table.name);
+							if (std::find(table_names.begin(), table_names.end(), table_name) == table_names.end()) {
+								table_names.push_back(std::move(table_name));
+							}
+						}
 					}
-				}
+				});
 			});
-		});
-	} catch (std::exception &ex) {
-		LogAutoReclusterError(db, ex.what());
-		return;
-	} catch (...) {
-		LogAutoReclusterError(db, "unknown error while scanning sorted tables");
-		return;
+		} catch (std::exception &ex) {
+			LogAutoReclusterError(db, ex.what());
+			return;
+		} catch (...) {
+			LogAutoReclusterError(db, "unknown error while scanning sorted tables");
+			return;
+		}
 	}
 
 	bool checkpoint_needed = false;
+	vector<QualifiedName> retry_tables;
 	for (auto &table_name : table_names) {
 		if (!AutoReclusterEnabled()) {
 			return;
@@ -293,7 +343,16 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 			ReclusterExplicitResult result;
 			shared_ptr<TableReclusterState> table_state;
 			connection.context->RunFunctionInTransaction([&]() {
-				auto &table = Catalog::GetEntry<DuckTableEntry>(*connection.context, table_name);
+				auto table_entry =
+				    Catalog::GetEntry<DuckTableEntry>(*connection.context, table_name, OnEntryNotFound::RETURN_NULL);
+				if (!table_entry) {
+					return;
+				}
+				auto &table = *table_entry;
+				if (!table.SortEnabled()) {
+					SynchronizeTable(table);
+					return;
+				}
 				auto state = table.GetStorage().GetDataTableInfo()->GetReclusterState();
 				if (!state) {
 					state = SynchronizeTable(table);
@@ -302,9 +361,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 					return;
 				}
 				table_state = state;
-				auto checkpoint = state->GetLastCheckpoint();
-				if (!checkpoint || checkpoint->checkpoint_number == 0) {
-					checkpoint_needed |= EstimateRemainingReclusterBytes(table.GetStorage(), *state) > 0;
+				if (!state->HasUsableCheckpoint()) {
+					checkpoint_needed =
+					    checkpoint_needed || (AutoCheckpointEnabled() && table.GetStorage().GetTotalRows() > 0);
 					return;
 				}
 				ReclusterExplicitOptions options;
@@ -321,6 +380,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 			} else if (result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE &&
 			           result.remaining_recluster_bytes > 0) {
 				checkpoint_needed = true;
+			} else if (result.state == ReclusterExplicitState::BUDGET_EXHAUSTED &&
+			           result.remaining_recluster_bytes > 0) {
+				retry_tables.push_back(table_name);
 			}
 		} catch (FatalException &ex) {
 			InvalidateAfterAutoReclusterError(db, ex);
@@ -340,7 +402,10 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 			LogAutoReclusterError(db, table_name.ToString() + ": unknown background error");
 		}
 	}
-	if (checkpoint_needed) {
+	if (!retry_tables.empty()) {
+		RequestAutoRecluster(retry_tables);
+	}
+	if (checkpoint_needed || retry_checkpoint) {
 		RequestAutoCheckpoint();
 	}
 }

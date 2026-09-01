@@ -114,8 +114,8 @@ private:
 	shared_ptr<RowVersionManager> owned_version_info;
 	//! The column data of the row_group (mutable because `const` can lazily load)
 	mutable vector<shared_ptr<ColumnData>> columns;
-	//! Runtime ownership identity for each top-level column's concrete storage tree.
-	vector<shared_ptr<ColumnDropOwnershipBundle>> column_drop_ownership_bundles;
+	//! Fixed-size lazy ownership slots. A published non-null slot is never reset or replaced.
+	mutable vector<shared_ptr<ColumnDropOwnershipBundle>> column_drop_ownership_bundles;
 
 public:
 	void MoveToCollection(RowGroupCollection &collection);
@@ -276,6 +276,7 @@ public:
 	//! Direct accessors, fall outside of general use but can be useful to some extensions
 	ColumnData &GetRawColumnData(const StorageIndex &c) const;
 	ColumnData &GetRawColumnData(storage_t c) const;
+	bool HasColumnDropOwnershipBundle(idx_t column_index) const;
 	const shared_ptr<ColumnDropOwnershipBundle> &GetColumnDropOwnershipBundle(idx_t column_index) const;
 
 private:
@@ -307,6 +308,7 @@ private:
 	                                               shared_ptr<ColumnDropOwnershipBundle> &result_bundle);
 	static shared_ptr<ColumnDropOwnershipBundle> InitializeColumnDropOwnership(ColumnData &column);
 	static void BindColumnDropOwnership(ColumnData &column, ColumnDropOwnershipBundle &bundle);
+	const shared_ptr<ColumnDropOwnershipBundle> &GetOrCreateColumnDropOwnershipBundleLocked(idx_t column_index) const;
 
 	bool HasUnloadedDeletes() const;
 	unique_ptr<RowGroup> CreateNewRowGroupCopy(RowGroupCollection &new_collection, idx_t new_column_count);

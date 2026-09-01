@@ -48,14 +48,26 @@ struct LayoutPatch {
 	vector<shared_ptr<RowGroup>> replacement_groups;
 };
 
+struct LayoutPatchIndex {
+	idx_t base_start_index;
+	idx_t base_end_index;
+	idx_t layout_start_index;
+	vector<row_t> replacement_starts;
+};
+
 struct RowGroupLayout {
 	RowGroupLayout(layout_version_t layout_version, transaction_t visible_from,
 	               shared_ptr<RowGroupSegmentTree> base_tree, vector<shared_ptr<const LayoutPatch>> patches = {});
+	optional_idx FindPatch(row_t row_id) const;
+	idx_t FindNextPatch(row_t row_id) const;
+	optional_idx FindReplacementGroup(idx_t patch_index, row_t row_id) const;
+	idx_t GetBaseLayoutIndex(idx_t base_index, idx_t next_patch_index) const;
 
 	layout_version_t layout_version;
 	transaction_t visible_from;
 	shared_ptr<RowGroupSegmentTree> base_tree;
 	vector<shared_ptr<const LayoutPatch>> patches;
+	vector<LayoutPatchIndex> patch_indexes;
 };
 
 static constexpr idx_t MAX_LAYOUT_PATCHES_PER_CHECKPOINT = 64;
@@ -112,7 +124,8 @@ public:
 private:
 	bool NextUnfiltered(LayoutRowGroupEntry &result);
 	void AdvanceBase();
-	void BeginPatch(const LayoutPatch &patch);
+	void BeginPatch(idx_t index);
+	void Seek(row_t row_id);
 
 private:
 	RowGroupCollectionSnapshot snapshot;

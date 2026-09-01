@@ -74,11 +74,10 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, RowGroupPointer pointer)
 	}
 	this->column_pointers = std::move(pointer.data_pointers);
 	this->columns.resize(column_pointers.size());
-	this->column_drop_ownership_bundles.reserve(columns.size());
+	this->column_drop_ownership_bundles.resize(columns.size());
 	this->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[columns.size()]);
 	for (idx_t c = 0; c < columns.size(); c++) {
 		this->is_loaded[c] = false;
-		this->column_drop_ownership_bundles.push_back(make_shared_ptr<ColumnDropOwnershipBundle>());
 	}
 	this->deletes_pointers = std::move(pointer.deletes_pointers);
 	this->has_metadata_blocks = pointer.has_metadata_blocks;
@@ -101,11 +100,10 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, PersistentRowGroupData &dat
 	auto &info = GetTableInfo();
 	auto &types = collection.get().GetTypes();
 	columns.reserve(types.size());
-	column_drop_ownership_bundles.reserve(types.size());
+	column_drop_ownership_bundles.resize(types.size());
 	for (idx_t c = 0; c < types.size(); c++) {
 		auto entry = ColumnData::CreateColumn(block_manager, info, c, types[c]);
 		entry->InitializeColumn(data.column_data[c]);
-		column_drop_ownership_bundles.push_back(InitializeColumnDropOwnership(*entry));
 		columns.push_back(std::move(entry));
 	}
 
@@ -208,11 +206,37 @@ ColumnData &RowGroup::GetRawColumnData(storage_t c) const {
 	return GetColumn(c);
 }
 
-const shared_ptr<ColumnDropOwnershipBundle> &RowGroup::GetColumnDropOwnershipBundle(idx_t column_index) const {
-	if (column_index >= column_drop_ownership_bundles.size() || !column_drop_ownership_bundles[column_index]) {
+bool RowGroup::HasColumnDropOwnershipBundle(idx_t column_index) const {
+	if (column_index >= column_drop_ownership_bundles.size()) {
 		throw InternalException("Column drop ownership bundle index is out of range");
 	}
-	return column_drop_ownership_bundles[column_index];
+	lock_guard<mutex> guard(row_group_lock);
+	return column_drop_ownership_bundles[column_index] != nullptr;
+}
+
+const shared_ptr<ColumnDropOwnershipBundle> &
+RowGroup::GetOrCreateColumnDropOwnershipBundleLocked(idx_t column_index) const {
+	if (column_index >= column_drop_ownership_bundles.size()) {
+		throw InternalException("Column drop ownership bundle index is out of range");
+	}
+	auto &bundle = column_drop_ownership_bundles[column_index];
+	if (bundle) {
+		return bundle;
+	}
+	if (ColumnIsLoaded(column_index)) {
+		if (!columns[column_index]) {
+			throw InternalException("Loaded column is missing its column data");
+		}
+		bundle = InitializeColumnDropOwnership(*columns[column_index]);
+	} else {
+		bundle = make_shared_ptr<ColumnDropOwnershipBundle>();
+	}
+	return bundle;
+}
+
+const shared_ptr<ColumnDropOwnershipBundle> &RowGroup::GetColumnDropOwnershipBundle(idx_t column_index) const {
+	lock_guard<mutex> guard(row_group_lock);
+	return GetOrCreateColumnDropOwnershipBundleLocked(column_index);
 }
 
 void RowGroup::LoadColumn(storage_t c) const {
@@ -254,7 +278,9 @@ void RowGroup::LoadColumn(storage_t c) const {
 		                        "not match count of row group %llu",
 		                        c, loaded_column->count.load(), this->count.load());
 	}
-	BindColumnDropOwnership(*loaded_column, *GetColumnDropOwnershipBundle(c));
+	if (column_drop_ownership_bundles[c]) {
+		BindColumnDropOwnership(*loaded_column, *column_drop_ownership_bundles[c]);
+	}
 	this->columns[c] = std::move(loaded_column);
 	is_loaded[c] = true;
 }
@@ -290,10 +316,9 @@ void RowGroup::InitializeEmpty(const vector<LogicalType> &types, ColumnDataType 
 	D_ASSERT(columns.empty());
 	D_ASSERT(column_drop_ownership_bundles.empty());
 	columns.reserve(types.size());
-	column_drop_ownership_bundles.reserve(types.size());
+	column_drop_ownership_bundles.resize(types.size());
 	for (idx_t i = 0; i < types.size(); i++) {
 		auto column_data = ColumnData::CreateColumn(GetBlockManager(), GetTableInfo(), i, types[i], data_type);
-		column_drop_ownership_bundles.push_back(InitializeColumnDropOwnership(*column_data));
 		columns.push_back(std::move(column_data));
 	}
 }
@@ -530,7 +555,6 @@ unique_ptr<RowGroup> RowGroup::AlterType(RowGroupCollection &new_collection, con
 		column_data->Append(append_state, append_vector, scan_chunk.size());
 	}
 	column_data->FinalizeAppend(nullptr, append_state);
-	auto changed_column_bundle = InitializeColumnDropOwnership(*column_data);
 
 	auto supports_per_column_writes = new_collection.SupportsPerColumnWrites();
 	if (!supports_per_column_writes) {
@@ -544,14 +568,13 @@ unique_ptr<RowGroup> RowGroup::AlterType(RowGroupCollection &new_collection, con
 	for (idx_t i = 0; i < columns.size(); i++) {
 		if (i == changed_idx) {
 			row_group->columns[i] = std::move(column_data);
-			row_group->column_drop_ownership_bundles[i] = std::move(changed_column_bundle);
 			if (row_group->is_loaded) {
 				row_group->is_loaded[i] = true;
 			}
 			column_data.reset();
 		} else {
 			row_group->columns[i] = columns[i];
-			row_group->column_drop_ownership_bundles[i] = column_drop_ownership_bundles[i];
+			row_group->column_drop_ownership_bundles[i] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 			if (row_group->is_loaded) {
 				row_group->is_loaded[i] = is_loaded[i].load();
 			}
@@ -595,7 +618,6 @@ unique_ptr<RowGroup> RowGroup::AddColumn(RowGroupCollection &new_collection, Col
 		}
 		added_column->FinalizeAppend(nullptr, state);
 	}
-	auto added_column_bundle = InitializeColumnDropOwnership(*added_column);
 
 	if (!new_collection.SupportsPerColumnWrites()) {
 		// ensure all columns are loaded, as checkpointing will need to load them anyway, and it's better to fail-fast
@@ -608,7 +630,7 @@ unique_ptr<RowGroup> RowGroup::AddColumn(RowGroupCollection &new_collection, Col
 	// copy existing columns
 	for (idx_t i = 0; i < columns.size(); i++) {
 		row_group->columns[i] = columns[i];
-		row_group->column_drop_ownership_bundles[i] = column_drop_ownership_bundles[i];
+		row_group->column_drop_ownership_bundles[i] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 		if (row_group->is_loaded) {
 			row_group->is_loaded[i] = is_loaded[i].load();
 		}
@@ -621,7 +643,6 @@ unique_ptr<RowGroup> RowGroup::AddColumn(RowGroupCollection &new_collection, Col
 	}
 	// add the new column
 	row_group->columns[columns.size()] = std::move(added_column);
-	row_group->column_drop_ownership_bundles[columns.size()] = std::move(added_column_bundle);
 	if (row_group->is_loaded) {
 		row_group->is_loaded[columns.size()] = true;
 	}
@@ -649,7 +670,7 @@ unique_ptr<RowGroup> RowGroup::RemoveColumn(RowGroupCollection &new_collection, 
 			continue;
 		}
 		row_group->columns[target_idx] = columns[i];
-		row_group->column_drop_ownership_bundles[target_idx] = column_drop_ownership_bundles[i];
+		row_group->column_drop_ownership_bundles[target_idx] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 		if (row_group->is_loaded) {
 			row_group->is_loaded[target_idx] = is_loaded[i].load();
 		}
@@ -684,6 +705,7 @@ struct BlockIdCollector : public BlockIdVisitor {
 };
 
 void RowGroup::CommitDropColumn(const idx_t column_index, CommitDropState &drop_state) {
+	GetColumnDropOwnershipBundle(column_index);
 	auto &column = GetColumn(column_index);
 	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
 	for (auto &node_ref : runtime_tree.nodes) {
@@ -1430,12 +1452,13 @@ shared_ptr<ColumnData> RowGroup::CheckpointColumn(const RowGroup &row_group, idx
                                                   RowGroupWriteData &write_data,
                                                   shared_ptr<ColumnDropOwnershipBundle> &result_bundle) {
 	auto &column = row_group.GetColumn(column_idx);
+	auto source_bundle = row_group.GetColumnDropOwnershipBundle(column_idx);
 	ColumnCheckpointInfo checkpoint_info(info, column_idx);
 	auto checkpoint_state = column.Checkpoint(row_group, checkpoint_info);
 
 	auto result_col = checkpoint_state->GetFinalResult();
 	if (result_col.get() == &column) {
-		result_bundle = row_group.GetColumnDropOwnershipBundle(column_idx);
+		result_bundle = std::move(source_bundle);
 	} else {
 		result_bundle = InitializeColumnDropOwnership(*result_col);
 	}
@@ -1718,7 +1741,7 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 				                                ? std::move(*col_stats)
 				                                : BaseStatistics::CreateEmpty(GetCollection().GetTypes()[column_idx]));
 			}
-			result_row_group->column_drop_ownership_bundles[column_idx] = column_drop_ownership_bundles[column_idx];
+			result_row_group->column_drop_ownership_bundles[column_idx] = GetColumnDropOwnershipBundle(column_idx);
 		} else {
 			// checkpoint this column
 			auto &column = GetColumn(column_idx);
@@ -2208,12 +2231,12 @@ void RowGroup::Verify() {
 	D_ASSERT(!sort_metadata.IsSorted() || sealed);
 	D_ASSERT(column_drop_ownership_bundles.size() == columns.size());
 	for (idx_t c = 0; c < columns.size(); c++) {
-		D_ASSERT(column_drop_ownership_bundles[c]);
 		if (!ColumnIsLoaded(c)) {
 			continue;
 		}
 		if (columns[c]) {
-			D_ASSERT(columns[c]->GetDropOwnershipToken());
+			D_ASSERT(column_drop_ownership_bundles[c] ? columns[c]->GetDropOwnershipToken()
+			                                          : !columns[c]->GetDropOwnershipToken());
 			columns[c]->Verify(*this);
 		}
 	}

@@ -63,12 +63,123 @@ static void VerifyLayout(const RowGroupLayout &layout) {
 	}
 }
 
+static vector<LayoutPatchIndex> BuildPatchIndexes(RowGroupSegmentTree &base_tree,
+                                                  const vector<shared_ptr<const LayoutPatch>> &patches) {
+	vector<LayoutPatchIndex> result;
+	result.reserve(patches.size());
+	idx_t replaced_group_count = 0;
+	idx_t replacement_group_count = 0;
+	auto tree_lock = base_tree.Lock();
+	for (auto &patch : patches) {
+		auto base_node = base_tree.GetSegmentAtOrAfter(tree_lock, NumericCast<idx_t>(patch->range.start));
+		if (!base_node || NumericCast<row_t>(base_node->GetRowStart()) != patch->range.start) {
+			throw InternalException("Layout patch range does not begin at a base row group boundary");
+		}
+
+		LayoutPatchIndex index;
+		index.base_start_index = base_node->GetIndex();
+		index.layout_start_index = index.base_start_index - replaced_group_count + replacement_group_count;
+		idx_t replaced_rows = 0;
+		row_t replaced_end = patch->range.start;
+		while (base_node && NumericCast<row_t>(base_node->GetRowStart()) < patch->range.end) {
+			auto base_start = NumericCast<row_t>(base_node->GetRowStart());
+			auto base_end = NumericCast<row_t>(base_node->GetRowEnd());
+			if (base_start < replaced_end || base_end > patch->range.end) {
+				throw InternalException("Layout patch range is not aligned with its base row groups");
+			}
+			replaced_rows += base_node->GetNode().count.load();
+			replaced_end = base_end;
+			base_node = base_tree.GetNextSegment(tree_lock, *base_node);
+		}
+		if (replaced_end != patch->range.end || replaced_rows != patch->replaced_physical_rows) {
+			throw InternalException("Layout patch replaced row count does not match its base row groups");
+		}
+		index.base_end_index = base_node ? base_node->GetIndex() : base_tree.GetSegmentCount(tree_lock);
+
+		row_t replacement_start = patch->range.start;
+		index.replacement_starts.reserve(patch->replacement_groups.size());
+		for (auto &row_group : patch->replacement_groups) {
+			index.replacement_starts.push_back(replacement_start);
+			replacement_start += NumericCast<row_t>(row_group->count.load());
+		}
+		replaced_group_count += index.base_end_index - index.base_start_index;
+		replacement_group_count += patch->replacement_groups.size();
+		result.push_back(std::move(index));
+	}
+	return result;
+}
+
 RowGroupLayout::RowGroupLayout(layout_version_t layout_version_p, transaction_t visible_from_p,
                                shared_ptr<RowGroupSegmentTree> base_tree_p,
                                vector<shared_ptr<const LayoutPatch>> patches_p)
     : layout_version(layout_version_p), visible_from(visible_from_p), base_tree(std::move(base_tree_p)),
       patches(std::move(patches_p)) {
 	VerifyLayout(*this);
+	patch_indexes = BuildPatchIndexes(*base_tree, patches);
+}
+
+optional_idx RowGroupLayout::FindPatch(row_t row_id) const {
+	idx_t lower = 0;
+	idx_t upper = patches.size();
+	while (lower < upper) {
+		auto index = lower + (upper - lower) / 2;
+		if (patches[index]->range.start <= row_id) {
+			lower = index + 1;
+		} else {
+			upper = index;
+		}
+	}
+	if (lower == 0) {
+		return optional_idx();
+	}
+	auto candidate = lower - 1;
+	return patches[candidate]->range.Contains(row_id) ? optional_idx(candidate) : optional_idx();
+}
+
+idx_t RowGroupLayout::FindNextPatch(row_t row_id) const {
+	idx_t lower = 0;
+	idx_t upper = patches.size();
+	while (lower < upper) {
+		auto index = lower + (upper - lower) / 2;
+		if (patches[index]->range.start < row_id) {
+			lower = index + 1;
+		} else {
+			upper = index;
+		}
+	}
+	return lower;
+}
+
+optional_idx RowGroupLayout::FindReplacementGroup(idx_t patch_index, row_t row_id) const {
+	D_ASSERT(patch_index < patches.size());
+	auto &starts = patch_indexes[patch_index].replacement_starts;
+	idx_t lower = 0;
+	idx_t upper = starts.size();
+	while (lower < upper) {
+		auto index = lower + (upper - lower) / 2;
+		if (starts[index] <= row_id) {
+			lower = index + 1;
+		} else {
+			upper = index;
+		}
+	}
+	if (lower == 0) {
+		return optional_idx();
+	}
+	auto candidate = lower - 1;
+	auto row_end =
+	    starts[candidate] + NumericCast<row_t>(patches[patch_index]->replacement_groups[candidate]->count.load());
+	return row_id < row_end ? optional_idx(candidate) : optional_idx();
+}
+
+idx_t RowGroupLayout::GetBaseLayoutIndex(idx_t base_index, idx_t next_patch_index) const {
+	D_ASSERT(next_patch_index <= patch_indexes.size());
+	if (next_patch_index == 0) {
+		return base_index;
+	}
+	auto &previous = patch_indexes[next_patch_index - 1];
+	D_ASSERT(base_index >= previous.base_end_index);
+	return previous.layout_start_index + previous.replacement_starts.size() + base_index - previous.base_end_index;
 }
 
 TableLayoutHistory::TableLayoutHistory(shared_ptr<const RowGroupLayout> initial_layout)

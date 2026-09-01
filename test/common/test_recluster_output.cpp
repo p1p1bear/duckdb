@@ -75,13 +75,18 @@ static void PrepareOutputTask(ReclusterTaskStartResult &start) {
 }
 
 static duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>>
-CaptureLayoutDropOwnership(const duckdb::shared_ptr<const RowGroupLayout> &layout, RowGroupRange range) {
+CaptureLayoutDropOwnership(const duckdb::shared_ptr<const RowGroupLayout> &layout, RowGroupRange range,
+                           optional_idx selected_column = optional_idx()) {
 	duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>> result;
 	reference_set_t<RowGroupColumnDropOwnership> visited;
 	LayoutRowGroupCursor cursor(RowGroupCollectionSnapshot(layout), range);
 	LayoutRowGroupEntry current;
 	while (cursor.Next(current)) {
-		for (idx_t column_index = 0; column_index < current.row_group->GetColumnCount(); column_index++) {
+		auto first_column = selected_column.IsValid() ? selected_column.GetIndex() : 0;
+		auto last_column = selected_column.IsValid() ? first_column + 1 : current.row_group->GetColumnCount();
+		REQUIRE(last_column <= current.row_group->GetColumnCount());
+		for (idx_t column_index = first_column; column_index < last_column; column_index++) {
+			current.row_group->GetColumnDropOwnershipBundle(column_index);
 			auto tree = CaptureColumnDropOwnershipRuntimeTree(current.row_group->GetRawColumnData(column_index));
 			for (auto &node : tree.nodes) {
 				auto ownership = node.get().GetDropOwnershipToken();
@@ -352,11 +357,21 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 		auto row_group = lazy_collection->GetRowGroup(NumericCast<int64_t>(row_group_index));
 		REQUIRE(row_group);
 		REQUIRE(row_group->GetColumnStartPointers().size() == 4);
+		for (idx_t column_index = 0; column_index < row_group->GetColumnCount(); column_index++) {
+			REQUIRE_FALSE(row_group->HasColumnDropOwnershipBundle(column_index));
+		}
 		for (auto &pointer : row_group->GetColumnStartPointers()) {
 			REQUIRE(pointer.IsValid());
 		}
 	}
 	CheckCollectionRows(con, *lazy_collection, expected);
+	for (idx_t row_group_index = 0; row_group_index < lazy_collection->GetRowGroupCount(); row_group_index++) {
+		auto row_group = lazy_collection->GetRowGroup(NumericCast<int64_t>(row_group_index));
+		REQUIRE(row_group);
+		for (idx_t column_index = 0; column_index < row_group->GetColumnCount(); column_index++) {
+			REQUIRE_FALSE(row_group->HasColumnDropOwnershipBundle(column_index));
+		}
+	}
 
 	auto main_result = con.Query("SELECT count(*), count(DISTINCT payload) FROM tbl");
 	REQUIRE_NO_FAIL(*main_result);
@@ -889,6 +904,104 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 		Connection con(db);
 		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("DROP TABLE reclaims an unmaterialized recluster replacement layout", "[storage][recluster_finalize][drop]") {
+	auto path = TestCreatePath("recluster_drop_table_layout.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS drop_layout (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE drop_layout"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload VARCHAR)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT ((i * 37) % 4096)::INTEGER, repeat(i::VARCHAR, 64) "
+		                          "FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT drop_layout"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k)"));
+		auto recluster = con.Query(
+		    "SELECT tasks_completed FROM recluster('drop_layout.main.tbl', create_checkpoint=true, max_tasks=1)");
+		REQUIRE(recluster);
+		REQUIRE(CHECK_COLUMN(recluster, 0, {1}));
+
+		duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>> replacement_ownership;
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto layout = entry.GetStorage().GetRowGroupCollection()->GetCurrentLayout();
+			REQUIRE(layout);
+			REQUIRE(layout->patches.size() == 1);
+			replacement_ownership = CaptureLayoutDropOwnership(layout, layout->patches[0]->range);
+		});
+		REQUIRE_FALSE(replacement_ownership.empty());
+
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE tbl"));
+		for (auto &ownership : replacement_ownership) {
+			REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::DROPPED);
+		}
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("FORCE CHECKPOINT drop_layout"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_FAIL(con.Query("SELECT * FROM tbl"));
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("DROP COLUMN reclaims an unmaterialized recluster replacement column",
+          "[storage][recluster_finalize][drop]") {
+	auto path = TestCreatePath("recluster_drop_column_layout.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db;
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+		REQUIRE_NO_FAIL(
+		    con.Query("ATTACH '" + path + "' AS drop_layout (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+		REQUIRE_NO_FAIL(con.Query("USE drop_layout"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k INTEGER, payload VARCHAR, retained BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT ((i * 37) % 4096)::INTEGER, repeat(i::VARCHAR, 64), i "
+		                          "FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT drop_layout"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (k)"));
+		auto recluster = con.Query(
+		    "SELECT tasks_completed FROM recluster('drop_layout.main.tbl', create_checkpoint=true, max_tasks=1)");
+		REQUIRE(recluster);
+		REQUIRE(CHECK_COLUMN(recluster, 0, {1}));
+
+		duckdb::vector<duckdb::shared_ptr<RowGroupColumnDropOwnership>> replacement_ownership;
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto layout = entry.GetStorage().GetRowGroupCollection()->GetCurrentLayout();
+			REQUIRE(layout);
+			REQUIRE(layout->patches.size() == 1);
+			replacement_ownership = CaptureLayoutDropOwnership(layout, layout->patches[0]->range, optional_idx(1));
+		});
+		REQUIRE_FALSE(replacement_ownership.empty());
+
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl DROP COLUMN payload"));
+		for (auto &ownership : replacement_ownership) {
+			REQUIRE(ownership->GetState() == RowGroupColumnDropOwnership::State::DROPPED);
+		}
+		auto rows = con.Query("SELECT count(*), sum(retained) FROM tbl");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("FORCE CHECKPOINT drop_layout"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		auto rows = con.Query("SELECT count(*), sum(retained) FROM tbl");
 		REQUIRE(rows);
 		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
 		REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));

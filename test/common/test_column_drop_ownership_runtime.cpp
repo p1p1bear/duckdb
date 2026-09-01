@@ -10,6 +10,8 @@
 #include "duckdb/storage/table/row_group_column_drop_ownership.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "test_helpers.hpp"
 
 #include <atomic>
@@ -41,6 +43,7 @@ CaptureTableDropOwnership(Connection &con, const string &table_name, optional_id
 		auto last_column = selected_column.IsValid() ? first_column + 1 : row_group->GetColumnCount();
 		REQUIRE(last_column <= row_group->GetColumnCount());
 		for (idx_t column_index = first_column; column_index < last_column; column_index++) {
+			row_group->GetColumnDropOwnershipBundle(column_index);
 			auto tree = CaptureColumnDropOwnershipRuntimeTree(row_group->GetRawColumnData(column_index));
 			for (auto &node : tree.nodes) {
 				auto token = node.get().GetDropOwnershipToken();
@@ -80,6 +83,135 @@ private:
 static_assert(noexcept(std::declval<ColumnDropOwnershipRuntimeTree &>().ApplyTokenPlan(
                   std::declval<const vector<shared_ptr<RowGroupColumnDropOwnership>> &>())),
               "applying a validated ownership token plan must be noexcept");
+
+TEST_CASE("Ordinary row groups initialize column ownership only when shared", "[storage][drop_ownership_runtime]") {
+	auto path = TestCreatePath("column_drop_ownership_lazy.db");
+	DeleteDatabase(path);
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER, removed VARCHAR, retained BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER, i::VARCHAR, i::BIGINT FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto collection = entry.GetStorage().GetRowGroupCollection();
+			auto source_row_group = collection->GetRowGroup(0);
+			REQUIRE(source_row_group);
+			for (idx_t column_index = 0; column_index < source_row_group->GetColumnCount(); column_index++) {
+				REQUIRE_FALSE(source_row_group->HasColumnDropOwnershipBundle(column_index));
+			}
+
+			auto unloaded_tree = CaptureColumnDropOwnershipRuntimeTree(source_row_group->GetRawColumnData(0));
+			REQUIRE_FALSE(source_row_group->HasColumnDropOwnershipBundle(0));
+			for (auto &node : unloaded_tree.nodes) {
+				REQUIRE_FALSE(node.get().GetDropOwnershipToken());
+			}
+
+			auto removed_collection = collection->RemoveColumn(1);
+			auto removed_row_group = removed_collection->GetRowGroup(0);
+			REQUIRE(removed_row_group);
+			REQUIRE(source_row_group->HasColumnDropOwnershipBundle(0));
+			REQUIRE_FALSE(source_row_group->HasColumnDropOwnershipBundle(1));
+			REQUIRE(source_row_group->HasColumnDropOwnershipBundle(2));
+			REQUIRE(removed_row_group->HasColumnDropOwnershipBundle(0));
+			REQUIRE(removed_row_group->HasColumnDropOwnershipBundle(1));
+			REQUIRE(source_row_group->GetColumnDropOwnershipBundle(0) ==
+			        removed_row_group->GetColumnDropOwnershipBundle(0));
+			REQUIRE(source_row_group->GetColumnDropOwnershipBundle(2) ==
+			        removed_row_group->GetColumnDropOwnershipBundle(1));
+
+			auto source_tree = CaptureColumnDropOwnershipRuntimeTree(source_row_group->GetRawColumnData(2));
+			auto clone_tree = CaptureColumnDropOwnershipRuntimeTree(removed_row_group->GetRawColumnData(1));
+			REQUIRE(source_tree.nodes.size() == clone_tree.nodes.size());
+			for (idx_t node_index = 0; node_index < source_tree.nodes.size(); node_index++) {
+				REQUIRE(source_tree.nodes[node_index].get().GetDropOwnershipToken());
+				REQUIRE(source_tree.nodes[node_index].get().GetDropOwnershipToken() ==
+				        clone_tree.nodes[node_index].get().GetDropOwnershipToken());
+			}
+		});
+	}
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Nested checkpoint results preserve ownership for reused children", "[storage][drop_ownership_runtime]") {
+	auto path = TestCreatePath("column_drop_ownership_nested_checkpoint.db");
+	DeleteDatabase(path);
+	shared_ptr<RowGroup> source_row_group;
+	{
+		DuckDB db(path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(payload STRUCT(a INTEGER, b BIGINT))"));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT struct_pack(a := i::INTEGER, b := i::BIGINT) "
+		                          "FROM range(4096) t(i)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(path);
+		Connection con(db);
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto root = entry.GetStorage().GetRowGroupCollection()->GetRowGroups()->GetRootSegment();
+			REQUIRE(root);
+			source_row_group = root->ReferenceNode();
+			REQUIRE(source_row_group);
+			REQUIRE_FALSE(source_row_group->HasColumnDropOwnershipBundle(0));
+
+			auto &table = entry.GetStorage();
+			MetaTransaction::Get(*con.context).ModifyDatabase(table.db, DatabaseModificationType());
+			Vector row_ids(LogicalType::ROW_TYPE);
+			row_ids.Append(Value::BIGINT(0));
+			DataChunk updates;
+			updates.Initialize(*con.context, {LogicalType::INTEGER});
+			updates.data[0].Append(Value::INTEGER(42));
+			updates.SetChildCardinality(1);
+			table.UpdateColumn(entry, *con.context, row_ids, {0, 1}, updates);
+			REQUIRE_FALSE(source_row_group->HasColumnDropOwnershipBundle(0));
+		});
+
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		shared_ptr<RowGroup> current_row_group;
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+			auto root = entry.GetStorage().GetRowGroupCollection()->GetRowGroups()->GetRootSegment();
+			REQUIRE(root);
+			current_row_group = root->ReferenceNode();
+		});
+		REQUIRE(current_row_group);
+		REQUIRE(current_row_group != source_row_group);
+		REQUIRE(source_row_group->HasColumnDropOwnershipBundle(0));
+		REQUIRE(current_row_group->HasColumnDropOwnershipBundle(0));
+		REQUIRE(source_row_group->GetColumnDropOwnershipBundle(0) !=
+		        current_row_group->GetColumnDropOwnershipBundle(0));
+
+		auto source_tree = CaptureColumnDropOwnershipRuntimeTree(source_row_group->GetRawColumnData(0));
+		auto current_tree = CaptureColumnDropOwnershipRuntimeTree(current_row_group->GetRawColumnData(0));
+		REQUIRE(source_tree.nodes.size() == current_tree.nodes.size());
+		bool found_reused_child = false;
+		bool found_rewritten_node = false;
+		for (idx_t node_index = 0; node_index < source_tree.nodes.size(); node_index++) {
+			auto source_token = source_tree.nodes[node_index].get().GetDropOwnershipToken();
+			auto current_token = current_tree.nodes[node_index].get().GetDropOwnershipToken();
+			REQUIRE(source_token);
+			REQUIRE(current_token);
+			found_reused_child |= source_token == current_token;
+			found_rewritten_node |= source_token != current_token;
+		}
+		REQUIRE(found_reused_child);
+		REQUIRE(found_rewritten_node);
+
+		auto rows = con.Query("SELECT (payload).a, (payload).b FROM tbl WHERE rowid = 0");
+		REQUIRE(rows);
+		REQUIRE(CHECK_COLUMN(rows, 0, {42}));
+		REQUIRE(CHECK_COLUMN(rows, 1, {0}));
+		source_row_group.reset();
+	}
+	DeleteDatabase(path);
+}
 
 TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[storage][drop_ownership_runtime]") {
 	auto path = TestCreatePath("column_drop_ownership_runtime.db");
@@ -173,7 +305,7 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 			REQUIRE(shape_nodes[3].parent_index == 2);
 
 			vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
-			auto &bundle = pre_checkpoint_row_group->GetColumnDropOwnershipBundle(0);
+			auto bundle = pre_checkpoint_row_group->GetColumnDropOwnershipBundle(0);
 			REQUIRE(bundle->Bind(runtime_tree.shape, canonical_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
 			REQUIRE(runtime_tree.ApplyTokenPlan(canonical_tokens));
 			for (idx_t node_index = 0; node_index < runtime_tree.nodes.size(); node_index++) {

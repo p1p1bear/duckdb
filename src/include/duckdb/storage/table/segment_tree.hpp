@@ -214,6 +214,29 @@ public:
 	optional_ptr<SegmentNode<T>> GetSegment(SegmentLock &l, idx_t row_number) const {
 		return nodes[GetSegmentIndex(l, row_number)].get();
 	}
+	//! Gets the segment containing the row number, or the first segment after it when the row falls in a gap
+	optional_ptr<SegmentNode<T>> GetSegmentAtOrAfter(idx_t row_number) const {
+		auto l = Lock();
+		return GetSegmentAtOrAfter(l, row_number);
+	}
+	optional_ptr<SegmentNode<T>> GetSegmentAtOrAfter(SegmentLock &l, idx_t row_number) const {
+		while (nodes.empty() || row_number >= nodes.back()->GetRowEnd()) {
+			if (!LoadNextSegment(l)) {
+				break;
+			}
+		}
+		idx_t lower = 0;
+		idx_t upper = nodes.size();
+		while (lower < upper) {
+			auto index = lower + (upper - lower) / 2;
+			if (nodes[index]->GetRowEnd() <= row_number) {
+				lower = index + 1;
+			} else {
+				upper = index;
+			}
+		}
+		return lower < nodes.size() ? nodes[lower].get() : nullptr;
+	}
 
 	void AppendSegment(shared_ptr<T> segment) {
 		auto l = Lock();

@@ -326,8 +326,8 @@ TEST_CASE("Schema alters preserve table sort identities through WAL replay", "[s
 		REQUIRE(before_restart.metadata.next_column_id == 10);
 		REQUIRE(before_restart.metadata.next_sort_order_id == 3);
 		REQUIRE(before_restart.metadata.current_sort_order_id == 2);
-		REQUIRE(before_restart.metadata.definitions[0].columns[0].column_id == 1);
-		REQUIRE(before_restart.metadata.definitions[1].columns[0].column_id == 9);
+		REQUIRE(before_restart.metadata.definitions.size() == 1);
+		REQUIRE(before_restart.metadata.definitions[0].columns[0].column_id == 9);
 		REQUIRE(before_restart.catalog_column_ids == duckdb::vector<persistent_column_id_t> {9, 8, 0, 4});
 		REQUIRE(before_restart.storage_column_ids == duckdb::vector<persistent_column_id_t> {9, 8, 4});
 	}
@@ -443,15 +443,23 @@ TEST_CASE("Create table parser preserves sort order modifiers", "[parser][sort_m
 	REQUIRE(parser.statements.size() == 1);
 	auto &statement = parser.statements[0]->Cast<CreateStatement>();
 	auto &info = statement.info->Cast<CreateTableInfo>();
-	REQUIRE(info.sort_keys.size() == 2);
+	REQUIRE(info.sort_keys.empty());
 	REQUIRE(info.sort_orders.size() == 2);
 	REQUIRE(info.sort_orders[0].type == OrderType::ORDER_DEFAULT);
 	REQUIRE(info.sort_orders[0].null_order == OrderByNullType::ORDER_DEFAULT);
 	REQUIRE(info.sort_orders[1].type == OrderType::ASCENDING);
 	REQUIRE(info.sort_orders[1].null_order == OrderByNullType::NULLS_LAST);
-	for (idx_t i = 0; i < info.sort_orders.size(); i++) {
-		REQUIRE(ParsedExpression::Equals(info.sort_keys[i], info.sort_orders[i].expression));
-	}
+
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	BinarySerializer::Serialize(info, stream);
+	stream.Rewind();
+	auto round_trip_info = BinaryDeserializer::Deserialize<CreateInfo>(stream);
+	auto &round_trip = round_trip_info->Cast<CreateTableInfo>();
+	REQUIRE(round_trip.sort_keys.empty());
+	REQUIRE(round_trip.sort_orders.size() == 2);
+	REQUIRE(round_trip.sort_orders[1].type == OrderType::ASCENDING);
+	REQUIRE(round_trip.sort_orders[1].null_order == OrderByNullType::NULLS_LAST);
 
 	Parser modified_parser;
 	modified_parser.ParseQuery("CREATE TABLE rejected(i INTEGER) SORTED BY (i DESC NULLS FIRST)");
@@ -474,7 +482,7 @@ TEST_CASE("Create table sort key projections normalize and validate", "[storage]
 	auto legacy_output_info = BinaryDeserializer::Deserialize<CreateInfo>(stream);
 	auto &legacy_output = legacy_output_info->Cast<CreateTableInfo>();
 	REQUIRE(!legacy_output.sort_metadata);
-	REQUIRE(legacy_output.sort_keys.size() == 1);
+	REQUIRE(legacy_output.sort_keys.empty());
 	REQUIRE(legacy_output.sort_orders.size() == 1);
 	REQUIRE(legacy_output.sort_orders[0].type == OrderType::ORDER_DEFAULT);
 	REQUIRE(legacy_output.sort_orders[0].null_order == OrderByNullType::ORDER_DEFAULT);

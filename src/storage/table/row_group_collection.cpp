@@ -2628,16 +2628,18 @@ void RowGroupCollection::Destroy() {
 // CommitDrop
 //===--------------------------------------------------------------------===//
 void RowGroupCollection::CommitDropColumn(const idx_t column_index, CommitDropState &drop_state) {
-	auto row_groups = GetRowGroups();
-	for (auto &row_group : row_groups->Segments()) {
-		row_group.CommitDropColumn(column_index, drop_state);
+	LayoutRowGroupCursor cursor(GetCurrentSnapshot());
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		entry.row_group->CommitDropColumn(column_index, drop_state);
 	}
 }
 
 void RowGroupCollection::CommitDropTable(CommitDropState &drop_state) {
-	auto row_groups = GetRowGroups();
-	for (auto &row_group : row_groups->Segments()) {
-		row_group.CommitDrop(drop_state);
+	LayoutRowGroupCursor cursor(GetCurrentSnapshot());
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		entry.row_group->CommitDrop(drop_state);
 	}
 }
 

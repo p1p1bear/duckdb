@@ -372,6 +372,23 @@ unique_ptr<BlockingSample> DuckTableEntry::GetSample() {
 	return storage->GetSample();
 }
 
+void DuckTableEntry::HoldReclusterDDLWriteGate(DuckTransaction &transaction, const char *operation) {
+	if (!storage->IsMainTable()) {
+		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);
+	}
+	transaction.HoldReclusterDDLCoordinationLock(*storage->GetDataTableInfo());
+	transaction.HoldExclusiveReclusterWriteLock(*storage->GetDataTableInfo());
+	if (!storage->IsMainTable()) {
+		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);
+	}
+	auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+	if (current_layout && transaction.start_time < current_layout->visible_from) {
+		throw TransactionException(
+		    "Transaction conflict: cannot %s table \"%s\" from before its current storage layout was published",
+		    operation, name);
+	}
+}
+
 unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
 	if (transaction.HasContext()) {
 		return AlterEntry(transaction.GetContext(), info);
@@ -409,6 +426,10 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	auto &table_info = info.Cast<AlterTableInfo>();
 	if (SortEnabled() && table_info.alter_table_type == AlterTableType::ADD_CONSTRAINT) {
 		throw BinderException("Cannot add an index constraint while SORTED BY is enabled");
+	}
+	if (HasSortHistory() && table_info.alter_table_type != AlterTableType::SET_SORTED_BY) {
+		auto &transaction = DuckTransaction::Get(context, storage->db);
+		HoldReclusterDDLWriteGate(transaction, "alter");
 	}
 	switch (table_info.alter_table_type) {
 	case AlterTableType::RENAME_COLUMN: {
@@ -490,21 +511,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 	auto create_info = GetInfo();
 	auto &table_info = create_info->Cast<CreateTableInfo>();
 	auto hold_write_gate = [&]() {
-		if (!storage->IsMainTable()) {
-			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);
-		}
 		auto &transaction = DuckTransaction::Get(context, storage->db);
-		transaction.HoldReclusterDDLCoordinationLock(*storage->GetDataTableInfo());
-		transaction.HoldExclusiveReclusterWriteLock(*storage->GetDataTableInfo());
-		if (!storage->IsMainTable()) {
-			throw TransactionException("Catalog write-write conflict on alter with \"%s\"", name);
-		}
-		auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
-		if (current_layout && transaction.start_time < current_layout->visible_from) {
-			throw TransactionException(
-			    "Transaction conflict: cannot alter table \"%s\" from before its current storage layout was published",
-			    name);
-		}
+		HoldReclusterDDLWriteGate(transaction, "alter");
 	};
 
 	if (info.bind_mode == AlterBindMode::SKIP_BINDING) {
@@ -518,6 +526,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 		}
 		hold_write_gate();
 		table_info.sort_metadata->current_sort_order_id = INVALID_SORT_ORDER_ID;
+		table_info.sort_metadata->definitions.clear();
 		info.sort_post_image = BuildTableSortPostImage(*table_info.sort_metadata, table_info.columns);
 	} else {
 		VerifySortedAlterCapabilities(*this);
@@ -536,6 +545,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, Set
 		hold_write_gate();
 		VerifySortedAlterCapabilities(*this);
 		metadata.current_sort_order_id = metadata.next_sort_order_id++;
+		metadata.definitions.clear();
 		metadata.definitions.push_back(std::move(definition));
 		ValidateTableSortCatalogMetadata(metadata, table_info.columns);
 		info.sort_post_image = BuildTableSortPostImage(metadata, table_info.columns);

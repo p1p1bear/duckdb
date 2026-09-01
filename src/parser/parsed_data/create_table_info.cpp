@@ -75,11 +75,8 @@ void CreateTableInfo::NormalizeLegacySortKeys() {
 		for (auto &sort_key : sort_keys) {
 			sort_orders.emplace_back(OrderType::ORDER_DEFAULT, OrderByNullType::ORDER_DEFAULT, sort_key->Copy());
 		}
-	} else if (sort_keys.empty()) {
-		for (auto &sort_order : sort_orders) {
-			sort_keys.push_back(sort_order.expression->Copy());
-		}
 	}
+	sort_keys.clear();
 }
 
 void CreateTableInfo::Serialize(Serializer &serializer) const {
@@ -94,17 +91,20 @@ void CreateTableInfo::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<unique_ptr<SelectStatement>>(203, "query", query);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(204, "partition_keys", partition_keys);
 
-	vector<unique_ptr<ParsedExpression>> projected_sort_keys;
-	const auto *serialized_sort_keys = &sort_keys;
-	if (sort_keys.empty() && !sort_orders.empty()) {
+	vector<unique_ptr<ParsedExpression>> legacy_sort_keys;
+	const auto serialize_sort_orders = serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION);
+	if (!serialize_sort_orders && !sort_orders.empty()) {
 		for (auto &sort_order : sort_orders) {
-			projected_sort_keys.push_back(sort_order.expression->Copy());
+			legacy_sort_keys.push_back(sort_order.expression->Copy());
 		}
-		serialized_sort_keys = &projected_sort_keys;
+	} else if (sort_orders.empty()) {
+		for (auto &sort_key : sort_keys) {
+			legacy_sort_keys.push_back(sort_key->Copy());
+		}
 	}
-	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", *serialized_sort_keys);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<ParsedExpression>>>(205, "sort_keys", legacy_sort_keys);
 	serializer.WritePropertyWithDefault<case_insensitive_map_t<unique_ptr<ParsedExpression>>>(206, "options", options);
-	if (!serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+	if (!serialize_sort_orders) {
 		return;
 	}
 	serializer.WritePropertyWithDefault<optional<TableSortCatalogMetadata>>(207, "sort_metadata", sort_metadata,

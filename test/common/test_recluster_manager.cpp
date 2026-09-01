@@ -198,7 +198,7 @@ TEST_CASE("Maintenance commits chain bounded automatic conversion tasks", "[stor
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Automatic recluster does not request checkpoints by default", "[storage][recluster_auto]") {
+TEST_CASE("Unrelated commits do not schedule automatic recluster or checkpoints", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_checkpoint_default.db");
 	DeleteDatabase(path);
 	DuckDB db;
@@ -221,11 +221,31 @@ TEST_CASE("Automatic recluster does not request checkpoints by default", "[stora
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
 	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
 	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
-	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes > 0 "
-	                           "FROM recluster('checkpoint_default.main.tbl')");
-	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
-	REQUIRE(CHECK_COLUMN(remaining, 1, {"NO_ELIGIBLE_RANGE"}));
-	REQUIRE(CHECK_COLUMN(remaining, 2, {true}));
+	auto inversions =
+	    con.Query("SELECT count(*) > 0 FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {true}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Sorted commits without a checkpoint do not schedule unusable work by default",
+          "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_no_checkpoint.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(
+	    con.Query("ATTACH '" + path + "' AS no_checkpoint (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE no_checkpoint"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(2048) t(i)"));
+	REQUIRE(!GetReclusterState(con, "tbl"));
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (2048)"));
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	REQUIRE(!GetReclusterState(con, "tbl"));
 	DeleteDatabase(path);
 }
 
@@ -242,14 +262,14 @@ TEST_CASE("Automatic checkpoint requests discover newly sorted tables", "[storag
 	    con.Query("ATTACH '" + path + "' AS checkpoint_discovery (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE checkpoint_discovery"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (i * 37) % 4096 FROM range(4096) t(i)"));
 	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
 	REQUIRE(!GetReclusterState(con, "tbl"));
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
-	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	auto &manager = GetReclusterManager(con, "tbl");
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
 	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") > 0);
 	auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('checkpoint_discovery.main.tbl')");
 	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
@@ -274,7 +294,6 @@ TEST_CASE("Automatic checkpoint requests coalesce across sorted tables", "[stora
 	REQUIRE_NO_FAIL(con.Query("USE checkpoint_coalesce"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE left_tbl(i BIGINT) SORTED BY (i)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE right_tbl(i BIGINT) SORTED BY (i)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
 	AppendInterleavedSortedRuns(con, "left_tbl", 5);
 	AppendInterleavedSortedRuns(con, "right_tbl", 5);
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_coalesce"));
@@ -282,8 +301,9 @@ TEST_CASE("Automatic checkpoint requests coalesce across sorted tables", "[stora
 	REQUIRE(GetReclusterCheckpointNumber(con, "right_tbl") == checkpoint_number);
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
-	GetReclusterManager(con, "left_tbl").WaitForAutoRecluster();
+	auto &manager = GetReclusterManager(con, "left_tbl");
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
 	REQUIRE(GetReclusterCheckpointNumber(con, "left_tbl") == checkpoint_number + 1);
 	REQUIRE(GetReclusterCheckpointNumber(con, "right_tbl") == checkpoint_number + 1);
 	auto remaining = con.Query("SELECT table_name, tasks_completed, state FROM ("
@@ -313,14 +333,14 @@ TEST_CASE("Automatic checkpoint requests are rate limited", "[storage][recluster
 	    con.Query("ATTACH '" + path + "' AS checkpoint_rate (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE checkpoint_rate"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY (i)"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
 	AppendInterleavedSortedRuns(con, "tbl", 17);
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_rate"));
 	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
-	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	auto &manager = GetReclusterManager(con, "tbl");
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
 	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number + 1);
 	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes > 0 "
 	                           "FROM recluster('checkpoint_rate.main.tbl')");
@@ -372,7 +392,7 @@ TEST_CASE("Automatic checkpoint requests retry after a writer releases the check
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Commits wake automatic recluster after it is enabled", "[storage][recluster_auto]") {
+TEST_CASE("Only commits to modified sorted tables wake automatic recluster", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_commit.db");
 	DeleteDatabase(path);
 	DuckDB db;
@@ -382,24 +402,41 @@ TEST_CASE("Commits wake automatic recluster after it is enabled", "[storage][rec
 	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS auto_commit (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE auto_commit"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i BIGINT)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE untouched(i BIGINT)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
-	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO target SELECT 4095 - i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO untouched SELECT 4095 - i FROM range(4096) t(i)"));
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_commit"));
-	REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE target SET SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE untouched SET SORTED BY (i)"));
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_commit"));
 
-	auto &manager = GetReclusterManager(con, "tbl");
+	auto &manager = GetReclusterManager(con, "target");
 	manager.WaitForAutoRecluster();
-	auto before =
-	    con.Query("SELECT count(*) > 0 FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
-	REQUIRE(CHECK_COLUMN(before, 0, {true}));
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
 	manager.WaitForAutoRecluster();
-	auto after = con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous_i FROM tbl) WHERE i < previous_i");
-	REQUIRE(CHECK_COLUMN(after, 0, {0}));
+	auto before = con.Query("SELECT table_name, has_inversions FROM ("
+	                        "SELECT 'target' table_name, count(*) > 0 has_inversions FROM ("
+	                        "SELECT i, lag(i) OVER () previous_i FROM target) WHERE i < previous_i UNION ALL "
+	                        "SELECT 'untouched' table_name, count(*) > 0 has_inversions FROM ("
+	                        "SELECT i, lag(i) OVER () previous_i FROM untouched) WHERE i < previous_i) "
+	                        "ORDER BY table_name");
+	REQUIRE(CHECK_COLUMN(before, 0, {"target", "untouched"}));
+	REQUIRE(CHECK_COLUMN(before, 1, {true, true}));
+
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO target VALUES (4096)"));
+	manager.WaitForAutoRecluster();
+	auto after = con.Query("SELECT table_name, has_inversions FROM ("
+	                       "SELECT 'target' table_name, count(*) > 0 has_inversions FROM ("
+	                       "SELECT i, lag(i) OVER () previous_i FROM target) WHERE i < previous_i UNION ALL "
+	                       "SELECT 'untouched' table_name, count(*) > 0 has_inversions FROM ("
+	                       "SELECT i, lag(i) OVER () previous_i FROM untouched) WHERE i < previous_i) "
+	                       "ORDER BY table_name");
+	REQUIRE(CHECK_COLUMN(after, 0, {"target", "untouched"}));
+	REQUIRE(CHECK_COLUMN(after, 1, {false, true}));
 	DeleteDatabase(path);
 }
 
@@ -416,13 +453,12 @@ TEST_CASE("Database close drains automatic recluster work", "[storage][recluster
 		    con.Query("ATTACH '" + path + "' AS auto_close (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 		REQUIRE_NO_FAIL(con.Query("USE auto_close"));
 		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT)"));
-		REQUIRE_NO_FAIL(con.Query("CREATE TABLE wake(i INTEGER)"));
 		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095 - i FROM range(4096) t(i)"));
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_close"));
 		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT auto_close"));
 		REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
-		REQUIRE_NO_FAIL(con.Query("INSERT INTO wake VALUES (1)"));
+		GetReclusterManager(con, "tbl").RequestAutoRecluster();
 	}
 	{
 		DuckDB db;

@@ -94,6 +94,8 @@ public:
 	ReclusterTableStatus GetTableStatus(DuckTableEntry &table);
 	//! Coalesces a commit/checkpoint wake-up into one background scheduler task.
 	void RequestAutoRecluster() noexcept;
+	//! Queues automatic work only for sorted tables modified by a committed transaction.
+	void RequestAutoRecluster(const vector<QualifiedName> &table_names) noexcept;
 	//! Stops accepting automatic work and drains any queued/running task before database close.
 	void StopAutoRecluster() noexcept;
 	//! Drains this manager's background work. Used by shutdown and deterministic tests.

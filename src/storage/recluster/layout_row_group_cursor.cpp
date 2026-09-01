@@ -39,24 +39,6 @@ row_t LayoutRowGroupEntry::GetRowEnd() const {
 	return row_start + NumericCast<row_t>(row_group->count.load());
 }
 
-static optional_idx FindContainingPatch(const RowGroupLayout &layout, row_t row_id) {
-	idx_t lower = 0;
-	idx_t upper = layout.patches.size();
-	while (lower < upper) {
-		auto index = lower + (upper - lower) / 2;
-		if (layout.patches[index]->range.start <= row_id) {
-			lower = index + 1;
-		} else {
-			upper = index;
-		}
-	}
-	if (lower == 0) {
-		return optional_idx();
-	}
-	auto candidate = lower - 1;
-	return layout.patches[candidate]->range.Contains(row_id) ? optional_idx(candidate) : optional_idx();
-}
-
 static bool LookupBaseTree(RowGroupSegmentTree &tree, row_t row_id, LayoutRowGroupEntry &result) {
 	if (row_id < 0) {
 		return false;
@@ -79,24 +61,20 @@ bool RowGroupCollectionSnapshot::Lookup(row_t row_id, LayoutRowGroupEntry &resul
 		return LookupBaseTree(*base_tree, row_id, result);
 	}
 
-	auto patch_index = FindContainingPatch(*layout, row_id);
+	auto patch_index = layout->FindPatch(row_id);
 	if (!patch_index.IsValid()) {
 		auto found = LookupBaseTree(*layout->base_tree, row_id, result);
 		result.layout_index = DConstants::INVALID_INDEX;
 		return found;
 	}
 
-	auto &patch = *layout->patches[patch_index.GetIndex()];
-	auto replacement_start = patch.range.start;
-	for (auto &row_group : patch.replacement_groups) {
-		auto replacement_end = replacement_start + NumericCast<row_t>(row_group->count.load());
-		if (row_id < replacement_end) {
-			result.row_group = row_group;
-			result.row_start = replacement_start;
-			result.layout_index = DConstants::INVALID_INDEX;
-			return true;
-		}
-		replacement_start = replacement_end;
+	auto replacement_index = layout->FindReplacementGroup(patch_index.GetIndex(), row_id);
+	if (replacement_index.IsValid()) {
+		auto &index = layout->patch_indexes[patch_index.GetIndex()];
+		result.row_group = layout->patches[patch_index.GetIndex()]->replacement_groups[replacement_index.GetIndex()];
+		result.row_start = index.replacement_starts[replacement_index.GetIndex()];
+		result.layout_index = DConstants::INVALID_INDEX;
+		return true;
 	}
 	return false;
 }
@@ -106,7 +84,9 @@ LayoutRowGroupCursor::LayoutRowGroupCursor(RowGroupCollectionSnapshot snapshot_p
 	if (scan_range && (scan_range->start < 0 || scan_range->start > scan_range->end)) {
 		throw InternalException("Layout row group cursor has an invalid scan range");
 	}
-	base_node = snapshot.GetBaseTree()->GetRootSegment();
+	if (!scan_range || scan_range->start != scan_range->end) {
+		Seek(scan_range ? scan_range->start : 0);
+	}
 }
 
 void LayoutRowGroupCursor::AdvanceBase() {
@@ -115,30 +95,53 @@ void LayoutRowGroupCursor::AdvanceBase() {
 	}
 }
 
-void LayoutRowGroupCursor::BeginPatch(const LayoutPatch &patch) {
-	if (!base_node || NumericCast<row_t>(base_node->GetRowStart()) != patch.range.start) {
+void LayoutRowGroupCursor::BeginPatch(idx_t index) {
+	auto &patch = *snapshot.layout->patches[index];
+	auto &navigation = snapshot.layout->patch_indexes[index];
+	if (!base_node || base_node->GetIndex() != navigation.base_start_index) {
 		throw InternalException("Layout patch range does not begin at a base row group boundary");
 	}
-
-	idx_t replaced_rows = 0;
-	row_t replaced_end = patch.range.start;
-	while (base_node && NumericCast<row_t>(base_node->GetRowStart()) < patch.range.end) {
-		auto base_start = NumericCast<row_t>(base_node->GetRowStart());
-		auto base_end = base_start + NumericCast<row_t>(base_node->GetNode().count.load());
-		if (base_start < replaced_end || base_end > patch.range.end) {
-			throw InternalException("Layout patch range is not aligned with its base row groups");
-		}
-		replaced_rows += base_node->GetNode().count.load();
-		replaced_end = base_end;
-		AdvanceBase();
-	}
-	if (replaced_end != patch.range.end || replaced_rows != patch.replaced_physical_rows) {
-		throw InternalException("Layout patch replaced row count does not match its base row groups");
-	}
-
+	base_node = snapshot.GetBaseTree()->GetSegmentByIndex(NumericCast<int64_t>(navigation.base_end_index));
 	replacement_index = 0;
 	replacement_row_start = patch.range.start;
 	emitting_patch = true;
+}
+
+void LayoutRowGroupCursor::Seek(row_t row_id) {
+	auto &tree = *snapshot.GetBaseTree();
+	if (snapshot.kind == RowGroupCollectionSnapshot::Kind::BASE_TREE) {
+		base_node = tree.GetSegmentAtOrAfter(NumericCast<idx_t>(row_id));
+		return;
+	}
+
+	auto containing_patch = snapshot.layout->FindPatch(row_id);
+	if (containing_patch.IsValid()) {
+		patch_index = containing_patch.GetIndex();
+		auto &navigation = snapshot.layout->patch_indexes[patch_index];
+		base_node = tree.GetSegmentByIndex(NumericCast<int64_t>(navigation.base_end_index));
+		auto replacement = snapshot.layout->FindReplacementGroup(patch_index, row_id);
+		if (replacement.IsValid()) {
+			replacement_index = replacement.GetIndex();
+			replacement_row_start = navigation.replacement_starts[replacement_index];
+			next_layout_index = navigation.layout_start_index + replacement_index;
+			emitting_patch = true;
+			return;
+		}
+		patch_index++;
+		next_layout_index = navigation.layout_start_index + navigation.replacement_starts.size();
+		return;
+	}
+
+	base_node = tree.GetSegmentAtOrAfter(NumericCast<idx_t>(row_id));
+	patch_index = snapshot.layout->FindNextPatch(row_id);
+	if (!base_node) {
+		return;
+	}
+	while (patch_index < snapshot.layout->patches.size() &&
+	       snapshot.layout->patches[patch_index]->range.end <= NumericCast<row_t>(base_node->GetRowStart())) {
+		patch_index++;
+	}
+	next_layout_index = snapshot.layout->GetBaseLayoutIndex(base_node->GetIndex(), patch_index);
 }
 
 bool LayoutRowGroupCursor::NextUnfiltered(LayoutRowGroupEntry &result) {
@@ -182,7 +185,7 @@ bool LayoutRowGroupCursor::NextUnfiltered(LayoutRowGroupEntry &result) {
 				AdvanceBase();
 				return true;
 			}
-			BeginPatch(patch);
+			BeginPatch(patch_index);
 			continue;
 		}
 

@@ -125,7 +125,8 @@ MakeReplacementPatch(row_t start, row_t end, uint64_t task_id,
 TEST_CASE("Table layout history selects layouts by transaction start time", "[storage][row_group_layout]") {
 	DuckDB db;
 	Connection con(db);
-	auto tree = GetLayoutTestTree(con, "layout_history_test");
+	auto collection = GetLayoutTestCollection(con, "layout_history_test");
+	auto tree = MakeLayoutTestTree(*collection, {10, 10});
 
 	auto initial = make_shared_ptr<RowGroupLayout>(INITIAL_LAYOUT_VERSION, 0, tree);
 	TableLayoutHistory history(initial);
@@ -356,7 +357,8 @@ TEST_CASE("Table layout history cleanup keeps layouts needed by active transacti
 TEST_CASE("Checkpoint tree installation preserves the current layout version", "[storage][row_group_layout]") {
 	DuckDB db;
 	Connection con(db);
-	auto tree = GetLayoutTestTree(con, "layout_checkpoint_source");
+	auto collection = GetLayoutTestCollection(con, "layout_checkpoint_source");
+	auto tree = MakeLayoutTestTree(*collection, {10});
 	auto checkpoint_tree = GetLayoutTestTree(con, "layout_checkpoint_target");
 
 	TableLayoutHistory history(make_shared_ptr<RowGroupLayout>(INITIAL_LAYOUT_VERSION, 0, tree));
@@ -493,12 +495,90 @@ TEST_CASE("Layout row group cursor rejects patches inside base row groups", "[st
 	auto collection = GetLayoutTestCollection(con, "layout_cursor_alignment_test");
 	auto tree = MakeLayoutTestTree(*collection, {10, 10});
 	auto replacement = make_shared_ptr<RowGroup>(*collection, 10);
+	REQUIRE_THROWS_AS(make_shared_ptr<RowGroupLayout>(1, 10, tree,
+	                                                  duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {
+	                                                      MakeReplacementPatch(5, 15, 1, {replacement})}),
+	                  InternalException);
+}
+
+TEST_CASE("Layout lookup and range cursors seek within large patches", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_large_patch_seek_test");
+	duckdb::vector<idx_t> base_counts(256, 1);
+	auto tree = MakeLayoutTestTree(*collection, base_counts);
+	duckdb::vector<duckdb::shared_ptr<RowGroup>> replacements;
+	for (idx_t index = 0; index < 200; index++) {
+		replacements.push_back(make_shared_ptr<RowGroup>(*collection, 1));
+	}
+	auto patch = MakeReplacementPatch(10, 210, 1, std::move(replacements));
+	auto layout = make_shared_ptr<RowGroupLayout>(
+	    1, 10, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(patch)});
+	RowGroupCollectionSnapshot snapshot(layout);
+
+	LayoutRowGroupEntry entry;
+	REQUIRE(snapshot.Lookup(209, entry));
+	REQUIRE(entry.row_start == 209);
+	REQUIRE(!snapshot.Lookup(256, entry));
+
+	LayoutRowGroupCursor cursor(snapshot, RowGroupRange {205, 211});
+	for (row_t expected = 205; expected < 211; expected++) {
+		REQUIRE(cursor.Next(entry));
+		REQUIRE(entry.row_start == expected);
+		REQUIRE(entry.layout_index == NumericCast<idx_t>(expected));
+	}
+	REQUIRE(!cursor.Next(entry));
+}
+
+TEST_CASE("Layout range cursors seek across base row ID gaps", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_gap_seek_test");
+	auto tree = make_shared_ptr<RowGroupSegmentTree>(*collection, 0);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 5), 0);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 5), 10);
+	tree->AppendSegment(make_shared_ptr<RowGroup>(*collection, 5), 20);
+	auto layout = make_shared_ptr<RowGroupLayout>(1, 10, tree);
+
+	LayoutRowGroupCursor cursor(RowGroupCollectionSnapshot(layout), RowGroupRange {6, 11});
+	LayoutRowGroupEntry entry;
+	REQUIRE(cursor.Next(entry));
+	REQUIRE(entry.row_start == 10);
+	REQUIRE(entry.layout_index == 1);
+	REQUIRE(!cursor.Next(entry));
+}
+
+TEST_CASE("Layout range cursors preserve indexes across multiple patches", "[storage][row_group_layout]") {
+	DuckDB db;
+	Connection con(db);
+	auto collection = GetLayoutTestCollection(con, "layout_multi_patch_seek_test");
+	auto tree = MakeLayoutTestTree(*collection, {10, 10, 10, 10, 10, 10});
+	auto first_patch = MakeReplacementPatch(
+	    10, 20, 1, {make_shared_ptr<RowGroup>(*collection, 5), make_shared_ptr<RowGroup>(*collection, 5)});
+	auto second_patch = MakeReplacementPatch(30, 50, 2, {make_shared_ptr<RowGroup>(*collection, 15)});
 	auto layout = make_shared_ptr<RowGroupLayout>(
 	    1, 10, tree,
-	    duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {MakeReplacementPatch(5, 15, 1, {replacement})});
-	LayoutRowGroupCursor cursor {RowGroupCollectionSnapshot(layout)};
+	    duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(first_patch), std::move(second_patch)});
+	auto snapshot = RowGroupCollectionSnapshot(layout);
+
 	LayoutRowGroupEntry entry;
-	REQUIRE_THROWS_AS(cursor.Next(entry), InternalException);
+	LayoutRowGroupCursor replacement_cursor(snapshot, RowGroupRange {40, 41});
+	REQUIRE(replacement_cursor.Next(entry));
+	REQUIRE(entry.row_start == 30);
+	REQUIRE(entry.layout_index == 4);
+	REQUIRE(!replacement_cursor.Next(entry));
+
+	LayoutRowGroupCursor replacement_gap_cursor(snapshot, RowGroupRange {47, 51});
+	REQUIRE(replacement_gap_cursor.Next(entry));
+	REQUIRE(entry.row_start == 50);
+	REQUIRE(entry.layout_index == 5);
+	REQUIRE(!replacement_gap_cursor.Next(entry));
+
+	LayoutRowGroupCursor trailing_base_cursor(snapshot, RowGroupRange {55, 56});
+	REQUIRE(trailing_base_cursor.Next(entry));
+	REQUIRE(entry.row_start == 50);
+	REQUIRE(entry.layout_index == 5);
+	REQUIRE(!trailing_base_cursor.Next(entry));
 }
 
 TEST_CASE("Layout row group cursor accepts row ID gaps between replaced groups", "[storage][row_group_layout]") {
@@ -1074,7 +1154,7 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Sorted table DDL waits for transaction write gates", "[storage][row_group_layout]") {
+TEST_CASE("Sorted table ALTER waits for transaction write gates", "[storage][row_group_layout]") {
 	auto path = TestCreatePath("sorted_write_gate.db");
 	DeleteDatabase(path);
 	DuckDB db;
@@ -1091,7 +1171,7 @@ TEST_CASE("Sorted table DDL waits for transaction write gates", "[storage][row_g
 	std::atomic<bool> ddl_started(false);
 	auto ddl_future = std::async(std::launch::async, [&]() {
 		ddl_started = true;
-		return ddl.Query("ALTER TABLE target RESET SORTED BY");
+		return ddl.Query("ALTER TABLE target ADD COLUMN payload BIGINT");
 	});
 	auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 	while (!ddl_started.load() && std::chrono::steady_clock::now() < start_deadline) {
@@ -1111,7 +1191,48 @@ TEST_CASE("Sorted table DDL waits for transaction write gates", "[storage][row_g
 	REQUIRE(finished_status == std::future_status::ready);
 	auto ddl_result = ddl_future.get();
 	REQUIRE_NO_FAIL(std::move(ddl_result));
+	REQUIRE_NO_FAIL(writer.Query("ALTER TABLE target RESET SORTED BY"));
 	REQUIRE_NO_FAIL(writer.Query("UPDATE target SET i = 2"));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Sorted table DROP waits for transaction write gates", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("sorted_drop_gate.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection writer(db);
+	Connection ddl(db);
+	REQUIRE_NO_FAIL(writer.Query("ATTACH '" + path + "' AS drop_gate (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(writer.Query("USE drop_gate"));
+	REQUIRE_NO_FAIL(ddl.Query("USE drop_gate"));
+	REQUIRE_NO_FAIL(writer.Query("CREATE TABLE target(i INTEGER) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(writer.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(writer.Query("INSERT INTO target VALUES (1)"));
+
+	std::atomic<bool> ddl_started(false);
+	auto ddl_future = std::async(std::launch::async, [&]() {
+		ddl_started = true;
+		return ddl.Query("DROP TABLE target");
+	});
+	auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ddl_started.load() && std::chrono::steady_clock::now() < start_deadline) {
+		std::this_thread::yield();
+	}
+	auto blocked_status = ddl_future.wait_for(std::chrono::milliseconds(100));
+	auto commit_result = writer.Query("COMMIT");
+	auto finished_status = ddl_future.wait_for(std::chrono::seconds(5));
+	if (finished_status != std::future_status::ready) {
+		ddl.Interrupt();
+		ddl_future.wait();
+	}
+
+	REQUIRE(ddl_started.load());
+	REQUIRE(blocked_status == std::future_status::timeout);
+	REQUIRE_NO_FAIL(std::move(commit_result));
+	REQUIRE(finished_status == std::future_status::ready);
+	auto ddl_result = ddl_future.get();
+	REQUIRE_NO_FAIL(std::move(ddl_result));
+	REQUIRE_FAIL(writer.Query("SELECT * FROM target"));
 	DeleteDatabase(path);
 }
 

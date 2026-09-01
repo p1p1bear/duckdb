@@ -21,6 +21,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_commit.hpp"
@@ -704,6 +705,36 @@ bool DuckTransaction::HoldsReclusterWriteLock(DataTableInfo &info) {
 		return false;
 	}
 	return entry->second->mode == HeldTableGateMode::SHARED || entry->second->mode == HeldTableGateMode::EXCLUSIVE;
+}
+
+vector<QualifiedName> DuckTransaction::GetModifiedReclusterTables(bool include_without_checkpoint) noexcept {
+	vector<QualifiedName> result;
+	try {
+		lock_guard<mutex> guard(recluster_transaction_lock);
+		for (auto &entry : table_write_locks) {
+			auto mode = entry.second->mode;
+			if ((mode != HeldTableGateMode::SHARED && mode != HeldTableGateMode::EXCLUSIVE) ||
+			    !entry.first.get().HasSortStorage()) {
+				continue;
+			}
+			auto &info = entry.first.get();
+			if (!include_without_checkpoint) {
+				auto state = info.GetReclusterState();
+				if (!state) {
+					continue;
+				}
+				if (!state->HasUsableCheckpoint()) {
+					continue;
+				}
+			}
+			auto schema_path = info.GetSchemaPath();
+			schema_path.insert(schema_path.begin(), info.GetDB().GetName());
+			result.emplace_back(std::move(schema_path), info.GetTableName());
+		}
+	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
+		result.clear();
+	}
+	return result;
 }
 
 void DuckTransaction::ReleaseReclusterWriteLocks() noexcept {

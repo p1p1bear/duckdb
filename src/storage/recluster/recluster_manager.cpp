@@ -110,7 +110,7 @@ optional<PendingCheckpointTableState> ReclusterManager::PrepareCheckpoint(DuckTa
 
 void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &&states) noexcept {
 	ClearAutoCheckpointRequest();
-	bool installed_snapshot = false;
+	vector<QualifiedName> installed_tables;
 	for (auto &pending : states) {
 		if (!pending.storage || !pending.storage->IsMainTable()) {
 			continue;
@@ -125,11 +125,19 @@ void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &
 		if (storage_generation_id != pending.candidate_snapshot.storage_generation_id) {
 			continue;
 		}
-		installed_snapshot |= pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
-		                                                                  std::move(pending.candidate_snapshot));
+		if (pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
+		                                                std::move(pending.candidate_snapshot))) {
+			try {
+				auto &table_info = *pending.storage->GetDataTableInfo();
+				auto schema_path = table_info.GetSchemaPath();
+				schema_path.insert(schema_path.begin(), db.GetName());
+				installed_tables.emplace_back(std::move(schema_path), table_info.GetTableName());
+			} catch (...) { // NOLINT: checkpoint publication cannot fail while queuing best-effort background work
+			}
+		}
 	}
-	if (installed_snapshot) {
-		RequestAutoRecluster();
+	if (!installed_tables.empty()) {
+		RequestAutoRecluster(installed_tables);
 	}
 }
 

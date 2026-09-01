@@ -41,6 +41,7 @@ public:
 	uint64_t GetCurrentStorageGenerationId() const;
 	bool TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
 	                                  CheckpointLayoutSnapshot snapshot) noexcept;
+	bool HasUsableCheckpoint() const;
 	optional<CheckpointLayoutSnapshot> GetLastCheckpoint() const;
 	void ClearLastCheckpoint();
 	bool TryRegisterTask(shared_ptr<RangeTask> task);

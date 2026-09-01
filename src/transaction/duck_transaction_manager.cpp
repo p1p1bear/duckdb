@@ -331,7 +331,13 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// check if we can checkpoint
 	unique_ptr<StorageLockKey> lock;
 	auto undo_properties = transaction.GetUndoProperties();
-	auto trigger_auto_recluster = transaction.ChangesMade();
+	auto trigger_auto_recluster =
+	    transaction.ChangesMade() && Settings::Get<AutoReclusterSetting>(db.GetDatabase());
+	bool include_recluster_tables_without_checkpoint = false;
+	if (trigger_auto_recluster) {
+		include_recluster_tables_without_checkpoint =
+		    Settings::Get<ReclusterTriggerCheckpointSetting>(db.GetDatabase());
+	}
 	auto checkpoint_decision =
 	    error.HasError() ? CheckpointDecision(error.Message()) : CanCheckpoint(transaction, lock, undo_properties);
 	unique_lock<mutex> held_wal_lock;
@@ -455,6 +461,11 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// potentially resulting in garbage collection
 	bool store_transaction = undo_properties.has_updates || undo_properties.has_index_deletes ||
 	                         undo_properties.has_catalog_changes || undo_properties.has_recluster || error.HasError();
+	vector<QualifiedName> modified_recluster_tables;
+	if (!error.HasError() && trigger_auto_recluster) {
+		modified_recluster_tables =
+		    transaction.GetModifiedReclusterTables(include_recluster_tables_without_checkpoint);
+	}
 	transaction.ReleaseReclusterWriteLocks();
 
 	// Remove the transaction from the list of active transactions and gather cleanup information.
@@ -501,7 +512,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	}
 	if (!error.HasError() && !checkpoint_failed && trigger_auto_recluster && db.HasReclusterManager() &&
 	    db.GetStorageManager().IsLoaded()) {
-		db.GetReclusterManager().RequestAutoRecluster();
+		db.GetReclusterManager().RequestAutoRecluster(modified_recluster_tables);
 	}
 
 	return error;

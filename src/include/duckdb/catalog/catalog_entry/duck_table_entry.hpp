@@ -17,6 +17,7 @@
 namespace duckdb {
 
 class CommitDropState;
+class DuckTransaction;
 
 struct AddConstraintInfo;
 struct CreateTriggerInfo;
@@ -64,6 +65,7 @@ public:
 
 	void CommitAlter(string &column_name, CommitDropState &drop_state);
 	void CommitDrop(CommitDropState &drop_state);
+	void HoldReclusterDDLWriteGate(DuckTransaction &transaction, const char *operation);
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 

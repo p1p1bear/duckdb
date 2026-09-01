@@ -68,6 +68,11 @@ bool TableReclusterState::TryInstallCheckpointSnapshot(sort_order_id_t sort_orde
 	return true;
 }
 
+bool TableReclusterState::HasUsableCheckpoint() const {
+	lock_guard<mutex> guard(task_lock);
+	return last_checkpoint && last_checkpoint->checkpoint_number > 0;
+}
+
 optional<CheckpointLayoutSnapshot> TableReclusterState::GetLastCheckpoint() const {
 	lock_guard<mutex> guard(task_lock);
 	return last_checkpoint;
