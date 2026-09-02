@@ -351,8 +351,8 @@ void DuckTransaction::PushRecluster(unique_ptr<ReclusterCommitInfo> info) {
 	}
 	auto &recluster_state = GetOrCreateReclusterState();
 	lock_guard<mutex> guard(recluster_state.lock);
-	if (!recluster_state.is_maintenance_transaction || recluster_state.has_recluster_undo || undo_buffer.ChangesMade() ||
-	    storage->ChangesMade()) {
+	if (!recluster_state.is_maintenance_transaction || recluster_state.has_recluster_undo ||
+	    undo_buffer.ChangesMade() || storage->ChangesMade()) {
 		throw InternalException("A recluster maintenance transaction must contain exactly one recluster change");
 	}
 	auto undo_entry = undo_buffer.CreateEntry(UndoFlags::RECLUSTER, sizeof(ReclusterUndoData));

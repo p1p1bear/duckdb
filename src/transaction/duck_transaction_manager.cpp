@@ -331,8 +331,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// check if we can checkpoint
 	unique_ptr<StorageLockKey> lock;
 	auto undo_properties = transaction.GetUndoProperties();
-	auto trigger_auto_recluster =
-	    transaction.ChangesMade() && Settings::Get<AutoReclusterSetting>(db.GetDatabase());
+	auto trigger_auto_recluster = transaction.ChangesMade() && Settings::Get<AutoReclusterSetting>(db.GetDatabase());
 	bool include_recluster_tables_without_checkpoint = false;
 	if (trigger_auto_recluster) {
 		include_recluster_tables_without_checkpoint =
@@ -463,8 +462,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	                         undo_properties.has_catalog_changes || undo_properties.has_recluster || error.HasError();
 	vector<QualifiedName> modified_recluster_tables;
 	if (!error.HasError() && trigger_auto_recluster) {
-		modified_recluster_tables =
-		    transaction.GetModifiedReclusterTables(include_recluster_tables_without_checkpoint);
+		modified_recluster_tables = transaction.GetModifiedReclusterTables(include_recluster_tables_without_checkpoint);
 	}
 	transaction.ReleaseReclusterWriteLocks();
 

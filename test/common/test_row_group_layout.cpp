@@ -285,8 +285,7 @@ TEST_CASE("Transaction-local deletes make append organization sticky unsorted", 
 		first_chunk.data[0].Append(Value::INTEGER(1));
 		first_chunk.data[0].Append(Value::INTEGER(2));
 		first_chunk.SetChildCardinality(2);
-		table.LocalAppend(entry, *con.context, first_chunk, bound_constraints, false,
-		                  AppendOrganization::Sorted(1, 1));
+		table.LocalAppend(entry, *con.context, first_chunk, bound_constraints, false, AppendOrganization::Sorted(1, 1));
 
 		auto &local_storage = LocalStorage::Get(*con.context, table.db);
 		auto local_table = local_storage.GetStorage(table);

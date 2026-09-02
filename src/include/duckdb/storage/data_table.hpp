@@ -137,8 +137,7 @@ public:
 	//! Append a chunk to the transaction-local storage of this table and update the delete indexes.
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, Vector &row_ids,
-	                 DataChunk &delete_chunk,
-	                 const AppendOrganization &organization = AppendOrganization::Unsorted());
+	                 DataChunk &delete_chunk, const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Appends to the transaction-local storage of this table
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool constraints_verified,
