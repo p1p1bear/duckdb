@@ -140,15 +140,15 @@ void ReclusterManager::SetAutoCheckpointIntervalForTesting(idx_t interval_ms) {
 }
 
 bool ReclusterManager::InitializeAutoScheduler() {
+	if (auto_scheduler_closing.load()) {
+		return false;
+	}
 	if (auto_scheduler_initialized.load()) {
 		return true;
 	}
 	lock_guard<mutex> guard(queue_lock);
 	if (auto_scheduler_initialized.load()) {
 		return true;
-	}
-	if (auto_scheduler_closing.load()) {
-		return false;
 	}
 	auto state = make_shared_ptr<ReclusterAutoSchedulerState>(*this);
 	auto producer = TaskScheduler::GetScheduler(db.GetDatabase()).CreateProducer();
@@ -374,6 +374,9 @@ void ReclusterManager::RequestAutoRecluster() noexcept {
 }
 
 void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_names) noexcept {
+	if (table_names.empty() && !auto_scheduler_initialized.load()) {
+		return;
+	}
 	if (!AutoReclusterEnabled()) {
 		return;
 	}

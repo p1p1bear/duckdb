@@ -220,16 +220,6 @@ static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange
 	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 }
 
-static idx_t EstimateReclusterOutputBytes(DataTable &storage, const vector<block_id_t> &block_ids) {
-	unordered_set<block_id_t> blocks;
-	for (auto block_id : block_ids) {
-		if (block_id >= 0) {
-			blocks.insert(block_id);
-		}
-	}
-	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
-}
-
 static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const ReclusterLayoutAnalysis &analysis) {
 	unordered_set<block_id_t> blocks;
 	idx_t transient_bytes = 0;
@@ -333,15 +323,15 @@ static bool CheckFinalizePhysicalColumns(const DataTable &storage, const Replace
 
 static bool CheckFinalizeManifest(const ReplacementManifest &manifest) {
 	try {
-		manifest.Validate();
+		manifest.VerifySeal();
 		return true;
 	} catch (SerializationException &) {
 		return false;
 	}
 }
 
-static bool CheckFinalizeCheckpoint(const TableReclusterState &state, const ReclusterCandidate &candidate) {
-	auto checkpoint = state.GetLastCheckpoint();
+static bool CheckFinalizeCheckpoint(const shared_ptr<const CheckpointLayoutSnapshot> &checkpoint,
+                                    const ReclusterCandidate &candidate) {
 	if (!checkpoint || checkpoint->storage_generation_id != candidate.storage_generation_id) {
 		return false;
 	}
@@ -360,29 +350,35 @@ static bool CheckFinalizeCheckpoint(const TableReclusterState &state, const Recl
 	return true;
 }
 
-static bool CheckFinalizeInputs(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
-                                const ReclusterCandidate &candidate) {
+enum class FinalizeInputCheck : uint8_t { VALID, LAYOUT_CHANGED, INVALID };
+
+static FinalizeInputCheck CheckFinalizeInputs(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
+                                              const ReclusterCandidate &candidate,
+                                              const shared_ptr<const RowGroupLayout> &expected_layout) {
 	auto snapshot = collection.GetCurrentSnapshot();
 	if (snapshot.kind != RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT) {
-		return false;
+		return FinalizeInputCheck::INVALID;
+	}
+	if (snapshot.layout.get() != expected_layout.get()) {
+		return FinalizeInputCheck::LAYOUT_CHANGED;
 	}
 	for (auto &patch : snapshot.layout->patches) {
 		if (patch->range.Overlaps(candidate.range)) {
-			return false;
+			return FinalizeInputCheck::INVALID;
 		}
 	}
 	for (auto &expected : candidate.expected_row_groups) {
 		LayoutRowGroupEntry current;
 		if (!snapshot.Lookup(expected.start, current) || current.row_start != expected.start ||
 		    current.GetRowEnd() != expected.start + NumericCast<row_t>(expected.count)) {
-			return false;
+			return FinalizeInputCheck::INVALID;
 		}
 		auto identity = ComputeRowGroupPhysicalIdentityV1(*current.row_group, current.row_start, columns);
 		if (!identity || !(*identity == expected)) {
-			return false;
+			return FinalizeInputCheck::INVALID;
 		}
 	}
-	return true;
+	return FinalizeInputCheck::VALID;
 }
 
 static vector<row_t> BuildFinalDeleteRowIds(RangeTask &task, const ReclusterDeleteJournalScan &scan) {
@@ -466,16 +462,36 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		unique_ptr<StorageLockKey> table_write_gate;
 		unique_ptr<StorageLockKey> layout_lock;
 		shared_ptr<const RowGroupLayout> current_layout;
-		shared_ptr<RowGroupLayout> pending_layout;
-		optional<PreparedReclusterCommitResources> prepared_resources;
+		shared_ptr<const CheckpointLayoutSnapshot> current_checkpoint;
+		unique_ptr<ReclusterCommitInfo> commit_info;
 		while (true) {
 			if (task->IsCancelRequested() || task->IsPublishForbidden()) {
 				return CancelFinalizeTask(*state, task);
 			}
+			auto preparation_layout_lock = GetSharedLayoutPublishLock();
 			current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
 			if (!current_layout || current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
 			    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
 			        current_layout->layout_version) {
+				return FailFinalizeTask(*state, task);
+			}
+			current_checkpoint = state->GetLastCheckpoint();
+			auto input_check =
+			    CheckFinalizeInputs(*storage->GetRowGroupCollection(), storage->Columns(), candidate, current_layout);
+			if (input_check == FinalizeInputCheck::LAYOUT_CHANGED) {
+				current_layout.reset();
+				current_checkpoint.reset();
+				continue;
+			}
+			if (manifest.header.task_id != task->GetTaskId() || manifest.header.table_id != task_context.GetTableId() ||
+			    manifest.header.prepared_layout_version != candidate.layout_version ||
+			    manifest.header.sort_order_id != candidate.sort_order_id ||
+			    manifest.header.input_range.start != task->GetRange().start ||
+			    manifest.header.input_range.end != task->GetRange().end ||
+			    manifest.old_groups != candidate.expected_row_groups ||
+			    manifest.sort_columns != task_context.GetSortDefinition().columns ||
+			    !CheckFinalizePhysicalColumns(*storage, manifest) || !CheckFinalizeManifest(manifest) ||
+			    !CheckFinalizeCheckpoint(current_checkpoint, candidate) || input_check != FinalizeInputCheck::VALID) {
 				return FailFinalizeTask(*state, task);
 			}
 
@@ -487,17 +503,33 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			patch->replaced_physical_rows = candidate.input_physical_rows;
 			patch->replacement_physical_rows = output.GetRowCount();
 			patch->replacement_groups = output.GetRowGroups();
-			pending_layout =
+			auto pending_layout =
 			    storage->GetRowGroupCollection()->BuildPendingPatchedLayout(current_layout, std::move(patch));
 			auto resources = ReclusterCommitInfo::Prepare(task, storage, current_layout);
+			auto prepared_wal_checkpoint_iteration = resources.wal_checkpoint_iteration;
+			preparation_layout_lock.reset();
+			auto &journal_limits = task->GetDeleteJournalLimits();
+			auto final_scan = task->ScanResolvedDeletes(manifest.header.last_applied_delete_sequence,
+			                                            journal_limits.max_slots, journal_limits.max_rowids);
+			if (final_scan.blocked_by_reserved || final_scan.limit_exceeded ||
+			    final_scan.resolved_through != task->GetLatestDeleteSequence()) {
+				if (!task->TryAdvance(RangeTaskState::FINALIZING, RangeTaskState::PREPARED)) {
+					return CancelFinalizeTask(*state, task);
+				}
+				return ReclusterTaskFinalizeStatus::RETRY;
+			}
+			auto final_deleted_new_rowids = BuildFinalDeleteRowIds(*task, final_scan);
+			auto prepared_commit = make_uniq<ReclusterCommitInfo>(
+			    task, state, storage, current_layout, std::move(pending_layout), std::move(final_deleted_new_rowids),
+			    final_scan.resolved_through, std::move(resources));
 
 			table_write_gate = storage->GetDataTableInfo()->GetExclusiveReclusterWriteLock();
 			layout_lock = TryGetSharedLayoutPublishLock();
 			if (!layout_lock) {
 				table_write_gate.reset();
-				pending_layout.reset();
+				prepared_commit.reset();
 				current_layout.reset();
-				resources = PreparedReclusterCommitResources();
+				current_checkpoint.reset();
 				auto wait_for_checkpoint = GetSharedLayoutPublishLock();
 				wait_for_checkpoint.reset();
 				continue;
@@ -506,17 +538,19 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			if (db.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && db.GetStorageManager().HasWAL()) {
 				auto checkpoint_iteration =
 				    db.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
-				wal_generation_matches = checkpoint_iteration == resources.wal_checkpoint_iteration;
+				wal_generation_matches = checkpoint_iteration == prepared_wal_checkpoint_iteration;
 			}
 			if (storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
-			    !wal_generation_matches) {
+			    state->GetLastCheckpoint().get() != current_checkpoint.get() ||
+			    task->GetLatestDeleteSequence() != final_scan.resolved_through || !wal_generation_matches) {
 				layout_lock.reset();
 				table_write_gate.reset();
-				pending_layout.reset();
+				prepared_commit.reset();
 				current_layout.reset();
+				current_checkpoint.reset();
 				continue;
 			}
-			prepared_resources = std::move(resources);
+			commit_info = std::move(prepared_commit);
 			break;
 		}
 
@@ -531,39 +565,14 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		    state->GetCurrentSortOrderId() != candidate.sort_order_id ||
 		    state->GetCurrentStorageGenerationId() != candidate.storage_generation_id ||
 		    storage->GetRowGroupCollection()->GetStorageGenerationId() != candidate.storage_generation_id ||
-		    !current_layout || !prepared_resources ||
+		    !current_layout || !commit_info ||
 		    storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
+		    state->GetLastCheckpoint().get() != current_checkpoint.get() ||
 		    current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
 		    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
-		        current_layout->layout_version ||
-		    manifest.header.task_id != task->GetTaskId() || manifest.header.table_id != task_context.GetTableId() ||
-		    manifest.header.prepared_layout_version != candidate.layout_version ||
-		    manifest.header.sort_order_id != candidate.sort_order_id ||
-		    manifest.header.input_range.start != task->GetRange().start ||
-		    manifest.header.input_range.end != task->GetRange().end ||
-		    manifest.old_groups != candidate.expected_row_groups ||
-		    manifest.sort_columns != task_context.GetSortDefinition().columns ||
-		    !CheckFinalizePhysicalColumns(*storage, manifest) || !CheckFinalizeManifest(manifest) ||
-		    !CheckFinalizeCheckpoint(*state, candidate) ||
-		    !CheckFinalizeInputs(*storage->GetRowGroupCollection(), storage->Columns(), candidate)) {
+		        current_layout->layout_version) {
 			return FailFinalizeTask(*state, task);
 		}
-
-		auto &journal_limits = task->GetDeleteJournalLimits();
-		auto final_scan = task->ScanResolvedDeletes(manifest.header.last_applied_delete_sequence,
-		                                            journal_limits.max_slots, journal_limits.max_rowids);
-		if (final_scan.blocked_by_reserved || final_scan.limit_exceeded ||
-		    final_scan.resolved_through != task->GetLatestDeleteSequence()) {
-			if (!task->TryAdvance(RangeTaskState::FINALIZING, RangeTaskState::PREPARED)) {
-				return CancelFinalizeTask(*state, task);
-			}
-			return ReclusterTaskFinalizeStatus::RETRY;
-		}
-		auto final_deleted_new_rowids = BuildFinalDeleteRowIds(*task, final_scan);
-
-		auto commit_info = make_uniq<ReclusterCommitInfo>(
-		    task, state, storage, current_layout, std::move(pending_layout), std::move(final_deleted_new_rowids),
-		    final_scan.resolved_through, std::move(*prepared_resources));
 
 		if (!task->TryEnterCommitting()) {
 			return CancelFinalizeTask(*state, task);
@@ -803,8 +812,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				ReclusterDeleteCatchup catchup(*start.task);
 				catchup.Run();
 			}
-			auto task_output_bytes =
-			    EstimateReclusterOutputBytes(*storage, start.task->GetTaskContext().GetOutput().GetBlockIds());
+			auto task_output_bytes = start.task->GetTaskContext().GetOutput().GetByteSize();
 
 			auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 			while (true) {

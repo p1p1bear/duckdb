@@ -22,6 +22,11 @@
 
 namespace duckdb {
 
+struct PreparedReclusterWAL {
+	WALReclusterEntry header;
+	vector<WALReclusterDeleteEntry> deletes;
+};
+
 PreparedReclusterCommitResources ReclusterCommitInfo::Prepare(const shared_ptr<RangeTask> &task,
                                                               const shared_ptr<DataTable> &storage,
                                                               const shared_ptr<const RowGroupLayout> &old_layout) {
@@ -33,7 +38,6 @@ PreparedReclusterCommitResources ReclusterCommitInfo::Prepare(const shared_ptr<R
 	result.retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
 	    storage->GetRowGroupCollection(), old_layout, task->GetRange());
 	auto &output = task->GetTaskContext().GetOutput();
-	output.GetManifest().VerifySeal();
 	auto &attached = storage->GetAttached();
 	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL()) {
 		result.wal_retention = attached.GetReclusterManager().GetWALBlockRetention().Reserve(
@@ -52,33 +56,64 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_pt
                                          PreparedReclusterCommitResources resources)
     : task(std::move(task_p)), table_state(std::move(table_state_p)), storage(std::move(storage_p)),
       old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
-      final_deleted_new_rowids(std::move(final_deleted_new_rowids_p)),
-      journal_resolved_through(journal_resolved_through_p), retirement(std::move(resources.retirement)),
-      wal_retention(std::move(resources.wal_retention)), wal_checkpoint_iteration(resources.wal_checkpoint_iteration) {
+      retirement(std::move(resources.retirement)), wal_retention(std::move(resources.wal_retention)),
+      wal_checkpoint_iteration(resources.wal_checkpoint_iteration) {
 	if (!task || !table_state || !storage || !old_layout || !pending_layout || !task->HasTaskContext() ||
 	    !task->GetTaskContext().HasOutput() || task->GetTaskContext().GetStorage().get() != storage.get() ||
 	    !retirement.IsActive() || pending_layout->visible_from != 0 ||
 	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
 	    pending_layout->layout_version != old_layout->layout_version + 1 ||
 	    pending_layout->base_tree.get() != old_layout->base_tree.get() ||
-	    journal_resolved_through <
+	    journal_resolved_through_p <
 	        task->GetTaskContext().GetOutput().GetManifest().header.last_applied_delete_sequence) {
 		throw InternalException("Invalid recluster commit state");
 	}
-	for (idx_t row_index = 0; row_index < final_deleted_new_rowids.size(); row_index++) {
-		auto row_id = final_deleted_new_rowids[row_index];
+	for (idx_t row_index = 0; row_index < final_deleted_new_rowids_p.size(); row_index++) {
+		auto row_id = final_deleted_new_rowids_p[row_index];
 		if (!task->GetRange().Contains(row_id) ||
-		    (row_index > 0 && final_deleted_new_rowids[row_index - 1] >= row_id)) {
+		    (row_index > 0 && final_deleted_new_rowids_p[row_index - 1] >= row_id)) {
 			throw InternalException("Invalid final recluster DELETE row IDs");
 		}
 	}
 	auto &output = task->GetTaskContext().GetOutput();
-	output.GetManifest().VerifySeal();
 	auto &attached = storage->GetAttached();
 	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL() &&
 	    (!wal_retention.IsActive() || wal_checkpoint_iteration == 0)) {
 		throw InternalException("Invalid recluster WAL retention preparation");
 	}
+	if (wal_retention.IsActive()) {
+		prepared_wal = make_uniq<PreparedReclusterWAL>();
+		auto &manifest = output.GetManifest();
+		auto delete_chunk_count = final_deleted_new_rowids_p.size() / STANDARD_VECTOR_SIZE +
+		                          (final_deleted_new_rowids_p.size() % STANDARD_VECTOR_SIZE != 0);
+		prepared_wal->header.table_id = manifest.header.table_id;
+		prepared_wal->header.task_id = manifest.header.task_id;
+		prepared_wal->header.expected_layout_version = old_layout->layout_version;
+		prepared_wal->header.target_layout_version = pending_layout->layout_version;
+		prepared_wal->header.range_start = manifest.header.input_range.start;
+		prepared_wal->header.range_end = manifest.header.input_range.end;
+		prepared_wal->header.manifest_pointer = output.GetManifestPointer();
+		prepared_wal->header.manifest_size = manifest.payload_size;
+		prepared_wal->header.manifest_checksum = manifest.checksum;
+		prepared_wal->header.journal_resolved_through = journal_resolved_through_p;
+		prepared_wal->header.final_delete_row_count = final_deleted_new_rowids_p.size();
+		prepared_wal->header.delete_chunk_count = NumericCast<uint32_t>(delete_chunk_count);
+		prepared_wal->deletes.reserve(delete_chunk_count);
+		for (idx_t chunk_index = 0; chunk_index < delete_chunk_count; chunk_index++) {
+			auto begin = chunk_index * STANDARD_VECTOR_SIZE;
+			auto end = MinValue<idx_t>(begin + STANDARD_VECTOR_SIZE, final_deleted_new_rowids_p.size());
+			WALReclusterDeleteEntry entry;
+			entry.table_id = manifest.header.table_id;
+			entry.task_id = manifest.header.task_id;
+			entry.chunk_index = NumericCast<uint32_t>(chunk_index);
+			entry.new_rowids.assign(final_deleted_new_rowids_p.begin() + NumericCast<int64_t>(begin),
+			                        final_deleted_new_rowids_p.begin() + NumericCast<int64_t>(end));
+			entry.Validate();
+			prepared_wal->deletes.push_back(std::move(entry));
+		}
+		prepared_wal->header.Validate();
+	}
+	output.ApplyFinalDeletes(final_deleted_new_rowids_p);
 }
 
 ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
@@ -137,42 +172,15 @@ void ReclusterCommitInfo::ReleaseRecoveredBlocksNoThrow() noexcept {
 	}
 }
 
-void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) const {
-	if (is_recovery || state != ReclusterCommitLifecycle::PREPARED || !wal_retention.IsActive()) {
+void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) {
+	if (is_recovery || state != ReclusterCommitLifecycle::PREPARED || !wal_retention.IsActive() || !prepared_wal) {
 		throw InternalException("Cannot write an applied recluster commit to the WAL");
 	}
-	auto &manifest = task->GetTaskContext().GetOutput().GetManifest();
-	manifest.VerifySeal();
-	auto delete_chunk_count = final_deleted_new_rowids.empty()
-	                              ? 0
-	                              : NumericCast<uint32_t>((final_deleted_new_rowids.size() + STANDARD_VECTOR_SIZE - 1) /
-	                                                      STANDARD_VECTOR_SIZE);
-	WALReclusterEntry header;
-	header.table_id = manifest.header.table_id;
-	header.task_id = manifest.header.task_id;
-	header.expected_layout_version = old_layout->layout_version;
-	header.target_layout_version = pending_layout->layout_version;
-	header.range_start = manifest.header.input_range.start;
-	header.range_end = manifest.header.input_range.end;
-	header.manifest_pointer = task->GetTaskContext().GetOutput().GetManifestPointer();
-	header.manifest_size = manifest.payload_size;
-	header.manifest_checksum = manifest.checksum;
-	header.journal_resolved_through = journal_resolved_through;
-	header.final_delete_row_count = final_deleted_new_rowids.size();
-	header.delete_chunk_count = delete_chunk_count;
-	wal.WriteRecluster(header);
-
-	for (uint32_t chunk_index = 0; chunk_index < delete_chunk_count; chunk_index++) {
-		auto begin = NumericCast<idx_t>(chunk_index) * STANDARD_VECTOR_SIZE;
-		auto end = MinValue<idx_t>(begin + STANDARD_VECTOR_SIZE, final_deleted_new_rowids.size());
-		WALReclusterDeleteEntry delete_entry;
-		delete_entry.table_id = header.table_id;
-		delete_entry.task_id = header.task_id;
-		delete_entry.chunk_index = chunk_index;
-		delete_entry.new_rowids.assign(final_deleted_new_rowids.begin() + NumericCast<int64_t>(begin),
-		                               final_deleted_new_rowids.begin() + NumericCast<int64_t>(end));
-		wal.WriteReclusterDelete(delete_entry);
+	wal.WriteRecluster(prepared_wal->header);
+	for (auto &entry : prepared_wal->deletes) {
+		wal.WriteReclusterDelete(entry);
 	}
+	prepared_wal.reset();
 }
 
 void ReclusterCommitInfo::CommitRuntimeWALRetention() noexcept {
@@ -191,10 +199,6 @@ void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_
 	}
 
 	try {
-		if (!is_recovery) {
-			auto &output = task->GetTaskContext().GetOutput();
-			output.ApplyFinalDeletes(final_deleted_new_rowids);
-		}
 		pending_layout->visible_from = commit_id;
 		published_layout = pending_layout;
 		storage->GetRowGroupCollection()->PublishLayout(published_layout);

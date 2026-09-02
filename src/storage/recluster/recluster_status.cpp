@@ -13,6 +13,7 @@
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -36,24 +37,6 @@ static idx_t EstimateLiveBytes(idx_t bytes, idx_t physical_rows, idx_t live_rows
 	auto scaled = static_cast<idx_t>((static_cast<long double>(bytes) * static_cast<long double>(live_rows)) /
 	                                 static_cast<long double>(physical_rows));
 	return MaxValue<idx_t>(scaled, 1);
-}
-
-static optional_idx FindSortColumnIndex(const vector<ColumnDefinition> &columns, persistent_column_id_t column_id) {
-	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
-		if (columns[column_index].PersistentColumnId() == column_id) {
-			return column_index;
-		}
-	}
-	return optional_idx();
-}
-
-static string FormatSortColumn(const ColumnList &columns, const SortColumnDefinition &sort_column) {
-	for (auto &column : columns.Physical()) {
-		if (column.PersistentColumnId() == sort_column.column_id) {
-			return SQLIdentifier::ToString(column.Name().GetIdentifierName()) + " ASC NULLS LAST";
-		}
-	}
-	throw InternalException("SORTED BY status references a missing persistent column ID");
 }
 
 struct ReclusterRunStatus {
@@ -209,13 +192,12 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	if (!current_definition || current_definition->columns.empty()) {
 		throw InternalException("Enabled SORTED BY status has no current definition");
 	}
-	for (auto &sort_column : current_definition->columns) {
-		result.sort_columns.push_back(FormatSortColumn(table.GetColumns(), sort_column));
+	auto physical_sort_indexes = BindPersistentSortIndexes(storage.Columns(), *current_definition);
+	for (auto physical_index : physical_sort_indexes) {
+		auto &column = table.GetColumns().GetColumn(PhysicalIndex(physical_index));
+		result.sort_columns.push_back(SQLIdentifier::ToString(column.Name().GetIdentifierName()) + " ASC NULLS LAST");
 	}
-	auto first_sort_index = FindSortColumnIndex(storage.Columns(), current_definition->columns[0].column_id);
-	if (!first_sort_index.IsValid()) {
-		throw InternalException("SORTED BY status could not bind its first sort column");
-	}
+	auto first_sort_index = optional_idx(physical_sort_indexes[0]);
 
 	if (!state_matches_catalog) {
 		scheduling = TableReclusterSchedulingSnapshot();

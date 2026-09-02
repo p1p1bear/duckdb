@@ -699,9 +699,11 @@ static optional<ReclusterCandidate> SelectRunMerge(const CheckpointLayoutSnapsho
 			}
 			auto candidate = BuildCandidate(ReclusterCandidateType::RUN_MERGE, checkpoint, units, unit_begin,
 			                                unit_end + 1, layout_version, sort_order_id);
-			bool overlap_known;
-			idx_t overlapping_pairs;
-			ComputeMergeOverlap(units, unit_begin, unit_end + 1, overlap_known, overlapping_pairs);
+			bool overlap_known = false;
+			idx_t overlapping_pairs = 0;
+			if (limits.prioritize_overlap) {
+				ComputeMergeOverlap(units, unit_begin, unit_end + 1, overlap_known, overlapping_pairs);
+			}
 			if (!best || PreferMergeCandidate(candidate, overlap_known, overlapping_pairs, *best, best_overlap_known,
 			                                  best_overlapping_pairs, limits.prioritize_overlap)) {
 				best = std::move(candidate);
@@ -735,7 +737,9 @@ ReclusterCandidateSelection ReclusterLayoutAnalysis::SelectCandidate(const Reclu
 			}
 		}
 		if (!candidate) {
-			BuildUnitKeyRanges(*analysis);
+			if (limits.prioritize_overlap) {
+				BuildUnitKeyRanges(*analysis);
+			}
 			candidate = SelectRunMerge(*analysis->checkpoint, analysis->units, limits, analysis->layout_version,
 			                           analysis->sort_order_id, run_exceeds_limit);
 		}

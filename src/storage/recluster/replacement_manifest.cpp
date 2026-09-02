@@ -247,7 +247,7 @@ void ReplacementManifest::Seal() {
 	checksum = Checksum(payload.data(), payload.size());
 }
 
-void ReplacementManifest::VerifySeal() const {
+vector<uint8_t> ReplacementManifest::SerializeVerifiedPayload() const {
 	Validate();
 	auto payload = SerializePayload();
 	if (payload.size() != payload_size || payload.size() > REPLACEMENT_MANIFEST_MAX_PAYLOAD_SIZE ||
@@ -255,11 +255,15 @@ void ReplacementManifest::VerifySeal() const {
 		throw SerializationException("Replacement manifest seal changed: expected size %llu, current size %llu",
 		                             payload_size, payload.size());
 	}
+	return payload;
+}
+
+void ReplacementManifest::VerifySeal() const {
+	(void)SerializeVerifiedPayload();
 }
 
 void ReplacementManifest::Write(WriteStream &stream) const {
-	VerifySeal();
-	auto payload = SerializePayload();
+	auto payload = SerializeVerifiedPayload();
 	stream.WriteData(const_data_ptr_cast(REPLACEMENT_MANIFEST_MAGIC), sizeof(REPLACEMENT_MANIFEST_MAGIC));
 	stream.Write<uint32_t>(header.format_version);
 	stream.Write<uint64_t>(payload_size);

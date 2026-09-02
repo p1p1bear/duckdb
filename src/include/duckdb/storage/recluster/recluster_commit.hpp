@@ -21,6 +21,7 @@ class RangeTask;
 class RowGroupLayout;
 class TableReclusterState;
 class WriteAheadLog;
+struct PreparedReclusterWAL;
 
 struct PreparedReclusterCommitResources {
 	PreparedReclusterRetirement retirement;
@@ -42,7 +43,7 @@ public:
 	                    vector<block_id_t> recovered_blocks, RowGroupRange retired_range);
 	~ReclusterCommitInfo();
 
-	void WriteToWAL(WriteAheadLog &wal) const;
+	void WriteToWAL(WriteAheadLog &wal);
 	void Commit(transaction_t commit_id, CommitDropState &drop_state);
 	void RevertCommit();
 	void FinalizeCommit();
@@ -64,8 +65,7 @@ private:
 	shared_ptr<const RowGroupLayout> old_layout;
 	shared_ptr<RowGroupLayout> pending_layout;
 	shared_ptr<const RowGroupLayout> published_layout;
-	vector<row_t> final_deleted_new_rowids;
-	delete_sequence_t journal_resolved_through;
+	unique_ptr<PreparedReclusterWAL> prepared_wal;
 	sort_run_id_t recovered_run_id = INVALID_SORT_RUN_ID;
 	vector<block_id_t> recovered_blocks;
 	idx_t recovered_owned_block_count = 0;

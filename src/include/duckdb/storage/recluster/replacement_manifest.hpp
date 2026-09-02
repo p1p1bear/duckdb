@@ -61,6 +61,7 @@ struct ReplacementManifest {
 
 private:
 	vector<uint8_t> SerializePayload() const;
+	vector<uint8_t> SerializeVerifiedPayload() const;
 	static ReplacementManifest DeserializePayload(data_ptr_t payload, idx_t payload_size);
 };
 
