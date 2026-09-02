@@ -443,7 +443,7 @@ TEST_CASE("Automatic checkpoint requests coalesce across sorted tables", "[stora
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Automatic checkpoint requests are rate limited", "[storage][recluster_auto]") {
+TEST_CASE("Rate-limited automatic checkpoints retry without an external wake-up", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_checkpoint_rate_limit.db");
 	DeleteDatabase(path);
 	DuckDB db;
@@ -462,14 +462,15 @@ TEST_CASE("Automatic checkpoint requests are rate limited", "[storage][recluster
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
 	auto &manager = GetReclusterManager(con, "tbl");
+	manager.SetAutoCheckpointIntervalForTesting(10);
 	manager.RequestAutoRecluster();
 	manager.WaitForAutoRecluster();
-	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number + 1);
-	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes > 0 "
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") > checkpoint_number + 1);
+	auto remaining = con.Query("SELECT tasks_completed, state, remaining_recluster_bytes "
 	                           "FROM recluster('checkpoint_rate.main.tbl')");
 	REQUIRE(CHECK_COLUMN(remaining, 0, {0}));
-	REQUIRE(CHECK_COLUMN(remaining, 1, {"NO_ELIGIBLE_RANGE"}));
-	REQUIRE(CHECK_COLUMN(remaining, 2, {true}));
+	REQUIRE(CHECK_COLUMN(remaining, 1, {"COMPLETE"}));
+	REQUIRE(CHECK_COLUMN(remaining, 2, {0}));
 	DeleteDatabase(path);
 }
 

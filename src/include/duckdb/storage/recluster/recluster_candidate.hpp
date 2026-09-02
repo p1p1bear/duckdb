@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/row_group_layout.hpp"
 
@@ -16,7 +17,9 @@ namespace duckdb {
 
 class DataTable;
 class RowGroupCollection;
+class RowGroup;
 class TableReclusterState;
+class Value;
 struct TableReclusterSchedulingSnapshot;
 
 static constexpr idx_t DEFAULT_RECLUSTER_MAX_MERGE_RUNS = 4;
@@ -36,6 +39,7 @@ struct ReclusterCandidateLimits {
 	idx_t max_row_groups = 0;
 	idx_t max_merge_runs = 0;
 	double delete_cleanup_ratio = 0;
+	bool prioritize_overlap = true;
 };
 
 idx_t GetReclusterRowGroupLimit(DataTable &storage);
@@ -76,9 +80,10 @@ class ReclusterLayoutAnalysisState;
 class ReclusterLayoutAnalysis {
 public:
 	ReclusterLayoutAnalysis(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
-	                        TableReclusterState &state);
+	                        TableReclusterState &state, optional_idx first_sort_column = optional_idx());
 	ReclusterLayoutAnalysis(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
-	                        TableReclusterSchedulingSnapshot scheduling);
+	                        TableReclusterSchedulingSnapshot scheduling,
+	                        optional_idx first_sort_column = optional_idx());
 	~ReclusterLayoutAnalysis();
 
 	ReclusterCandidateSelection SelectCandidate(const ReclusterCandidateLimits &limits);
@@ -98,5 +103,6 @@ optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &co
                                                           const vector<ColumnDefinition> &columns,
                                                           TableReclusterState &state,
                                                           const ReclusterCandidate &candidate);
+bool GetReclusterRowGroupStatisticsRange(RowGroup &row_group, idx_t column_index, Value &minimum, Value &maximum);
 
 } // namespace duckdb

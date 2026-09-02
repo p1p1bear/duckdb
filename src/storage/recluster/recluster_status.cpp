@@ -13,9 +13,6 @@
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -59,31 +56,6 @@ static string FormatSortColumn(const ColumnList &columns, const SortColumnDefini
 	throw InternalException("SORTED BY status references a missing persistent column ID");
 }
 
-static bool GetStatisticsRange(RowGroup &row_group, idx_t column_index, Value &minimum, Value &maximum) {
-	auto statistics = row_group.GetStatistics(column_index);
-	if (!statistics) {
-		return false;
-	}
-	switch (statistics->GetStatsType()) {
-	case StatisticsType::NUMERIC_STATS:
-		if (!NumericStats::HasMinMax(*statistics)) {
-			return false;
-		}
-		minimum = NumericStats::Min(*statistics);
-		maximum = NumericStats::Max(*statistics);
-		return true;
-	case StatisticsType::STRING_STATS:
-		if (!StringStats::HasMinMax(*statistics)) {
-			return false;
-		}
-		minimum = Value::BLOB_RAW(StringStats::Min(*statistics));
-		maximum = Value::BLOB_RAW(StringStats::Max(*statistics));
-		return true;
-	default:
-		return false;
-	}
-}
-
 struct ReclusterRunStatus {
 	sort_run_id_t run_id = INVALID_SORT_RUN_ID;
 	idx_t live_bytes = 0;
@@ -99,7 +71,7 @@ static void AddRunStatistics(ReclusterRunStatus &run, RowGroup &row_group, idx_t
 	}
 	Value minimum;
 	Value maximum;
-	if (!GetStatisticsRange(row_group, column_index, minimum, maximum)) {
+	if (!GetReclusterRowGroupStatisticsRange(row_group, column_index, minimum, maximum)) {
 		run.statistics_known = false;
 		return;
 	}
@@ -251,7 +223,7 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		scheduling.sort_order_id = metadata.current_sort_order_id;
 		scheduling.storage_generation_id = storage_generation_id;
 	}
-	ReclusterLayoutAnalysis analysis(*row_groups, storage.Columns(), std::move(scheduling));
+	ReclusterLayoutAnalysis analysis(*row_groups, storage.Columns(), std::move(scheduling), first_sort_index);
 	if (state_matches_catalog) {
 		result.last_error = shared_state->GetLastError();
 	}

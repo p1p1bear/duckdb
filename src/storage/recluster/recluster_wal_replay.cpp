@@ -42,6 +42,7 @@ struct PendingReclusterWALTransaction {
 	vector<idx_t> reservation_indexes;
 	ReclusterWALTransactionError error = ReclusterWALTransactionError::NONE;
 	bool has_other_write = false;
+	bool catalog_changed = false;
 
 	bool HasReclusterEntries() const {
 		return header.has_value() || !deletes.empty() || error != ReclusterWALTransactionError::NONE;
@@ -53,8 +54,36 @@ struct PendingReclusterWALTransaction {
 		reservation_indexes.clear();
 		error = ReclusterWALTransactionError::NONE;
 		has_other_write = false;
+		catalog_changed = false;
 	}
 };
+
+static bool WALTypeChangesCatalog(WALType type) {
+	switch (type) {
+	case WALType::CREATE_TABLE:
+	case WALType::DROP_TABLE:
+	case WALType::CREATE_SCHEMA:
+	case WALType::DROP_SCHEMA:
+	case WALType::CREATE_VIEW:
+	case WALType::DROP_VIEW:
+	case WALType::CREATE_SEQUENCE:
+	case WALType::DROP_SEQUENCE:
+	case WALType::CREATE_MACRO:
+	case WALType::DROP_MACRO:
+	case WALType::CREATE_TYPE:
+	case WALType::DROP_TYPE:
+	case WALType::ALTER_INFO:
+	case WALType::CREATE_TABLE_MACRO:
+	case WALType::DROP_TABLE_MACRO:
+	case WALType::CREATE_INDEX:
+	case WALType::DROP_INDEX:
+	case WALType::CREATE_TRIGGER:
+	case WALType::DROP_TRIGGER:
+		return true;
+	default:
+		return false;
+	}
+}
 
 struct ReclusterWALReplayRecord {
 	WALReclusterEntry header;
@@ -608,6 +637,7 @@ public:
 	idx_t next_record = 0;
 	optional_idx wal_checkpoint_iteration;
 	optional_idx pending_replay_commit_record;
+	bool rebuild_table_map_after_commit = false;
 	unordered_map<persistent_table_id_t, optional_ptr<DuckTableEntry>> tables;
 };
 
@@ -628,6 +658,7 @@ void ReclusterWALReplayContext::SetWALCheckpointIteration(uint64_t checkpoint_it
 
 void ReclusterWALReplayContext::ObserveEntry(WALType type) {
 	auto &pending = state->pending;
+	pending.catalog_changed = pending.catalog_changed || WALTypeChangesCatalog(type);
 	switch (type) {
 	case WALType::RECLUSTER:
 		if (pending.has_other_write) {
@@ -678,6 +709,9 @@ void ReclusterWALReplayContext::AddDelete(WALReclusterDeleteEntry entry) {
 void ReclusterWALReplayContext::FinishTransaction(optional_idx transaction_end, optional_ptr<ClientContext> context) {
 	auto &pending = state->pending;
 	if (!pending.HasReclusterEntries()) {
+		if (state->phase == ReclusterWALReplayPhase::REPLAY) {
+			state->rebuild_table_map_after_commit = pending.catalog_changed;
+		}
 		pending.Reset();
 		return;
 	}
@@ -696,6 +730,7 @@ void ReclusterWALReplayContext::FinishTransaction(optional_idx transaction_end, 
 			throw InternalException("Recluster WAL replay requires a client context");
 		}
 		state->PrepareReplayRecord(*context, std::move(final_deleted_new_rowids), position);
+		state->rebuild_table_map_after_commit = pending.catalog_changed;
 	}
 	pending.Reset();
 }
@@ -712,7 +747,10 @@ void ReclusterWALReplayContext::OnTransactionCommitted() {
 		throw InternalException("Cannot update the recluster table map before WAL replay");
 	}
 	state->CommitPendingRetention();
-	state->RebuildTableMap();
+	if (state->rebuild_table_map_after_commit) {
+		state->RebuildTableMap();
+		state->rebuild_table_map_after_commit = false;
+	}
 }
 
 void ReclusterWALReplayContext::VerifyReplayComplete(bool all_succeeded) const {

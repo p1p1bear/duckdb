@@ -289,21 +289,26 @@ shared_ptr<const RowGroupLayout> RowGroupCollection::GetCurrentLayout() const {
 }
 
 shared_ptr<RowGroupLayout> RowGroupCollection::BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const {
+	return BuildPendingPatchedLayout(GetCurrentLayout(), std::move(patch));
+}
+
+shared_ptr<RowGroupLayout>
+RowGroupCollection::BuildPendingPatchedLayout(const shared_ptr<const RowGroupLayout> &base_layout,
+                                              shared_ptr<const LayoutPatch> patch) const {
 	if (!patch) {
 		throw InternalException("Cannot build a row group layout with a null patch");
 	}
-	auto current = GetCurrentLayout();
-	if (!current) {
+	if (!base_layout) {
 		throw InternalException("Cannot patch a row group collection without layout history");
 	}
-	if (current->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT) {
+	if (base_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT) {
 		throw InternalException("Row group layout reached the checkpoint patch limit");
 	}
-	if (current->layout_version == NumericLimits<layout_version_t>::Maximum()) {
+	if (base_layout->layout_version == NumericLimits<layout_version_t>::Maximum()) {
 		throw InternalException("Row group layout version is exhausted");
 	}
 
-	auto patches = current->patches;
+	auto patches = base_layout->patches;
 	idx_t insert_position = 0;
 	while (insert_position < patches.size() && patches[insert_position]->range.start < patch->range.start) {
 		insert_position++;
@@ -315,7 +320,8 @@ shared_ptr<RowGroupLayout> RowGroupCollection::BuildPendingPatchedLayout(shared_
 		throw InternalException("Cannot publish overlapping row group layout patches");
 	}
 	patches.insert(patches.begin() + NumericCast<int64_t>(insert_position), std::move(patch));
-	return make_shared_ptr<RowGroupLayout>(current->layout_version + 1, 0, current->base_tree, std::move(patches));
+	return make_shared_ptr<RowGroupLayout>(base_layout->layout_version + 1, 0, base_layout->base_tree,
+	                                       std::move(patches));
 }
 
 shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transaction_t visible_from,

@@ -244,6 +244,8 @@ public:
 	RowGroupCollectionSnapshot GetCurrentSnapshot() const;
 	shared_ptr<const RowGroupLayout> GetCurrentLayout() const;
 	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const;
+	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(const shared_ptr<const RowGroupLayout> &base_layout,
+	                                                     shared_ptr<const LayoutPatch> patch) const;
 	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
 	                                                    shared_ptr<const LayoutPatch> patch) const;
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);

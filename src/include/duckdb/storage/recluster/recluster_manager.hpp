@@ -100,6 +100,8 @@ public:
 	void StopAutoRecluster() noexcept;
 	//! Drains this manager's background work. Used by shutdown and deterministic tests.
 	void WaitForAutoRecluster();
+	//! Overrides the automatic checkpoint interval for deterministic tests.
+	void SetAutoCheckpointIntervalForTesting(idx_t interval_ms);
 	ReclusterWALBlockRetention &GetWALBlockRetention() {
 		return wal_block_retention;
 	}
@@ -125,6 +127,7 @@ private:
 	void FinishAutoReclusterTask() noexcept;
 	void ScheduleAutoReclusterTask() noexcept;
 	void RequestAutoCheckpoint() noexcept;
+	void ScheduleAutoCheckpointRetry(int64_t retry_at_ms) noexcept;
 	void ClearAutoCheckpointRequest() noexcept;
 	bool AutoReclusterEnabled() const noexcept;
 	bool AutoCheckpointEnabled() const noexcept;

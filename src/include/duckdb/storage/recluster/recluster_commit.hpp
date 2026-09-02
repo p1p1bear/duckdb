@@ -22,12 +22,21 @@ class RowGroupLayout;
 class TableReclusterState;
 class WriteAheadLog;
 
+struct PreparedReclusterCommitResources {
+	PreparedReclusterRetirement retirement;
+	ReclusterWALRetentionReservation wal_retention;
+	uint64_t wal_checkpoint_iteration = 0;
+};
+
 class ReclusterCommitInfo {
 public:
+	static PreparedReclusterCommitResources Prepare(const shared_ptr<RangeTask> &task,
+	                                                const shared_ptr<DataTable> &storage,
+	                                                const shared_ptr<const RowGroupLayout> &old_layout);
 	ReclusterCommitInfo(shared_ptr<RangeTask> task, shared_ptr<TableReclusterState> table_state,
 	                    shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
 	                    shared_ptr<RowGroupLayout> pending_layout, vector<row_t> final_deleted_new_rowids,
-	                    delete_sequence_t journal_resolved_through);
+	                    delete_sequence_t journal_resolved_through, PreparedReclusterCommitResources resources);
 	ReclusterCommitInfo(shared_ptr<DataTable> storage, shared_ptr<const RowGroupLayout> old_layout,
 	                    shared_ptr<RowGroupLayout> pending_layout, sort_run_id_t recovered_run_id,
 	                    vector<block_id_t> recovered_blocks, RowGroupRange retired_range);

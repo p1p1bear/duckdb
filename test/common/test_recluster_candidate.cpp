@@ -28,7 +28,7 @@ static ReclusterCandidateSelection SelectCandidateForTest(Connection &con, const
 		auto collection = entry.GetStorage().GetRowGroupCollection();
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state);
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state, optional_idx(0));
 		result = analysis.SelectCandidate(limits);
 	});
 	return result;
@@ -43,7 +43,8 @@ SelectCandidatesFromOneAnalysisForTest(Connection &con, const string &table_name
 		auto collection = entry.GetStorage().GetRowGroupCollection();
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
-		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), state->GetSchedulingSnapshot());
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), state->GetSchedulingSnapshot(),
+		                                 optional_idx(0));
 		for (auto &candidate_limits : limits) {
 			result.push_back(analysis.SelectCandidate(candidate_limits));
 		}
@@ -218,5 +219,37 @@ TEST_CASE("Recluster candidates preserve runs and prioritize delete cleanup", "[
 
 	ReclusterCandidateLimits invalid_limits {12288, 6, 1, 0.10};
 	REQUIRE_THROWS_AS(SelectCandidateForTest(con, "tbl", invalid_limits), InternalException);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Incremental run merges prioritize overlapping key ranges", "[storage][recluster_candidate]") {
+	auto path = TestCreatePath("recluster_overlap_candidate.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE candidate_db"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER) SORTED BY (i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (10000 + i)::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (10000 + i)::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (30000 + i)::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (40000 + i)::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (50000 + i)::INTEGER FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT candidate_db"));
+
+	ReclusterCandidateLimits incremental {4096, 2, 2, 1.0};
+	ReclusterCandidateLimits full = incremental;
+	full.prioritize_overlap = false;
+	auto selections = SelectCandidatesFromOneAnalysisForTest(con, "tbl", {incremental, full});
+	REQUIRE(selections[0].candidate);
+	REQUIRE(selections[0].candidate->type == ReclusterCandidateType::RUN_MERGE);
+	REQUIRE(selections[0].candidate->range.start == 2048);
+	REQUIRE(selections[0].candidate->range.end == 6144);
+	REQUIRE(selections[1].candidate);
+	REQUIRE(selections[1].candidate->type == ReclusterCandidateType::RUN_MERGE);
+	REQUIRE(selections[1].candidate->range.start == 0);
+	REQUIRE(selections[1].candidate->range.end == 4096);
 	DeleteDatabase(path);
 }

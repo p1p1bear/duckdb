@@ -22,18 +22,43 @@
 
 namespace duckdb {
 
+PreparedReclusterCommitResources ReclusterCommitInfo::Prepare(const shared_ptr<RangeTask> &task,
+                                                              const shared_ptr<DataTable> &storage,
+                                                              const shared_ptr<const RowGroupLayout> &old_layout) {
+	if (!task || !storage || !old_layout || !task->HasTaskContext() || !task->GetTaskContext().HasOutput() ||
+	    task->GetTaskContext().GetStorage().get() != storage.get()) {
+		throw InternalException("Invalid recluster commit resource preparation");
+	}
+	PreparedReclusterCommitResources result;
+	result.retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
+	    storage->GetRowGroupCollection(), old_layout, task->GetRange());
+	auto &output = task->GetTaskContext().GetOutput();
+	output.GetManifest().VerifySeal();
+	auto &attached = storage->GetAttached();
+	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL()) {
+		result.wal_retention = attached.GetReclusterManager().GetWALBlockRetention().Reserve(
+		    output.manifest_owner->GetBlockIds(), output.GetManifest().all_referenced_blocks);
+		result.wal_checkpoint_iteration =
+		    attached.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+	}
+	return result;
+}
+
 ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_ptr<TableReclusterState> table_state_p,
                                          shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
                                          shared_ptr<RowGroupLayout> pending_layout_p,
                                          vector<row_t> final_deleted_new_rowids_p,
-                                         delete_sequence_t journal_resolved_through_p)
+                                         delete_sequence_t journal_resolved_through_p,
+                                         PreparedReclusterCommitResources resources)
     : task(std::move(task_p)), table_state(std::move(table_state_p)), storage(std::move(storage_p)),
       old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
       final_deleted_new_rowids(std::move(final_deleted_new_rowids_p)),
-      journal_resolved_through(journal_resolved_through_p) {
+      journal_resolved_through(journal_resolved_through_p), retirement(std::move(resources.retirement)),
+      wal_retention(std::move(resources.wal_retention)), wal_checkpoint_iteration(resources.wal_checkpoint_iteration) {
 	if (!task || !table_state || !storage || !old_layout || !pending_layout || !task->HasTaskContext() ||
 	    !task->GetTaskContext().HasOutput() || task->GetTaskContext().GetStorage().get() != storage.get() ||
-	    pending_layout->visible_from != 0 || old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
+	    !retirement.IsActive() || pending_layout->visible_from != 0 ||
+	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
 	    pending_layout->layout_version != old_layout->layout_version + 1 ||
 	    pending_layout->base_tree.get() != old_layout->base_tree.get() ||
 	    journal_resolved_through <
@@ -47,17 +72,12 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_pt
 			throw InternalException("Invalid final recluster DELETE row IDs");
 		}
 	}
-	retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
-	    storage->GetRowGroupCollection(), old_layout, task->GetRange());
 	auto &output = task->GetTaskContext().GetOutput();
 	output.GetManifest().VerifySeal();
-	auto &manager = storage->GetAttached().GetReclusterManager();
 	auto &attached = storage->GetAttached();
-	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL()) {
-		wal_retention = manager.GetWALBlockRetention().Reserve(output.manifest_owner->GetBlockIds(),
-		                                                       output.GetManifest().all_referenced_blocks);
-		wal_checkpoint_iteration =
-		    attached.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL() &&
+	    (!wal_retention.IsActive() || wal_checkpoint_iteration == 0)) {
+		throw InternalException("Invalid recluster WAL retention preparation");
 	}
 }
 

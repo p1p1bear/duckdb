@@ -4,6 +4,9 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/thread.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/time_point.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -41,6 +44,12 @@ struct ReclusterAutoSchedulerState {
 	bool discover_tables = false;
 	bool auto_checkpoint_completed = false;
 	int64_t last_auto_checkpoint_ms = 0;
+	int64_t auto_checkpoint_interval_ms = AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS;
+	int64_t checkpoint_retry_at_ms = 0;
+#ifndef DUCKDB_NO_THREADS
+	unique_ptr<thread> checkpoint_timer;
+	bool checkpoint_timer_running = false;
+#endif
 	vector<QualifiedName> pending_tables;
 };
 
@@ -86,6 +95,9 @@ ReclusterManager::~ReclusterManager() {
 }
 
 void ReclusterManager::StopAutoRecluster() noexcept {
+#ifndef DUCKDB_NO_THREADS
+	unique_ptr<thread> checkpoint_timer;
+#endif
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		auto_scheduler_state->closing = true;
@@ -93,11 +105,28 @@ void ReclusterManager::StopAutoRecluster() noexcept {
 		auto_scheduler_state->checkpoint_requested = false;
 		auto_scheduler_state->discover_tables = false;
 		auto_scheduler_state->pending_tables.clear();
+#ifndef DUCKDB_NO_THREADS
+		checkpoint_timer = std::move(auto_scheduler_state->checkpoint_timer);
+#endif
+		auto_scheduler_state->cv.notify_all();
 	}
+#ifndef DUCKDB_NO_THREADS
+	if (checkpoint_timer && checkpoint_timer->joinable()) {
+		checkpoint_timer->join();
+	}
+#endif
 	try {
 		WaitForAutoRecluster();
 	} catch (...) { // NOLINT: database close cannot report a background drain failure
 	}
+}
+
+void ReclusterManager::SetAutoCheckpointIntervalForTesting(idx_t interval_ms) {
+	if (interval_ms == 0 || interval_ms > NumericLimits<int64_t>::Maximum()) {
+		throw InvalidInputException("Automatic recluster checkpoint interval must be greater than zero");
+	}
+	lock_guard<mutex> guard(auto_scheduler_state->lock);
+	auto_scheduler_state->auto_checkpoint_interval_ms = NumericCast<int64_t>(interval_ms);
 }
 
 void ReclusterManager::InitializeAutoScheduler() {
@@ -125,6 +154,7 @@ bool ReclusterManager::AutoCheckpointEnabled() const noexcept {
 void ReclusterManager::ClearAutoCheckpointRequest() noexcept {
 	lock_guard<mutex> guard(auto_scheduler_state->lock);
 	auto_scheduler_state->checkpoint_requested = false;
+	auto_scheduler_state->cv.notify_all();
 }
 
 void ReclusterManager::RequestAutoCheckpoint() noexcept {
@@ -132,16 +162,24 @@ void ReclusterManager::RequestAutoCheckpoint() noexcept {
 		return;
 	}
 	auto now_ms = TimePoint::GetTickMs();
+	optional<int64_t> retry_at_ms;
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		if (auto_scheduler_state->closing) {
 			return;
 		}
 		auto_scheduler_state->checkpoint_requested = true;
-		if (auto_scheduler_state->auto_checkpoint_completed &&
-		    now_ms - auto_scheduler_state->last_auto_checkpoint_ms < AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS) {
-			return;
+		if (auto_scheduler_state->auto_checkpoint_completed) {
+			auto elapsed_ms = now_ms - auto_scheduler_state->last_auto_checkpoint_ms;
+			if (elapsed_ms < auto_scheduler_state->auto_checkpoint_interval_ms) {
+				retry_at_ms =
+				    auto_scheduler_state->last_auto_checkpoint_ms + auto_scheduler_state->auto_checkpoint_interval_ms;
+			}
 		}
+	}
+	if (retry_at_ms) {
+		ScheduleAutoCheckpointRetry(*retry_at_ms);
+		return;
 	}
 
 	try {
@@ -177,6 +215,84 @@ void ReclusterManager::RequestAutoCheckpoint() noexcept {
 	} catch (...) {
 		LogAutoReclusterError(db, "unknown checkpoint request error");
 	}
+}
+
+void ReclusterManager::ScheduleAutoCheckpointRetry(int64_t retry_at_ms) noexcept {
+#ifdef DUCKDB_NO_THREADS
+	(void)retry_at_ms;
+	return;
+#else
+	unique_ptr<thread> completed_timer;
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested) {
+			return;
+		}
+		if (auto_scheduler_state->checkpoint_timer_running) {
+			auto_scheduler_state->checkpoint_retry_at_ms =
+			    MinValue(auto_scheduler_state->checkpoint_retry_at_ms, retry_at_ms);
+			auto_scheduler_state->cv.notify_all();
+			return;
+		}
+		completed_timer = std::move(auto_scheduler_state->checkpoint_timer);
+	}
+	if (completed_timer && completed_timer->joinable()) {
+		completed_timer->join();
+	}
+
+	try {
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested ||
+		    auto_scheduler_state->checkpoint_timer_running) {
+			return;
+		}
+		auto_scheduler_state->checkpoint_retry_at_ms = retry_at_ms;
+		auto_scheduler_state->checkpoint_timer_running = true;
+		auto state = auto_scheduler_state;
+		auto_scheduler_state->checkpoint_timer = make_uniq<thread>([state]() {
+			bool schedule_task = false;
+			{
+				unique_lock<mutex> guard(state->lock);
+				while (!state->closing && state->checkpoint_requested) {
+					auto now_ms = TimePoint::GetTickMs();
+					if (now_ms >= state->checkpoint_retry_at_ms) {
+						break;
+					}
+					auto retry_at = state->checkpoint_retry_at_ms;
+					state->cv.wait_for(guard, std::chrono::milliseconds(retry_at - now_ms), [&]() {
+						return state->closing || !state->checkpoint_requested ||
+						       state->checkpoint_retry_at_ms != retry_at;
+					});
+				}
+				if (!state->closing && state->checkpoint_requested && state->manager.AutoReclusterEnabled()) {
+					if (state->active) {
+						state->rerun_requested = true;
+					} else {
+						state->active = true;
+						schedule_task = true;
+					}
+				}
+				state->checkpoint_timer_running = false;
+				state->checkpoint_retry_at_ms = 0;
+				state->cv.notify_all();
+			}
+			if (schedule_task) {
+				state->manager.ScheduleAutoReclusterTask();
+			}
+		});
+	} catch (std::exception &ex) {
+		LogAutoReclusterError(db, string("checkpoint retry timer: ") + ex.what());
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_timer_running = false;
+		auto_scheduler_state->checkpoint_retry_at_ms = 0;
+		auto_scheduler_state->cv.notify_all();
+	} catch (...) {
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_timer_running = false;
+		auto_scheduler_state->checkpoint_retry_at_ms = 0;
+		auto_scheduler_state->cv.notify_all();
+	}
+#endif
 }
 
 void ReclusterManager::ScheduleAutoReclusterTask() noexcept {
@@ -282,7 +398,11 @@ void ReclusterManager::WaitForAutoRecluster() {
 			continue;
 		}
 		unique_lock<mutex> guard(auto_scheduler_state->lock);
-		if (!auto_scheduler_state->active) {
+		if (!auto_scheduler_state->active
+#ifndef DUCKDB_NO_THREADS
+		    && !auto_scheduler_state->checkpoint_timer_running
+#endif
+		) {
 			return;
 		}
 		auto_scheduler_state->cv.wait_for(guard, std::chrono::milliseconds(10));

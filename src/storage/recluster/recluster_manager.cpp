@@ -23,6 +23,8 @@
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/recluster/table_sort_bind.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
@@ -457,24 +459,71 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 	bool entered_committing = false;
 	bool undo_pushed = false;
 	try {
-		auto table_write_gate = storage->GetDataTableInfo()->GetExclusiveReclusterWriteLock();
-		auto layout_lock = TryGetSharedLayoutPublishLock();
-		while (!layout_lock) {
-			table_write_gate.reset();
-			auto wait_for_checkpoint = GetSharedLayoutPublishLock();
-			wait_for_checkpoint.reset();
+		auto &task_context = task->GetTaskContext();
+		auto &candidate = task_context.GetCandidate();
+		auto &output = task_context.GetOutput();
+		auto &manifest = output.GetManifest();
+		Connection maintenance_connection(db.GetDatabase());
+		unique_ptr<StorageLockKey> table_write_gate;
+		unique_ptr<StorageLockKey> layout_lock;
+		shared_ptr<const RowGroupLayout> current_layout;
+		shared_ptr<RowGroupLayout> pending_layout;
+		optional<PreparedReclusterCommitResources> prepared_resources;
+		while (true) {
+			if (task->IsCancelRequested() || task->IsPublishForbidden()) {
+				return CancelFinalizeTask(*state, task);
+			}
+			current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+			if (!current_layout || current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
+			    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
+			        current_layout->layout_version) {
+				return FailFinalizeTask(*state, task);
+			}
+
+			auto patch = make_shared_ptr<LayoutPatch>();
+			patch->task_id = task->GetTaskId();
+			patch->range = task->GetRange();
+			patch->sort_order_id = output.GetSortOrderId();
+			patch->run_id = output.GetRunId();
+			patch->replaced_physical_rows = candidate.input_physical_rows;
+			patch->replacement_physical_rows = output.GetRowCount();
+			patch->replacement_groups = output.GetRowGroups();
+			pending_layout =
+			    storage->GetRowGroupCollection()->BuildPendingPatchedLayout(current_layout, std::move(patch));
+			auto resources = ReclusterCommitInfo::Prepare(task, storage, current_layout);
+
 			table_write_gate = storage->GetDataTableInfo()->GetExclusiveReclusterWriteLock();
 			layout_lock = TryGetSharedLayoutPublishLock();
+			if (!layout_lock) {
+				table_write_gate.reset();
+				pending_layout.reset();
+				current_layout.reset();
+				resources = PreparedReclusterCommitResources();
+				auto wait_for_checkpoint = GetSharedLayoutPublishLock();
+				wait_for_checkpoint.reset();
+				continue;
+			}
+			bool wal_generation_matches = true;
+			if (db.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && db.GetStorageManager().HasWAL()) {
+				auto checkpoint_iteration =
+				    db.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+				wal_generation_matches = checkpoint_iteration == resources.wal_checkpoint_iteration;
+			}
+			if (storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
+			    !wal_generation_matches) {
+				layout_lock.reset();
+				table_write_gate.reset();
+				pending_layout.reset();
+				current_layout.reset();
+				continue;
+			}
+			prepared_resources = std::move(resources);
+			break;
 		}
 
 		if (task->IsCancelRequested() || task->IsPublishForbidden()) {
 			return CancelFinalizeTask(*state, task);
 		}
-		auto &task_context = task->GetTaskContext();
-		auto &candidate = task_context.GetCandidate();
-		auto &output = task_context.GetOutput();
-		auto &manifest = output.GetManifest();
-		auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
 		auto current_definition = table.GetSortMetadata() ? table.GetSortMetadata()->GetCurrent() : nullptr;
 		if (!storage->IsMainTable() || &table.GetStorage() != storage.get() || !table.SortEnabled() ||
 		    !current_definition || !(*current_definition == task_context.GetSortDefinition()) ||
@@ -483,7 +532,9 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		    state->GetCurrentSortOrderId() != candidate.sort_order_id ||
 		    state->GetCurrentStorageGenerationId() != candidate.storage_generation_id ||
 		    storage->GetRowGroupCollection()->GetStorageGenerationId() != candidate.storage_generation_id ||
-		    !current_layout || current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
+		    !current_layout || !prepared_resources ||
+		    storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
+		    current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
 		    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
 		        current_layout->layout_version ||
 		    manifest.header.task_id != task->GetTaskId() || manifest.header.table_id != task_context.GetTableId() ||
@@ -511,24 +562,14 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		}
 		auto final_deleted_new_rowids = BuildFinalDeleteRowIds(*task, final_scan);
 
-		auto patch = make_shared_ptr<LayoutPatch>();
-		patch->task_id = task->GetTaskId();
-		patch->range = task->GetRange();
-		patch->sort_order_id = output.GetSortOrderId();
-		patch->run_id = output.GetRunId();
-		patch->replaced_physical_rows = candidate.input_physical_rows;
-		patch->replacement_physical_rows = output.GetRowCount();
-		patch->replacement_groups = output.GetRowGroups();
-		auto pending_layout = storage->GetRowGroupCollection()->BuildPendingPatchedLayout(std::move(patch));
-		auto commit_info =
-		    make_uniq<ReclusterCommitInfo>(task, state, storage, current_layout, std::move(pending_layout),
-		                                   std::move(final_deleted_new_rowids), final_scan.resolved_through);
+		auto commit_info = make_uniq<ReclusterCommitInfo>(
+		    task, state, storage, current_layout, std::move(pending_layout), std::move(final_deleted_new_rowids),
+		    final_scan.resolved_through, std::move(*prepared_resources));
 
 		if (!task->TryEnterCommitting()) {
 			return CancelFinalizeTask(*state, task);
 		}
 		entered_committing = true;
-		Connection maintenance_connection(db.GetDatabase());
 		auto &maintenance_context = maintenance_connection.context->transaction;
 		maintenance_context.BeginTransaction();
 		MetaTransaction::Get(*maintenance_connection.context).ModifyDatabase(db, DatabaseModificationType());
@@ -632,9 +673,11 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		return result;
 	}
 	bool checkpoint_created = false;
+	bool remaining_bytes_computed = false;
 	idx_t tasks_at_last_checkpoint = 0;
 	idx_t stale_attempts = 0;
 	while (result.tasks_completed < options.max_tasks) {
+		remaining_bytes_computed = false;
 		context.InterruptCheck();
 		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
@@ -651,7 +694,15 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		auto max_row_group_limit =
 		    full_mode ? GetFullReclusterRowGroupLimit(*storage) : GetReclusterRowGroupLimit(*storage);
 		auto max_merge_runs = full_mode ? FULL_RECLUSTER_MAX_MERGE_RUNS : DEFAULT_RECLUSTER_MAX_MERGE_RUNS;
-		ReclusterLayoutAnalysis analysis(*storage->GetRowGroupCollection(), storage->Columns(), *state);
+		auto current_definition = table.GetSortMetadata()->GetCurrent();
+		if (!current_definition) {
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the current SORTED BY definition is missing";
+			break;
+		}
+		auto physical_sort_indexes = BindPersistentSortIndexes(storage->Columns(), *current_definition);
+		ReclusterLayoutAnalysis analysis(*storage->GetRowGroupCollection(), storage->Columns(), *state,
+		                                 optional_idx(physical_sort_indexes[0]));
 		auto checkpoint_row_groups = analysis.GetCheckpointRowGroupCount();
 		if (checkpoint_row_groups > 0) {
 			max_row_group_limit = MinValue(max_row_group_limit, checkpoint_row_groups);
@@ -662,6 +713,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		idx_t candidate_bytes = 0;
 		while (true) {
 			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups, max_merge_runs);
+			limits.prioritize_overlap = !full_mode;
 			selection = analysis.SelectCandidate(limits);
 			if (!selection.candidate) {
 				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
@@ -695,6 +747,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 
 		if (!selection.candidate) {
 			result.remaining_recluster_bytes = EstimateAnalyzedRemainingReclusterBytes(*storage, analysis);
+			remaining_bytes_computed = true;
 			if (candidate_bytes > caller_remaining_budget || result.input_bytes >= options.max_bytes) {
 				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
 				result.message = "the remaining byte budget cannot admit another row group";
@@ -795,7 +848,9 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		}
 	}
 
-	result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+	if (!remaining_bytes_computed) {
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+	}
 	if (result.state == ReclusterExplicitState::FAILED || result.state == ReclusterExplicitState::ALREADY_RUNNING ||
 	    result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE) {
 		if (result.state == ReclusterExplicitState::FAILED) {
