@@ -12,14 +12,9 @@
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/optional_ptr.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
-#include "duckdb/storage/recluster/recluster_types.hpp"
 #include "duckdb/transaction/undo_buffer.hpp"
 #include "duckdb/common/enums/active_transaction_state.hpp"
-
-#include <condition_variable>
-#include <exception>
 
 namespace duckdb {
 class CheckpointLock;
@@ -35,6 +30,7 @@ class StorageLockKey;
 class StorageCommitState;
 struct QualifiedName;
 struct DataTableInfo;
+struct DuckTransactionReclusterState;
 struct UndoBufferProperties;
 
 struct CommitInfo {
@@ -130,6 +126,8 @@ public:
 
 private:
 	void HoldReclusterWriteLock(DataTableInfo &info, bool exclusive);
+	DuckTransactionReclusterState &GetOrCreateReclusterState();
+	optional_ptr<DuckTransactionReclusterState> GetReclusterState();
 
 	//! The undo buffer is used to store old versions of rows that are updated
 	//! or deleted
@@ -152,33 +150,8 @@ private:
 	};
 	//! Active locks on tables
 	reference_map_t<DataTableInfo, unique_ptr<ActiveTableLock>> active_locks;
-	enum class HeldTableGateMode : uint8_t { ACQUIRING_SHARED, ACQUIRING_EXCLUSIVE, SHARED, EXCLUSIVE, FAILED };
-	struct HeldTableGate {
-		HeldTableGateMode mode;
-		std::condition_variable ready;
-		unique_ptr<StorageLockKey> handle;
-		std::exception_ptr failure;
-	};
-	mutex recluster_transaction_lock;
-	reference_map_t<DataTableInfo, shared_ptr<HeldTableGate>> table_write_locks;
-	enum class HeldDDLCoordinationState : uint8_t { ACQUIRING, HELD, FAILED };
-	struct HeldDDLCoordination {
-		HeldDDLCoordinationState state;
-		std::condition_variable ready;
-		unique_ptr<StorageLockKey> handle;
-		std::exception_ptr failure;
-	};
-	reference_map_t<DataTableInfo, shared_ptr<HeldDDLCoordination>> ddl_coordination_locks;
-	enum class ReclusterDeleteTransactionState : uint8_t { RECORDING, PREPARING, PREPARED, RESOLVED };
-	struct PendingTaskDeletes {
-		shared_ptr<RangeTask> task;
-		vector<row_t> old_rowids;
-		optional_ptr<ReclusterDeleteSlot> slot;
-	};
-	ReclusterDeleteTransactionState recluster_delete_state = ReclusterDeleteTransactionState::RECORDING;
-	unordered_map<recluster_task_id_t, PendingTaskDeletes> pending_recluster_deletes;
-	bool is_recluster_maintenance_transaction = false;
-	bool has_recluster_undo = false;
+	//! State used only by transactions that touch sorted tables or publish recluster work.
+	unique_ptr<DuckTransactionReclusterState> recluster_state;
 	//! A durable commit reached non-revertible storage finalization before reporting an error.
 	bool commit_finalization_irreversible = false;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.

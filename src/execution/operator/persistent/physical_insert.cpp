@@ -645,7 +645,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 			gstate.return_collection.Append(insert_chunk);
 		}
 		// When action_type is throw, we already verify constraints in `OnConflictHandling`
-		storage.LocalAppend(table, context.client, insert_chunk, bound_constraints, AppendOrganization::Unsorted(),
+		storage.LocalAppend(table, context.client, insert_chunk, bound_constraints,
 		                    action_type == OnConflictAction::THROW);
 		if (action_type == OnConflictAction::UPDATE && lstate.update_chunk.size() != 0) {
 			(void)HandleInsertConflicts<true>(table, context, lstate, gstate, lstate.update_chunk, *this);

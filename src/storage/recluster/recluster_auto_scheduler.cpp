@@ -95,9 +95,16 @@ ReclusterManager::~ReclusterManager() {
 }
 
 void ReclusterManager::StopAutoRecluster() noexcept {
+	auto_scheduler_closing.store(true);
 #ifndef DUCKDB_NO_THREADS
 	unique_ptr<thread> checkpoint_timer;
 #endif
+	{
+		lock_guard<mutex> initialization_guard(queue_lock);
+		if (!auto_scheduler_initialized.load()) {
+			return;
+		}
+	}
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		auto_scheduler_state->closing = true;
@@ -125,13 +132,30 @@ void ReclusterManager::SetAutoCheckpointIntervalForTesting(idx_t interval_ms) {
 	if (interval_ms == 0 || interval_ms > NumericLimits<int64_t>::Maximum()) {
 		throw InvalidInputException("Automatic recluster checkpoint interval must be greater than zero");
 	}
+	if (!InitializeAutoScheduler()) {
+		throw InternalException("Cannot initialize automatic recluster scheduling while the database is closing");
+	}
 	lock_guard<mutex> guard(auto_scheduler_state->lock);
 	auto_scheduler_state->auto_checkpoint_interval_ms = NumericCast<int64_t>(interval_ms);
 }
 
-void ReclusterManager::InitializeAutoScheduler() {
-	auto_scheduler_state = make_shared_ptr<ReclusterAutoSchedulerState>(*this);
-	auto_scheduler_producer = TaskScheduler::GetScheduler(db.GetDatabase()).CreateProducer();
+bool ReclusterManager::InitializeAutoScheduler() {
+	if (auto_scheduler_initialized.load()) {
+		return true;
+	}
+	lock_guard<mutex> guard(queue_lock);
+	if (auto_scheduler_initialized.load()) {
+		return true;
+	}
+	if (auto_scheduler_closing.load()) {
+		return false;
+	}
+	auto state = make_shared_ptr<ReclusterAutoSchedulerState>(*this);
+	auto producer = TaskScheduler::GetScheduler(db.GetDatabase()).CreateProducer();
+	auto_scheduler_state = std::move(state);
+	auto_scheduler_producer = std::move(producer);
+	auto_scheduler_initialized.store(true);
+	return true;
 }
 
 bool ReclusterManager::AutoReclusterEnabled() const noexcept {
@@ -152,6 +176,9 @@ bool ReclusterManager::AutoCheckpointEnabled() const noexcept {
 }
 
 void ReclusterManager::ClearAutoCheckpointRequest() noexcept {
+	if (!auto_scheduler_initialized.load()) {
+		return;
+	}
 	lock_guard<mutex> guard(auto_scheduler_state->lock);
 	auto_scheduler_state->checkpoint_requested = false;
 	auto_scheduler_state->cv.notify_all();
@@ -324,6 +351,13 @@ void ReclusterManager::RequestAutoRecluster() noexcept {
 			return;
 		}
 	}
+	try {
+		if (!InitializeAutoScheduler()) {
+			return;
+		}
+	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
+		return;
+	}
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		if (auto_scheduler_state->closing) {
@@ -344,6 +378,9 @@ void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_n
 		return;
 	}
 	try {
+		if (!InitializeAutoScheduler()) {
+			return;
+		}
 		{
 			lock_guard<mutex> guard(auto_scheduler_state->lock);
 			if (auto_scheduler_state->closing) {
@@ -390,6 +427,9 @@ void ReclusterManager::FinishAutoReclusterTask() noexcept {
 }
 
 void ReclusterManager::WaitForAutoRecluster() {
+	if (!auto_scheduler_initialized.load()) {
+		return;
+	}
 	auto &scheduler = TaskScheduler::GetScheduler(db.GetDatabase());
 	while (true) {
 		shared_ptr<Task> task;

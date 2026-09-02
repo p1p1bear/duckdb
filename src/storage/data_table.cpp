@@ -42,11 +42,55 @@
 
 namespace duckdb {
 
+struct DataTableSortRuntime {
+	StorageLock write_gate;
+	StorageLock ddl_gate;
+	mutex recluster_state_lock;
+	shared_ptr<TableReclusterState> recluster_state;
+	unique_ptr<TableSortStorageState> sort_storage;
+};
+
 DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p,
                              vector<Identifier> schema_path, Identifier table)
     : db(db), table_io_manager(std::move(table_io_manager_p)), schema_path(std::move(schema_path)),
       table(std::move(table)) {
 	D_ASSERT(!this->schema_path.empty());
+}
+
+DataTableInfo::~DataTableInfo() {
+}
+
+DataTableSortRuntime &DataTableInfo::GetOrCreateSortRuntime() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
+	}
+	return *sort_runtime;
+}
+
+optional_ptr<DataTableSortRuntime> DataTableInfo::GetSortRuntime() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	return sort_runtime.get();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetSharedReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.GetSharedLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetExclusiveReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.GetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::TryGetExclusiveReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.TryGetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetReclusterDDLCoordinationLock() {
+	return GetOrCreateSortRuntime().ddl_gate.GetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::TryGetReclusterDDLCoordinationLock() {
+	return GetOrCreateSortRuntime().ddl_gate.TryGetExclusiveLock();
 }
 
 void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) {
@@ -57,13 +101,16 @@ void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetada
 	if (sort_storage_initialized.load()) {
 		throw InternalException("Sort storage state has already been initialized");
 	}
-	sort_storage = make_uniq<TableSortStorageState>(metadata);
+	GetOrCreateSortRuntime().sort_storage = make_uniq<TableSortStorageState>(metadata);
 	sort_storage_initialized.store(true);
 }
 
 void DataTableInfo::ResetSortStorage() {
 	sort_storage_initialized.store(false);
-	sort_storage.reset();
+	auto runtime = GetSortRuntime();
+	if (runtime) {
+		runtime->sort_storage.reset();
+	}
 }
 
 bool DataTableInfo::HasSortStorage() const {
@@ -71,30 +118,37 @@ bool DataTableInfo::HasSortStorage() const {
 }
 
 TableSortStorageState &DataTableInfo::GetSortStorage() {
-	if (!sort_storage) {
+	auto runtime = GetSortRuntime();
+	if (!runtime || !runtime->sort_storage) {
 		throw InternalException("Table does not have sort storage state");
 	}
-	return *sort_storage;
+	return *runtime->sort_storage;
 }
 
 const TableSortStorageState &DataTableInfo::GetSortStorage() const {
-	if (!sort_storage) {
+	auto runtime = GetSortRuntime();
+	if (!runtime || !runtime->sort_storage) {
 		throw InternalException("Table does not have sort storage state");
 	}
-	return *sort_storage;
+	return *runtime->sort_storage;
 }
 
 shared_ptr<TableReclusterState> DataTableInfo::GetOrCreateReclusterState(uint64_t initialization_token) {
-	lock_guard<mutex> guard(recluster_state_lock);
-	if (!recluster_state) {
-		recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
+	auto &runtime = GetOrCreateSortRuntime();
+	lock_guard<mutex> guard(runtime.recluster_state_lock);
+	if (!runtime.recluster_state) {
+		runtime.recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
 	}
-	return recluster_state;
+	return runtime.recluster_state;
 }
 
 shared_ptr<TableReclusterState> DataTableInfo::GetReclusterState() const {
-	lock_guard<mutex> guard(recluster_state_lock);
-	return recluster_state;
+	auto runtime = GetSortRuntime();
+	if (!runtime) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(runtime->recluster_state_lock);
+	return runtime->recluster_state;
 }
 
 bool DataTableInfo::IsTemporary() const {
@@ -1158,8 +1212,8 @@ void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry
 }
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
-                            const vector<unique_ptr<BoundConstraint>> &bound_constraints,
-                            const AppendOrganization &organization, bool constraints_verified) {
+                            const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool constraints_verified,
+                            const AppendOrganization &organization) {
 	LocalAppendState append_state;
 	InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
 	LocalAppend(append_state, table, context, chunk, constraints_verified);

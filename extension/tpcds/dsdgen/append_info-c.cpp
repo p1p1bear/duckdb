@@ -33,7 +33,7 @@ tpcds_append_information::tpcds_append_information(duckdb::ClientContext &contex
 		optimistic_writer = duckdb::make_uniq<duckdb::OptimisticDataWriter>(context_p, table_entry->GetStorage());
 		auto collection = optimistic_writer->CreateCollection(table_entry->GetStorage(), types, partial_manager_type);
 		collection->collection->InitializeEmpty();
-		collection->InitializeAppend(append_state, duckdb::AppendOrganization::Unsorted());
+		collection->InitializeAppend(append_state);
 		optimistic_collection_index =
 		    table_entry->GetStorage().CreateOptimisticCollection(context, std::move(collection));
 		optimistic_collection = table_entry->GetStorage().GetOptimisticCollection(context, optimistic_collection_index);
@@ -195,8 +195,7 @@ void tpcds_append_information::FlushOptimistic() {
 		auto binder = duckdb::Binder::CreateBinder(context);
 		auto bound_constraints = binder->BindConstraints(table);
 		duckdb::LocalAppendState local_append_state;
-		storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints,
-		                              duckdb::AppendOrganization::Unsorted());
+		storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints);
 		auto &transaction = duckdb::DuckTransaction::Get(context, table.catalog);
 		for (auto &insert_chunk : row_collection.Chunks(transaction)) {
 			storage.LocalAppend(local_append_state, table, context, insert_chunk, false);

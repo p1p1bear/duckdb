@@ -122,7 +122,7 @@ public:
 private:
 	friend class ReclusterAutoTask;
 
-	void InitializeAutoScheduler();
+	bool InitializeAutoScheduler();
 	void RunAutoReclusterPass() noexcept;
 	void FinishAutoReclusterTask() noexcept;
 	void ScheduleAutoReclusterTask() noexcept;
@@ -142,6 +142,8 @@ private:
 	shared_ptr<ReclusterAutoSchedulerState> auto_scheduler_state;
 	unique_ptr<ProducerToken> auto_scheduler_producer;
 	mutex queue_lock;
+	atomic<bool> auto_scheduler_initialized {false};
+	atomic<bool> auto_scheduler_closing {false};
 	StorageLock layout_publish_lock;
 	unordered_map<persistent_table_id_t, weak_ptr<TableReclusterState>> tables;
 	atomic<uint64_t> next_checkpoint_number {1};

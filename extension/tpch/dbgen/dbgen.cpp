@@ -70,7 +70,7 @@ struct tpch_append_information {
 		auto collection =
 		    optimistic_writer->CreateCollection(table.GetStorage(), table.GetTypes(), partial_manager_type);
 		collection->collection->InitializeEmpty();
-		collection->InitializeAppend(append_state, AppendOrganization::Unsorted());
+		collection->InitializeAppend(append_state);
 		optimistic_collection_index = table.GetStorage().CreateOptimisticCollection(context, std::move(collection));
 		optimistic_collection = table.GetStorage().GetOptimisticCollection(context, optimistic_collection_index);
 		chunk.Initialize(context, table.GetTypes());
@@ -125,8 +125,7 @@ struct tpch_append_information {
 			auto binder = Binder::CreateBinder(context);
 			auto bound_constraints = binder->BindConstraints(table);
 			LocalAppendState local_append_state;
-			storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints,
-			                              AppendOrganization::Unsorted());
+			storage.InitializeLocalAppend(local_append_state, table, context, bound_constraints);
 			auto &transaction = DuckTransaction::Get(context, table.catalog);
 			for (auto &insert_chunk : row_collection.Chunks(transaction)) {
 				storage.LocalAppend(local_append_state, table, context, insert_chunk, false);

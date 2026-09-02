@@ -43,8 +43,10 @@ struct OptimisticWriteCollection {
 	vector<AppendOrganizationSpan> append_spans;
 
 	void MergeStorage(OptimisticWriteCollection &collection);
-	void InitializeAppend(TransactionData transaction, TableAppendState &state, const AppendOrganization &organization);
-	void InitializeAppend(TableAppendState &state, const AppendOrganization &organization);
+	void InitializeAppend(TransactionData transaction, TableAppendState &state,
+	                      const AppendOrganization &organization = AppendOrganization::Unsorted());
+	void InitializeAppend(TableAppendState &state,
+	                      const AppendOrganization &organization = AppendOrganization::Unsorted());
 	optional_idx Append(DataChunk &chunk, TableAppendState &state);
 	void FinalizeAppend(TransactionData transaction, TableAppendState &state);
 	void AddAppendSpan(idx_t collection_offset, idx_t physical_count, const AppendOrganization &organization);

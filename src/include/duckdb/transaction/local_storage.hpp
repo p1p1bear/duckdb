@@ -199,7 +199,7 @@ public:
 
 	//! Begin appending to the local storage
 	void InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry,
-	                      const AppendOrganization &organization);
+	                      const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Initialize the storage and its indexes, but no row groups.
 	void InitializeStorage(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry);
 

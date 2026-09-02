@@ -19,6 +19,7 @@ struct CheckpointOptions;
 class TableIOManager;
 class RowGroupCollection;
 class TableReclusterState;
+struct DataTableSortRuntime;
 
 struct DataTableInfo {
 	friend class DataTable;
@@ -26,6 +27,7 @@ struct DataTableInfo {
 public:
 	DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p, vector<Identifier> schema_path,
 	              Identifier table);
+	~DataTableInfo();
 
 	//! Bind unknown indexes throwing an exception if binding fails.
 	//! Only binds the specified index type, or all, if nullptr.
@@ -50,21 +52,11 @@ public:
 	unique_ptr<StorageLockKey> GetSharedLock() {
 		return checkpoint_lock.GetSharedLock();
 	}
-	unique_ptr<StorageLockKey> GetSharedReclusterWriteLock() {
-		return recluster_write_gate.GetSharedLock();
-	}
-	unique_ptr<StorageLockKey> GetExclusiveReclusterWriteLock() {
-		return recluster_write_gate.GetExclusiveLock();
-	}
-	unique_ptr<StorageLockKey> TryGetExclusiveReclusterWriteLock() {
-		return recluster_write_gate.TryGetExclusiveLock();
-	}
-	unique_ptr<StorageLockKey> GetReclusterDDLCoordinationLock() {
-		return recluster_ddl_gate.GetExclusiveLock();
-	}
-	unique_ptr<StorageLockKey> TryGetReclusterDDLCoordinationLock() {
-		return recluster_ddl_gate.TryGetExclusiveLock();
-	}
+	unique_ptr<StorageLockKey> GetSharedReclusterWriteLock();
+	unique_ptr<StorageLockKey> GetExclusiveReclusterWriteLock();
+	unique_ptr<StorageLockKey> TryGetExclusiveReclusterWriteLock();
+	unique_ptr<StorageLockKey> GetReclusterDDLCoordinationLock();
+	unique_ptr<StorageLockKey> TryGetReclusterDDLCoordinationLock();
 	bool AppendRequiresNewRowGroup(RowGroupCollection &collection, transaction_t checkpoint_id);
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
@@ -83,6 +75,10 @@ public:
 	void SetTableName(Identifier name);
 
 private:
+	DataTableSortRuntime &GetOrCreateSortRuntime() const;
+	optional_ptr<DataTableSortRuntime> GetSortRuntime() const;
+
+private:
 	//! The database instance of the table
 	AttachedDatabase &db;
 	//! The table IO manager
@@ -99,20 +95,14 @@ private:
 	vector<IndexStorageInfo> index_storage_infos;
 	//! Lock held while checkpointing
 	StorageLock checkpoint_lock;
-	//! Lock coordinating sorted-table writers and layout or catalog publication
-	StorageLock recluster_write_gate;
-	//! Lock serializing sorted-table DDL coordination on this table
-	StorageLock recluster_ddl_gate;
 	//! The last seen checkpoint while doing a concurrent operation, if any
 	optional_idx last_seen_checkpoint;
 	//! The amount of row groups the checkpoint is processing
 	optional_idx checkpoint_row_group_count;
-	//! Physical counters for tables that have SORTED BY history
-	unique_ptr<TableSortStorageState> sort_storage;
 	atomic<bool> sort_storage_initialized = false;
-	//! Optional runtime state for tables that have SORTED BY history
-	mutable mutex recluster_state_lock;
-	shared_ptr<TableReclusterState> recluster_state;
+	//! Writer coordination and maintenance state, allocated only after SORTED BY is used.
+	mutable mutex sort_runtime_lock;
+	mutable unique_ptr<DataTableSortRuntime> sort_runtime;
 };
 
 } // namespace duckdb

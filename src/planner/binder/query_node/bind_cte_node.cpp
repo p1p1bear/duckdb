@@ -172,8 +172,8 @@ BoundCTEData Binder::PrepareCTE(const Identifier &ctename, CommonTableExpression
 
 	// instead of eagerly binding the CTE here we add the CTE bind state to the list of CTE bindings
 	// the CTE is bound lazily - when referenced for the first time we perform the binding
-	result.cte_bind_state =
-	    make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases, statement.allow_direct_sort);
+	result.cte_bind_state = make_shared_ptr<CTEBindState>(*this, *statement.query_node, statement.aliases,
+	                                                     AllowDirectSort() && statement.allow_direct_sort);
 
 	result.child_binder = Binder::CreateBinder(context, this);
 

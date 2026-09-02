@@ -479,6 +479,10 @@ ColumnDataType GetColumnDataType(idx_t row_start) {
 	return ColumnDataType::MAIN_TABLE;
 }
 
+void RowGroupCollection::AppendRowGroup(SegmentLock &l, idx_t start_row) {
+	AppendRowGroup(l, start_row, AppendOrganization::Unsorted());
+}
+
 void RowGroupCollection::AppendRowGroup(SegmentLock &l, idx_t start_row, const AppendOrganization &organization) {
 	if (!organization.IsValid()) {
 		throw InternalException("Invalid append organization");
@@ -918,6 +922,10 @@ bool RowGroupCollection::IsEmpty() const {
 	return row_groups->IsEmpty(l);
 }
 
+void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state) {
+	InitializeAppend(transaction, state, AppendOrganization::Unsorted());
+}
+
 void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state,
                                           const AppendOrganization &organization) {
 	if (state.organization_initialized) {
@@ -971,6 +979,10 @@ void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppe
 	// initialize thread-local stats so we have less lock contention when updating distinct statistics
 	state.stats = TableStatistics();
 	state.stats.InitializeEmpty(types);
+}
+
+void RowGroupCollection::InitializeAppend(TableAppendState &state) {
+	InitializeAppend(state, AppendOrganization::Unsorted());
 }
 
 void RowGroupCollection::InitializeAppend(TableAppendState &state, const AppendOrganization &organization) {

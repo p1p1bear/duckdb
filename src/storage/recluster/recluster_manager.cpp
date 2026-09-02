@@ -42,7 +42,6 @@ static constexpr idx_t RECLUSTER_CONVERSION_ROW_GROUP_TARGET = 32;
 
 ReclusterManager::ReclusterManager(AttachedDatabase &db_p)
     : db(db_p), wal_block_retention(db_p), retirement_registry(db_p) {
-	InitializeAutoScheduler();
 }
 
 uint64_t ReclusterManager::AllocateInitializationToken() {
