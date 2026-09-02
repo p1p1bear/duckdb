@@ -1850,6 +1850,9 @@ void DataTable::VerifyUpdateConstraints(ConstraintState &state, ClientContext &c
 
 unique_ptr<TableUpdateState> DataTable::InitializeUpdate(TableCatalogEntry &table, ClientContext &context,
                                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	if (table.IsDuckTable()) {
+		table.Cast<DuckTableEntry>().VerifyUpdateAllowed();
+	}
 	HoldReclusterWriteGate(context, "update");
 	// Bind all indexes.
 	info->BindIndexes(context);

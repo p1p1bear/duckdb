@@ -96,7 +96,7 @@ static ErrorData ValidateSortedCreateCapabilities(DuckCatalog &catalog, BoundCre
 
 static void InitializeSortedCreate(BoundCreateTableInfo &info) {
 	auto &base = info.Base();
-	base.NormalizeLegacySortKeys();
+	base.NormalizeSortKeys();
 	if (!base.sort_metadata) {
 		auto metadata = CreateTableSortIdentity(base.columns);
 		metadata.current_sort_order_id = 1;

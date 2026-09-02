@@ -39,7 +39,7 @@ struct CreateTableInfo : public CreateInfo {
 	unique_ptr<SelectStatement> query;
 	//! Table Partition definitions
 	vector<unique_ptr<ParsedExpression>> partition_keys;
-	//! Table Sort definitions
+	//! Compatibility projection of table sort expressions for extension catalogs
 	vector<unique_ptr<ParsedExpression>> sort_keys;
 	//! Table Sort definitions including direction and NULL ordering
 	vector<OrderByNode> sort_orders;
@@ -56,7 +56,7 @@ public:
 
 	bool HasAnySortDefinition() const;
 	void ValidateSortKeySources() const;
-	void NormalizeLegacySortKeys();
+	void NormalizeSortKeys();
 	string ExtraOptionsToString() const;
 	string ToString() const override;
 };

@@ -41,7 +41,7 @@ unique_ptr<CreateInfo> CreateTableInfo::Copy() const {
 	if (query) {
 		result->query = unique_ptr_cast<SQLStatement, SelectStatement>(query->Copy());
 	}
-	result->NormalizeLegacySortKeys();
+	result->NormalizeSortKeys();
 	return std::move(result);
 }
 
@@ -69,14 +69,21 @@ void CreateTableInfo::ValidateSortKeySources() const {
 	}
 }
 
-void CreateTableInfo::NormalizeLegacySortKeys() {
+void CreateTableInfo::NormalizeSortKeys() {
 	ValidateSortKeySources();
+	if (sort_metadata) {
+		return;
+	}
 	if (sort_orders.empty()) {
 		for (auto &sort_key : sort_keys) {
 			sort_orders.emplace_back(OrderType::ORDER_DEFAULT, OrderByNullType::ORDER_DEFAULT, sort_key->Copy());
 		}
 	}
-	sort_keys.clear();
+	if (sort_keys.empty()) {
+		for (auto &sort_order : sort_orders) {
+			sort_keys.push_back(sort_order.expression->Copy());
+		}
+	}
 }
 
 void CreateTableInfo::Serialize(Serializer &serializer) const {
@@ -127,7 +134,7 @@ unique_ptr<CreateInfo> CreateTableInfo::Deserialize(Deserializer &deserializer) 
 	    207, "sort_metadata", result->sort_metadata, optional<TableSortCatalogMetadata>());
 	deserializer.ReadPropertyWithDefault<vector<OrderByNode>>(208, "sort_orders", result->sort_orders);
 	result->SetName(std::move(table));
-	result->NormalizeLegacySortKeys();
+	result->NormalizeSortKeys();
 	return std::move(result);
 }
 

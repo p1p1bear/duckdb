@@ -69,6 +69,7 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateTableStmt(
 	info->partition_keys = std::move(create_table_definition.partition_keys);
 	info->sort_orders = std::move(create_table_definition.sort_orders);
 	info->options = std::move(create_table_definition.options);
+	info->NormalizeSortKeys();
 
 	result->info = std::move(info);
 	return result;

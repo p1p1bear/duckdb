@@ -266,9 +266,9 @@ CALL recluster('r.main.events')
 statement ok
 ROLLBACK
 
-# A recovered checkpoint snapshot uses checkpoint number zero. FORCE CHECKPOINT
-# must be a separate statement because CALL itself owns an active read
-# transaction.
+# A recovered checkpoint snapshot uses checkpoint number zero. Automatic work
+# waits for a new checkpoint, while an explicit caller can consume it after
+# full physical identity and layout revalidation.
 statement ok
 CREATE TABLE recovered_full(k BIGINT) SORTED BY (k)
 
@@ -327,6 +327,17 @@ SELECT count(*) FROM (
 ----
 0
 
+query T
+SELECT blocked_reason FROM duckdb_recluster_status() WHERE table_name = 'recovered_full'
+----
+NO_CHECKPOINTED_RANGE
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.recovered_full', mode='full', create_checkpoint=false)
+----
+1	0	COMPLETE
+
 statement ok
 FORCE CHECKPOINT r
 
@@ -334,7 +345,7 @@ query IIT
 SELECT tasks_completed, remaining_recluster_bytes, state
 FROM recluster('r.main.recovered_full', mode='full')
 ----
-1	0	COMPLETE
+0	0	COMPLETE
 
 query I
 SELECT count(*) FROM (

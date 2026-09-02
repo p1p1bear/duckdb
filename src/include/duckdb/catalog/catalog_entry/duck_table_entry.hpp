@@ -60,6 +60,7 @@ public:
 	bool SortEnabled() const {
 		return sort_metadata && sort_metadata->IsEnabled();
 	}
+	void VerifyUpdateAllowed() const;
 
 	void SetAsRoot() override;
 

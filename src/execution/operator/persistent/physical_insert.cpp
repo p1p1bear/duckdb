@@ -124,12 +124,10 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 		table = insert_table.get_mutable();
 	}
 	auto result = make_uniq<InsertGlobalState>(context, GetTypes(), *table);
+	if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
+		table->VerifyUpdateAllowed();
+	}
 	if (table->SortEnabled() && allow_direct_sort) {
-		if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
-			throw NotImplementedException(
-			    "UPDATE conflict: table \"%s\" has SORTED BY enabled; use DELETE + INSERT or RESET SORTED BY",
-			    table->name);
-		}
 		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
 	}
 	return std::move(result);

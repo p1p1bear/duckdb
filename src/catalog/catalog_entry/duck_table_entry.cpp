@@ -372,6 +372,16 @@ unique_ptr<BlockingSample> DuckTableEntry::GetSample() {
 	return storage->GetSample();
 }
 
+void DuckTableEntry::VerifyUpdateAllowed() const {
+	if (!SortEnabled()) {
+		return;
+	}
+	throw NotImplementedException(
+	    "UPDATE is not supported on table \"%s\" because it uses SORTED BY. Use DELETE followed by INSERT, or RESET "
+	    "SORTED BY.",
+	    name);
+}
+
 void DuckTableEntry::HoldReclusterDDLWriteGate(DuckTransaction &transaction, const char *operation) {
 	if (!storage->IsMainTable()) {
 		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);

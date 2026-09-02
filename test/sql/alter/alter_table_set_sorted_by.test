@@ -43,6 +43,37 @@ CREATE TABLE tbl(i INTEGER, j VARCHAR, g INTEGER GENERATED ALWAYS AS((i + 1))) S
 statement ok
 ALTER TABLE tbl SET SORTED BY (i ASC NULLS LAST)
 
+# All foreground UPDATE forms are rejected before they can invalidate run metadata.
+statement error
+UPDATE tbl SET i = i + 1
+----
+<REGEX>:.*UPDATE is not supported on table "tbl" because it uses SORTED BY.*
+
+statement error
+MERGE INTO tbl
+USING (VALUES (1, 'changed')) source(i, j)
+ON tbl.i = source.i
+WHEN MATCHED THEN UPDATE SET j = source.j
+----
+<REGEX>:.*UPDATE is not supported on table "tbl" because it uses SORTED BY.*
+
+statement ok
+CREATE TABLE update_driver(i INTEGER)
+
+statement ok
+CREATE TRIGGER update_sorted_target AFTER INSERT ON update_driver FOR EACH STATEMENT
+UPDATE tbl SET i = i + 1
+
+statement error
+INSERT INTO update_driver VALUES (1)
+----
+<REGEX>:.*UPDATE is not supported on table "tbl" because it uses SORTED BY.*
+
+query I
+SELECT count(*) FROM update_driver
+----
+0
+
 statement ok
 ALTER TABLE tbl SET SORTED BY (j)
 

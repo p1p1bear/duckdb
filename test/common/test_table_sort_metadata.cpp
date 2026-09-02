@@ -443,7 +443,9 @@ TEST_CASE("Create table parser preserves sort order modifiers", "[parser][sort_m
 	REQUIRE(parser.statements.size() == 1);
 	auto &statement = parser.statements[0]->Cast<CreateStatement>();
 	auto &info = statement.info->Cast<CreateTableInfo>();
-	REQUIRE(info.sort_keys.empty());
+	REQUIRE(info.sort_keys.size() == 2);
+	REQUIRE(info.sort_keys[0]->ToString() == "tenant_id");
+	REQUIRE(info.sort_keys[1]->ToString() == "event_time");
 	REQUIRE(info.sort_orders.size() == 2);
 	REQUIRE(info.sort_orders[0].type == OrderType::ORDER_DEFAULT);
 	REQUIRE(info.sort_orders[0].null_order == OrderByNullType::ORDER_DEFAULT);
@@ -456,7 +458,9 @@ TEST_CASE("Create table parser preserves sort order modifiers", "[parser][sort_m
 	stream.Rewind();
 	auto round_trip_info = BinaryDeserializer::Deserialize<CreateInfo>(stream);
 	auto &round_trip = round_trip_info->Cast<CreateTableInfo>();
-	REQUIRE(round_trip.sort_keys.empty());
+	REQUIRE(round_trip.sort_keys.size() == 2);
+	REQUIRE(round_trip.sort_keys[0]->ToString() == "tenant_id");
+	REQUIRE(round_trip.sort_keys[1]->ToString() == "event_time");
 	REQUIRE(round_trip.sort_orders.size() == 2);
 	REQUIRE(round_trip.sort_orders[1].type == OrderType::ASCENDING);
 	REQUIRE(round_trip.sort_orders[1].null_order == OrderByNullType::NULLS_LAST);
@@ -482,7 +486,8 @@ TEST_CASE("Create table sort key projections normalize and validate", "[storage]
 	auto legacy_output_info = BinaryDeserializer::Deserialize<CreateInfo>(stream);
 	auto &legacy_output = legacy_output_info->Cast<CreateTableInfo>();
 	REQUIRE(!legacy_output.sort_metadata);
-	REQUIRE(legacy_output.sort_keys.empty());
+	REQUIRE(legacy_output.sort_keys.size() == 1);
+	REQUIRE(legacy_output.sort_keys[0]->ToString() == "event_time");
 	REQUIRE(legacy_output.sort_orders.size() == 1);
 	REQUIRE(legacy_output.sort_orders[0].type == OrderType::ORDER_DEFAULT);
 	REQUIRE(legacy_output.sort_orders[0].null_order == OrderByNullType::ORDER_DEFAULT);
@@ -491,12 +496,12 @@ TEST_CASE("Create table sort key projections normalize and validate", "[storage]
 	mismatched.sort_keys.push_back(make_uniq<ColumnRefExpression>("event_time"));
 	mismatched.sort_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
 	                                    make_uniq<ColumnRefExpression>("other_column"));
-	REQUIRE_THROWS_AS(mismatched.NormalizeLegacySortKeys(), SerializationException);
+	REQUIRE_THROWS_AS(mismatched.NormalizeSortKeys(), SerializationException);
 
 	CreateTableInfo mixed(QualifiedName(Identifier("events")));
 	mixed.sort_metadata = TableSortCatalogMetadata();
 	mixed.sort_keys.push_back(make_uniq<ColumnRefExpression>("event_time"));
-	REQUIRE_THROWS_AS(mixed.NormalizeLegacySortKeys(), SerializationException);
+	REQUIRE_THROWS_AS(mixed.NormalizeSortKeys(), SerializationException);
 }
 
 static TableSortCatalogPostImage MakeSortPostImage() {
