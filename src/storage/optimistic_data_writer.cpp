@@ -67,7 +67,6 @@ optional_idx OptimisticWriteCollection::Append(DataChunk &chunk, TableAppendStat
 }
 
 void OptimisticWriteCollection::FinalizeAppend(TransactionData transaction, TableAppendState &state) {
-	auto collection_offset = GetAppendSpanCount();
 	auto physical_count = state.total_append_count;
 	auto organization = state.organization;
 	if (!organization.IsValid()) {
@@ -77,39 +76,27 @@ void OptimisticWriteCollection::FinalizeAppend(TransactionData transaction, Tabl
 		append_spans.reserve(append_spans.size() + 1);
 	}
 	collection->FinalizeAppend(transaction, state);
-	AddAppendSpan(collection_offset, physical_count, organization);
+	AddAppendSpan(physical_count, organization);
 }
 
-void OptimisticWriteCollection::AddAppendSpan(idx_t collection_offset, idx_t physical_count,
-                                              const AppendOrganization &organization) {
+void OptimisticWriteCollection::AddAppendSpan(idx_t physical_count, const AppendOrganization &organization) {
 	if (physical_count == 0) {
 		return;
 	}
 	if (!organization.IsValid()) {
 		throw InternalException("Invalid append organization span");
 	}
-	if (collection_offset != GetAppendSpanCount()) {
-		throw InternalException("Append organization spans must be contiguous");
-	}
 	if (!append_spans.empty() && append_spans.back().organization == organization) {
 		append_spans.back().physical_count += physical_count;
 		return;
 	}
-	append_spans.push_back({collection_offset, physical_count, organization});
-}
-
-idx_t OptimisticWriteCollection::GetAppendSpanCount() const {
-	if (append_spans.empty()) {
-		return 0;
-	}
-	auto &last_span = append_spans.back();
-	return last_span.collection_offset + last_span.physical_count;
+	append_spans.push_back({physical_count, organization});
 }
 
 void OptimisticWriteCollection::VerifyAppendSpans(idx_t expected_count) const {
 	idx_t offset = 0;
 	for (auto &span : append_spans) {
-		if (span.physical_count == 0 || span.collection_offset != offset || !span.organization.IsValid()) {
+		if (span.physical_count == 0 || !span.organization.IsValid()) {
 			throw InternalException("Invalid append organization span sequence");
 		}
 		offset += span.physical_count;
@@ -131,7 +118,7 @@ void OptimisticWriteCollection::ForceUnsorted(idx_t output_count) {
 		row_group->SetSortMetadata({}, false);
 	}
 	append_spans.clear();
-	AddAppendSpan(0, output_count, AppendOrganization::Unsorted());
+	AddAppendSpan(output_count, AppendOrganization::Unsorted());
 }
 
 OptimisticDataWriter::OptimisticDataWriter(ClientContext &context, DataTable &table) : context(context), table(table) {
@@ -284,7 +271,6 @@ void OptimisticWriteCollection::MergeStorage(OptimisticWriteCollection &merge_co
 		// no rows to merge - done
 		return;
 	}
-	auto target_base = GetAppendSpanCount();
 	append_spans.reserve(append_spans.size() + merge_collection.append_spans.size());
 	idx_t current_row_group_count = collection->GetRowGroupCount();
 	// now we merge the target collection into this one - take over any unflushed row groups but adjust their index
@@ -298,7 +284,7 @@ void OptimisticWriteCollection::MergeStorage(OptimisticWriteCollection &merge_co
 	// finally perform the actual merge
 	collection->MergeStorage(merge_row_groups, nullptr, nullptr);
 	for (auto &span : merge_collection.append_spans) {
-		AddAppendSpan(target_base + span.collection_offset, span.physical_count, span.organization);
+		AddAppendSpan(span.physical_count, span.organization);
 	}
 	merge_collection.append_spans.clear();
 }

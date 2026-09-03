@@ -49,8 +49,7 @@ struct OptimisticWriteCollection {
 	                      const AppendOrganization &organization = AppendOrganization::Unsorted());
 	optional_idx Append(DataChunk &chunk, TableAppendState &state);
 	void FinalizeAppend(TransactionData transaction, TableAppendState &state);
-	void AddAppendSpan(idx_t collection_offset, idx_t physical_count, const AppendOrganization &organization);
-	idx_t GetAppendSpanCount() const;
+	void AddAppendSpan(idx_t physical_count, const AppendOrganization &organization);
 	void VerifyAppendSpans(idx_t expected_count) const;
 	void ForceUnsorted(idx_t output_count);
 	void FinalizeFlush();

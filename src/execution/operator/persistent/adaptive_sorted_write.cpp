@@ -34,14 +34,10 @@ bool InsertOrderToken::operator<(const InsertOrderToken &other) const {
 	return chunk_index < other.chunk_index;
 }
 
-AdaptiveSortedWrite::AdaptiveSortedWrite(ClientContext &context, DuckTableEntry &table_p,
-                                         vector<LogicalType> input_types_p,
+AdaptiveSortedWrite::AdaptiveSortedWrite(DuckTableEntry &table_p, vector<LogicalType> input_types_p,
                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints_p)
     : table(table_p), input_types(std::move(input_types_p)), bound_constraints(bound_constraints_p),
-      phase(AdaptiveInsertPhase::BUFFERING), total_count(0), row_group_size(table.GetStorage().GetRowGroupSize()),
-      staged_count(0), next_arrival_token(0), token_mode_initialized(false), uses_batch_tokens(false),
-      run_id(INVALID_SORT_RUN_ID) {
-	(void)context;
+      row_group_size(table.GetStorage().GetRowGroupSize()) {
 	auto metadata = table.GetSortMetadata();
 	if (!metadata || !metadata->IsEnabled()) {
 		throw InternalException("Adaptive sorted write requires an enabled SORTED BY definition");
@@ -62,10 +58,10 @@ AdaptiveSortedWrite::~AdaptiveSortedWrite() {
 
 InsertOrderToken AdaptiveSortedWrite::ResolveOrderToken(const InsertOrderToken &order_token) {
 	auto has_batch_token = order_token.batch_index.IsValid();
-	if (!token_mode_initialized) {
-		token_mode_initialized = true;
-		uses_batch_tokens = has_batch_token;
-	} else if (uses_batch_tokens != has_batch_token) {
+	auto requested_mode = has_batch_token ? InsertOrderMode::BATCH : InsertOrderMode::ARRIVAL;
+	if (order_mode == InsertOrderMode::UNSET) {
+		order_mode = requested_mode;
+	} else if (order_mode != requested_mode) {
 		throw InternalException("Adaptive sorted write cannot mix arrival and batch order tokens");
 	}
 	if (has_batch_token) {
@@ -103,8 +99,6 @@ void AdaptiveSortedWrite::AppendOwned(ClientContext &context, DataChunk &chunk, 
 	if (!staging.emplace(order_token, std::move(owned)).second) {
 		throw InternalException("Adaptive sorted write received a duplicate insert order token");
 	}
-	staged_count += count;
-	D_ASSERT(staged_count <= row_group_size);
 }
 
 void AdaptiveSortedWrite::SetFailure(std::exception_ptr exception) {
@@ -298,7 +292,6 @@ void AdaptiveSortedWrite::RegisterDrainPartition(idx_t partition_index, Physical
 		throw InternalException("Adaptive sorted write registered an invalid drain partition");
 	}
 	drain_partitions.push_back({partition_index, collection_index, row_count});
-	drained_row_count += row_count;
 }
 
 void AdaptiveSortedWrite::RegisterDrainWriter(unique_ptr<OptimisticDataWriter> writer) {
@@ -328,8 +321,7 @@ void AdaptiveSortedWrite::PrepareParallelDrain(ClientContext &context) {
 void AdaptiveSortedWrite::FinishParallelDrain(ClientContext &context) {
 	{
 		lock_guard<mutex> guard(lock);
-		if (phase != AdaptiveInsertPhase::DRAINING || drained_row_count != total_count ||
-		    drain_partitions.size() != expected_partition_count) {
+		if (phase != AdaptiveInsertPhase::DRAINING || drain_partitions.size() != expected_partition_count) {
 			throw InternalException("Adaptive sorted write did not drain every sorted partition");
 		}
 	}
@@ -529,7 +521,6 @@ SinkFinalizeType AdaptiveSortedWrite::FinalizeInternal(Pipeline &pipeline, Event
 			ThrowFailure(guard);
 		}
 		if (phase == AdaptiveInsertPhase::BUFFERING) {
-			D_ASSERT(staged_count == total_count);
 			owned_staging = std::move(staging);
 			phase = AdaptiveInsertPhase::DRAINING;
 		} else if (phase == AdaptiveInsertPhase::SORTING) {
@@ -571,16 +562,6 @@ SinkFinalizeType AdaptiveSortedWrite::Finalize(Pipeline &pipeline, Event &event,
 idx_t AdaptiveSortedWrite::TotalCount() const {
 	lock_guard<mutex> guard(lock);
 	return total_count;
-}
-
-AdaptiveInsertPhase AdaptiveSortedWrite::GetPhase() const {
-	lock_guard<mutex> guard(lock);
-	return phase;
-}
-
-sort_run_id_t AdaptiveSortedWrite::GetRunId() const {
-	lock_guard<mutex> guard(lock);
-	return run_id;
 }
 
 } // namespace duckdb

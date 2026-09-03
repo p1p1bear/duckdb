@@ -228,7 +228,7 @@ public:
 		}
 		auto collection = optimistic_writer->CreateCollection(table_entry.GetStorage(), insert_types);
 		collection->collection->InitializeEmpty();
-		collection->InitializeAppend(current_append_state, AppendOrganization::Unsorted());
+		collection->InitializeAppend(current_append_state);
 
 		auto &data_table = table_entry.GetStorage();
 		collection_index = data_table.CreateOptimisticCollection(context, std::move(collection));
@@ -454,7 +454,7 @@ unique_ptr<GlobalSinkState> PhysicalBatchInsert::GetGlobalSinkState(ClientContex
 	auto minimum_memory_per_thread = table->GetColumns().PhysicalColumnCount() * MINIMUM_MEMORY_PER_COLUMN;
 	auto result = make_uniq<BatchInsertGlobalState>(context, *table, minimum_memory_per_thread);
 	if (table->SortEnabled() && allow_direct_sort) {
-		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
 	}
 	return std::move(result);
 }
@@ -729,7 +729,7 @@ SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event,
 	// We are writing a small amount of data to disk.
 	// Thus, we append directly to the transaction local storage.
 	LocalAppendState append_state;
-	data_table.InitializeLocalAppend(append_state, table, context, bound_constraints, AppendOrganization::Unsorted());
+	data_table.InitializeLocalAppend(append_state, table, context, bound_constraints);
 	auto &transaction = DuckTransaction::Get(context, table.catalog);
 	for (auto &entry : g_state.collections) {
 		if (entry.type != RowGroupBatchType::NOT_FLUSHED) {

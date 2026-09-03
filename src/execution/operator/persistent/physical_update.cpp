@@ -264,8 +264,7 @@ SinkResultType PhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
 	}
 	mock_chunk.CheckCardinality(update_count);
 
-	table.LocalAppend(tableref, context.client, mock_chunk, bound_constraints, del_row_ids, delete_chunk,
-	                  AppendOrganization::Unsorted());
+	table.LocalAppend(tableref, context.client, mock_chunk, bound_constraints, del_row_ids, delete_chunk);
 	if (return_chunk) {
 		if (capture_old_rows) {
 			// Apply the dedup selection vector to the OLD columns so they line up with the NEW image.

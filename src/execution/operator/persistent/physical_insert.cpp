@@ -128,7 +128,7 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 		table->VerifyUpdateAllowed();
 	}
 	if (table->SortEnabled() && allow_direct_sort) {
-		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(context, *table, insert_types, bound_constraints);
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
 	}
 	return std::move(result);
 }
@@ -297,8 +297,7 @@ static idx_t PerformOnConflictAction(InsertLocalState &lstate, InsertGlobalState
 	if (!op.parallel && op.return_chunk) {
 		gstate.return_collection.Append(append_chunk);
 	}
-	data_table.LocalAppend(table, context.client, append_chunk, op.bound_constraints, row_ids, append_chunk,
-	                       AppendOrganization::Unsorted());
+	data_table.LocalAppend(table, context.client, append_chunk, op.bound_constraints, row_ids, append_chunk);
 	return update_chunk.size();
 }
 
@@ -665,7 +664,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 		// Create the local row group collection.
 		auto optimistic_collection = lstate.optimistic_writer->CreateCollection(storage, insert_types);
 		optimistic_collection->collection->InitializeEmpty();
-		optimistic_collection->InitializeAppend(lstate.local_append_state, AppendOrganization::Unsorted());
+		optimistic_collection->InitializeAppend(lstate.local_append_state);
 
 		lstate.collection_index =
 		    data_table.CreateOptimisticCollection(context.client, std::move(optimistic_collection));
@@ -714,8 +713,7 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	if (append_count < row_group_size) {
 		// we have few rows - append to the local storage directly
 		LocalAppendState append_state;
-		storage.InitializeLocalAppend(append_state, table, context.client, bound_constraints,
-		                              AppendOrganization::Unsorted());
+		storage.InitializeLocalAppend(append_state, table, context.client, bound_constraints);
 		auto &transaction = DuckTransaction::Get(context.client, table.catalog);
 		for (auto &insert_chunk : collection.Chunks(transaction)) {
 			storage.LocalAppend(append_state, table, context.client, insert_chunk, false);

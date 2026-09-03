@@ -228,10 +228,6 @@ TEST_CASE("Optimistic append spans survive ownership transfer and unsorted downg
 	target->MergeStorage(*second_source);
 	target->VerifyAppendSpans(6);
 	REQUIRE(target->append_spans.size() == 4);
-	REQUIRE(target->append_spans[0].collection_offset == 0);
-	REQUIRE(target->append_spans[1].collection_offset == 1);
-	REQUIRE(target->append_spans[2].collection_offset == 3);
-	REQUIRE(target->append_spans[3].collection_offset == 4);
 	REQUIRE(first_source->append_spans.empty());
 	REQUIRE(second_source->append_spans.empty());
 

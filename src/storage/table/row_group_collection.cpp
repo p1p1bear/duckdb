@@ -928,14 +928,13 @@ void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppe
 
 void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state,
                                           const AppendOrganization &organization) {
-	if (state.organization_initialized) {
+	if (state.start_row_group) {
 		throw InternalException("Table append state is already initialized");
 	}
 	if (!organization.IsValid()) {
 		throw InternalException("Invalid append organization");
 	}
 	state.organization = organization;
-	state.organization_initialized = true;
 	auto next_row_id = this->next_row_id.load();
 	D_ASSERT(next_row_id >= total_rows.load());
 	state.row_start = UnsafeNumericCast<row_t>(next_row_id);
@@ -991,7 +990,7 @@ void RowGroupCollection::InitializeAppend(TableAppendState &state, const AppendO
 }
 
 optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &state) {
-	if (!state.organization_initialized) {
+	if (!state.start_row_group) {
 		throw InternalException("Table append state is not initialized");
 	}
 	const idx_t row_group_size = GetRowGroupSize();
@@ -1018,7 +1017,8 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 		}
 		// finalize the append state for the current row group
 		current_row_group.FinalizeAppend(state.row_group_append_state);
-		current_row_group.SetSortMetadata(state.organization.GetSortMetadata(), state.organization.seal_last_row_group);
+		auto sort_metadata = state.organization.GetSortMetadata();
+		current_row_group.SetSortMetadata(sort_metadata, sort_metadata.IsSorted());
 		// we expect max 1 iteration of this loop (i.e. a single chunk should never overflow more than one
 		// row_group)
 		D_ASSERT(chunk.size() == remaining + append_count);
@@ -1050,7 +1050,7 @@ optional_idx RowGroupCollection::Append(DataChunk &chunk, TableAppendState &stat
 }
 
 void RowGroupCollection::FinalizeCompletedAppendRowGroup(TableAppendState &state, idx_t row_group_index) {
-	if (!state.organization_initialized || state.prefinalized_append_count > state.total_append_count ||
+	if (!state.start_row_group || state.prefinalized_append_count > state.total_append_count ||
 	    row_group_size > state.total_append_count - state.prefinalized_append_count) {
 		throw InternalException("Cannot pre-finalize an invalid row group append");
 	}
@@ -1064,14 +1064,15 @@ void RowGroupCollection::FinalizeCompletedAppendRowGroup(TableAppendState &state
 }
 
 void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppendState &state) {
-	if (!state.organization_initialized) {
+	if (!state.start_row_group) {
 		throw InternalException("Table append state is not initialized");
 	}
 	// first finalize the append of the final row group we appended to
 	auto &last_row_group = state.row_group_append_state.row_group->GetNode();
 	last_row_group.FinalizeAppend(state.row_group_append_state);
 	if (state.total_append_count > 0) {
-		last_row_group.SetSortMetadata(state.organization.GetSortMetadata(), state.organization.seal_last_row_group);
+		auto sort_metadata = state.organization.GetSortMetadata();
+		last_row_group.SetSortMetadata(sort_metadata, sort_metadata.IsSorted());
 	}
 
 	// now push version info into all row groups
@@ -1094,7 +1095,6 @@ void RowGroupCollection::FinalizeAppend(TransactionData transaction, TableAppend
 	state.total_append_count = 0;
 	state.prefinalized_append_count = 0;
 	state.start_row_group = nullptr;
-	state.organization_initialized = false;
 
 	auto local_stats_lock = state.stats.GetLock();
 	auto global_stats_lock = stats.GetLock();

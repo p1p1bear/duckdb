@@ -49,7 +49,7 @@ class AdaptiveSortedWrite {
 	friend class AdaptiveSortedWriteDrainEvent;
 
 public:
-	AdaptiveSortedWrite(ClientContext &context, DuckTableEntry &table, vector<LogicalType> input_types,
+	AdaptiveSortedWrite(DuckTableEntry &table, vector<LogicalType> input_types,
 	                    const vector<unique_ptr<BoundConstraint>> &bound_constraints);
 	~AdaptiveSortedWrite();
 
@@ -61,11 +61,10 @@ public:
 	                          InterruptState &interrupt_state);
 
 	idx_t TotalCount() const;
-	AdaptiveInsertPhase GetPhase() const;
-	sort_run_id_t GetRunId() const;
 
 private:
 	using OrderedInsertStaging = std::map<InsertOrderToken, unique_ptr<DataChunk>>;
+	enum class InsertOrderMode : uint8_t { UNSET, ARRIVAL, BATCH };
 	struct DrainPartition {
 		idx_t partition_index;
 		PhysicalIndex collection_index;
@@ -105,22 +104,19 @@ private:
 
 	mutable mutex lock;
 	std::condition_variable phase_changed;
-	AdaptiveInsertPhase phase;
-	idx_t total_count;
+	AdaptiveInsertPhase phase = AdaptiveInsertPhase::BUFFERING;
+	idx_t total_count = 0;
 	idx_t row_group_size;
-	idx_t staged_count;
-	idx_t next_arrival_token;
-	bool token_mode_initialized;
-	bool uses_batch_tokens;
+	idx_t next_arrival_token = 0;
+	InsertOrderMode order_mode = InsertOrderMode::UNSET;
 	bool write_gate_held = false;
-	sort_run_id_t run_id;
+	sort_run_id_t run_id = INVALID_SORT_RUN_ID;
 	OrderedInsertStaging staging;
 	unique_ptr<Sort> sort;
 	unique_ptr<GlobalSinkState> sort_sink;
 	unique_ptr<GlobalSourceState> sort_source;
 	idx_t drain_task_count = 0;
 	idx_t expected_partition_count = 0;
-	idx_t drained_row_count = 0;
 	bool single_collection_drain = false;
 	vector<DrainPartition> drain_partitions;
 	vector<unique_ptr<OptimisticDataWriter>> drain_writers;

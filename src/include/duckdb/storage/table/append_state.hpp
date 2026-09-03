@@ -33,14 +33,13 @@ struct TableAppendState;
 struct AppendOrganization {
 	sort_order_id_t sort_order_id = INVALID_SORT_ORDER_ID;
 	sort_run_id_t run_id = INVALID_SORT_RUN_ID;
-	bool seal_last_row_group = false;
 
 	static AppendOrganization Unsorted() {
 		return {};
 	}
 
 	static AppendOrganization Sorted(sort_order_id_t order_id, sort_run_id_t run_id_p) {
-		return {order_id, run_id_p, true};
+		return {order_id, run_id_p};
 	}
 
 	RowGroupSortMetadata GetSortMetadata() const {
@@ -48,13 +47,11 @@ struct AppendOrganization {
 	}
 
 	bool IsValid() const {
-		auto metadata = GetSortMetadata();
-		return metadata.IsValid() && metadata.IsSorted() == seal_last_row_group;
+		return GetSortMetadata().IsValid();
 	}
 
 	bool operator==(const AppendOrganization &other) const {
-		return sort_order_id == other.sort_order_id && run_id == other.run_id &&
-		       seal_last_row_group == other.seal_last_row_group;
+		return sort_order_id == other.sort_order_id && run_id == other.run_id;
 	}
 
 	bool operator!=(const AppendOrganization &other) const {
@@ -63,7 +60,6 @@ struct AppendOrganization {
 };
 
 struct AppendOrganizationSpan {
-	idx_t collection_offset = 0;
 	idx_t physical_count = 0;
 	AppendOrganization organization;
 };
@@ -162,7 +158,6 @@ struct TableAppendState {
 	//! Cached hash vector
 	Vector hashes;
 	AppendOrganization organization;
-	bool organization_initialized = false;
 };
 
 struct ConstraintState {
