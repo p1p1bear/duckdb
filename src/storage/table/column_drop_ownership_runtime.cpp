@@ -6,7 +6,7 @@ namespace duckdb {
 
 bool ColumnDropOwnershipRuntimeTree::ApplyTokenPlan(
     const vector<shared_ptr<RowGroupColumnDropOwnership>> &canonical_tokens) noexcept {
-	if (!shape || nodes.size() != shape->NodeCount() || canonical_tokens.size() != nodes.size()) {
+	if (canonical_tokens.size() != nodes.size()) {
 		return false;
 	}
 	for (idx_t node_index = 0; node_index < nodes.size(); node_index++) {

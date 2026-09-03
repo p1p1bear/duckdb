@@ -25,10 +25,9 @@ static_assert(!std::is_copy_constructible<BundleTestShape>::value, "ownership sh
 static_assert(!std::is_copy_constructible<BundleTestBundle>::value, "ownership bundles must have stable identity");
 static_assert(!std::is_constructible<BundleTestLayoutTag, ColumnDropOwnershipRuntimeKind, LogicalType>::value,
               "layout observers must provide an explicit runtime discriminator");
-static_assert(
-    noexcept(std::declval<BundleTestBundle &>().Bind(std::declval<const duckdb::shared_ptr<const BundleTestShape> &>(),
-                                                     std::declval<BundleTestTokenPlan &>())),
-    "ownership bundle binding must be noexcept");
+static_assert(noexcept(std::declval<BundleTestBundle &>().Bind(std::declval<duckdb::unique_ptr<BundleTestShape>>(),
+                                                               std::declval<BundleTestTokenPlan &>())),
+              "ownership bundle binding must be noexcept");
 
 static BundleTestTokenPtr MakeBundleTestToken() {
 	return make_shared_ptr<BundleTestToken>();
@@ -147,7 +146,8 @@ static BundleTestDescriptors MakeBundleTestVariantTree(bool shredded) {
 	return result;
 }
 
-TEST_CASE("Column drop ownership shape captures mixed direct tokens", "[storage][drop_ownership_bundle]") {
+TEST_CASE("Column drop ownership shape captures existing tokens without allocating missing tokens",
+          "[storage][drop_ownership_bundle]") {
 	auto root = MakeBundleTestToken();
 	auto element = MakeBundleTestToken();
 	auto shape = BundleTestShape::Capture(MakeBundleTestListTree(root, nullptr, element));
@@ -156,9 +156,8 @@ TEST_CASE("Column drop ownership shape captures mixed direct tokens", "[storage]
 	auto &nodes = shape->GetNodes();
 	REQUIRE(nodes[0].direct_token == root);
 	REQUIRE(nodes[2].direct_token == element);
-	REQUIRE(nodes[1].direct_token);
-	REQUIRE(nodes[3].direct_token);
-	REQUIRE(nodes[1].direct_token != nodes[3].direct_token);
+	REQUIRE(!nodes[1].direct_token);
+	REQUIRE(!nodes[3].direct_token);
 	REQUIRE(nodes[0].layout_tag.logical_type == LogicalType::LIST(LogicalType::DECIMAL(10, 2)));
 }
 
@@ -280,109 +279,58 @@ TEST_CASE("Column drop ownership bundle verifies and maps an exact observed shap
 	BundleTestTokenPlan plan(canonical_shape->NodeCount(), sentinel);
 	BundleTestBundle bundle;
 
-	REQUIRE(bundle.Bind(canonical_shape, plan) == BundleTestBindResult::ADOPTED);
-	for (idx_t node_index = 0; node_index < plan.size(); node_index++) {
-		REQUIRE(plan[node_index] == canonical_shape->GetNodes()[node_index].direct_token);
-	}
+	REQUIRE(bundle.Bind(std::move(canonical_shape), plan) == BundleTestBindResult::ADOPTED);
+	auto canonical_plan = plan;
 
-	auto &canonical_nodes = canonical_shape->GetNodes();
-	auto observed_shape = BundleTestShape::Capture(
-	    MakeBundleTestListTree(canonical_nodes[0].direct_token, nullptr, canonical_nodes[2].direct_token));
-	REQUIRE(bundle.Bind(observed_shape, plan) == BundleTestBindResult::VERIFIED);
-	for (idx_t node_index = 0; node_index < plan.size(); node_index++) {
-		REQUIRE(plan[node_index] == canonical_shape->GetNodes()[node_index].direct_token);
-	}
+	auto observed_shape =
+	    BundleTestShape::Capture(MakeBundleTestListTree(canonical_plan[0], nullptr, canonical_plan[2]));
+	REQUIRE(bundle.Bind(std::move(observed_shape), plan) == BundleTestBindResult::VERIFIED);
+	REQUIRE(plan == canonical_plan);
 }
 
 TEST_CASE("Mixed existing ownership requires explicit bundle initialization", "[storage][drop_ownership_bundle]") {
 	auto existing_root = MakeBundleTestToken();
-	auto existing_shape = BundleTestShape::Capture(MakeBundleTestListTree(existing_root));
+	auto mismatched_shape = BundleTestShape::Capture(MakeBundleTestListTree(existing_root));
 	auto sentinel = MakeBundleTestToken();
-	BundleTestTokenPlan plan(existing_shape->NodeCount(), sentinel);
+	BundleTestTokenPlan plan(mismatched_shape->NodeCount(), sentinel);
 	BundleTestBundle bundle;
 
-	REQUIRE(bundle.Bind(existing_shape, plan) == BundleTestBindResult::MISMATCH);
+	REQUIRE(bundle.Bind(std::move(mismatched_shape), plan) == BundleTestBindResult::MISMATCH);
 	for (auto &token : plan) {
 		REQUIRE(token == sentinel);
 	}
 
-	REQUIRE_NOTHROW(bundle.Initialize(existing_shape, plan));
+	auto existing_shape = BundleTestShape::Capture(MakeBundleTestListTree(existing_root));
+	REQUIRE_NOTHROW(bundle.Initialize(std::move(existing_shape), plan));
 	REQUIRE(plan[0] == existing_root);
-	for (idx_t node_index = 0; node_index < plan.size(); node_index++) {
-		REQUIRE(plan[node_index] == existing_shape->GetNodes()[node_index].direct_token);
+	for (auto &token : plan) {
+		REQUIRE(token);
 	}
 
 	auto lazy_shape = BundleTestShape::Capture(MakeBundleTestListTree());
 	BundleTestTokenPlan lazy_plan(lazy_shape->NodeCount(), sentinel);
-	REQUIRE(bundle.Bind(lazy_shape, lazy_plan) == BundleTestBindResult::VERIFIED);
+	REQUIRE(bundle.Bind(std::move(lazy_shape), lazy_plan) == BundleTestBindResult::VERIFIED);
 	for (idx_t node_index = 0; node_index < lazy_plan.size(); node_index++) {
 		REQUIRE(lazy_plan[node_index] == plan[node_index]);
 	}
 
 	auto second_shape = BundleTestShape::Capture(MakeBundleTestListTree());
 	BundleTestTokenPlan already_bound_plan(second_shape->NodeCount(), sentinel);
-	REQUIRE_THROWS_AS(bundle.Initialize(second_shape, already_bound_plan), InternalException);
+	REQUIRE_THROWS_AS(bundle.Initialize(std::move(second_shape), already_bound_plan), InternalException);
 	for (auto &token : already_bound_plan) {
-		REQUIRE(token == sentinel);
-	}
-
-	BundleTestBundle other_bundle;
-	BundleTestTokenPlan foreign_plan(existing_shape->NodeCount(), sentinel);
-	REQUIRE_THROWS_AS(other_bundle.Initialize(existing_shape, foreign_plan), InternalException);
-	for (auto &token : foreign_plan) {
 		REQUIRE(token == sentinel);
 	}
 
 	BundleTestBundle lazy_first_bundle;
 	auto lazy_first_shape = BundleTestShape::Capture(MakeBundleTestListTree());
 	BundleTestTokenPlan lazy_first_plan(lazy_first_shape->NodeCount());
-	REQUIRE(lazy_first_bundle.Bind(lazy_first_shape, lazy_first_plan) == BundleTestBindResult::ADOPTED);
+	REQUIRE(lazy_first_bundle.Bind(std::move(lazy_first_shape), lazy_first_plan) == BundleTestBindResult::ADOPTED);
 	auto late_existing_shape = BundleTestShape::Capture(MakeBundleTestListTree(MakeBundleTestToken()));
 	BundleTestTokenPlan late_initialize_plan(late_existing_shape->NodeCount(), sentinel);
-	REQUIRE_THROWS_AS(lazy_first_bundle.Initialize(late_existing_shape, late_initialize_plan), InternalException);
+	REQUIRE_THROWS_AS(lazy_first_bundle.Initialize(std::move(late_existing_shape), late_initialize_plan),
+	                  InternalException);
 	for (auto &token : late_initialize_plan) {
 		REQUIRE(token == sentinel);
-	}
-}
-
-TEST_CASE("A captured shape can affiliate with only one bundle", "[storage][drop_ownership_bundle]") {
-	auto candidate = BundleTestShape::Capture(MakeBundleTestListTree());
-	BundleTestBundle first_bundle;
-	BundleTestBundle second_bundle;
-	auto first_sentinel = MakeBundleTestToken();
-	auto second_sentinel = MakeBundleTestToken();
-	BundleTestTokenPlan first_plan(candidate->NodeCount(), first_sentinel);
-	BundleTestTokenPlan second_plan(candidate->NodeCount(), second_sentinel);
-	BundleTestBindResult first_result = BundleTestBindResult::MISMATCH;
-	BundleTestBindResult second_result = BundleTestBindResult::MISMATCH;
-	std::atomic<bool> start(false);
-
-	std::thread first([&]() {
-		while (!start.load()) {
-			std::this_thread::yield();
-		}
-		first_result = first_bundle.Bind(candidate, first_plan);
-	});
-	std::thread second([&]() {
-		while (!start.load()) {
-			std::this_thread::yield();
-		}
-		second_result = second_bundle.Bind(candidate, second_plan);
-	});
-	start = true;
-	first.join();
-	second.join();
-
-	REQUIRE((first_result == BundleTestBindResult::ADOPTED) != (second_result == BundleTestBindResult::ADOPTED));
-	REQUIRE((first_result == BundleTestBindResult::MISMATCH) != (second_result == BundleTestBindResult::MISMATCH));
-	for (idx_t node_index = 0; node_index < candidate->NodeCount(); node_index++) {
-		if (first_result == BundleTestBindResult::ADOPTED) {
-			REQUIRE(first_plan[node_index] == candidate->GetNodes()[node_index].direct_token);
-			REQUIRE(second_plan[node_index] == second_sentinel);
-		} else {
-			REQUIRE(first_plan[node_index] == first_sentinel);
-			REQUIRE(second_plan[node_index] == candidate->GetNodes()[node_index].direct_token);
-		}
 	}
 }
 
@@ -404,7 +352,7 @@ TEST_CASE("Explicit initialization races safely with lazy first binding", "[stor
 			std::this_thread::yield();
 		}
 		try {
-			bundle.Initialize(initialized_candidate, initialize_plan);
+			bundle.Initialize(std::move(initialized_candidate), initialize_plan);
 			initialize_succeeded = true;
 		} catch (...) {
 			initialize_failed = true;
@@ -414,7 +362,7 @@ TEST_CASE("Explicit initialization races safely with lazy first binding", "[stor
 		while (!start.load()) {
 			std::this_thread::yield();
 		}
-		bind_result = bundle.Bind(lazy_candidate, lazy_plan);
+		bind_result = bundle.Bind(std::move(lazy_candidate), lazy_plan);
 	});
 	start = true;
 	initializer.join();
@@ -440,27 +388,29 @@ TEST_CASE("Column drop ownership bundle rejects conflicting existing tokens with
           "[storage][drop_ownership_bundle]") {
 	auto canonical_shape = BundleTestShape::Capture(MakeBundleTestListTree());
 	BundleTestBundle bundle;
-	BundleTestTokenPlan initial_plan(canonical_shape->NodeCount());
-	REQUIRE(bundle.Bind(canonical_shape, initial_plan) == BundleTestBindResult::ADOPTED);
+	auto node_count = canonical_shape->NodeCount();
+	BundleTestTokenPlan initial_plan(node_count);
+	REQUIRE(bundle.Bind(std::move(canonical_shape), initial_plan) == BundleTestBindResult::ADOPTED);
 
 	auto foreign = MakeBundleTestToken();
 	auto conflicting_shape = BundleTestShape::Capture(MakeBundleTestListTree(foreign));
 	auto sentinel = MakeBundleTestToken();
-	BundleTestTokenPlan unchanged_plan(canonical_shape->NodeCount(), sentinel);
-	REQUIRE(bundle.Bind(conflicting_shape, unchanged_plan) == BundleTestBindResult::MISMATCH);
+	BundleTestTokenPlan unchanged_plan(node_count, sentinel);
+	REQUIRE(bundle.Bind(std::move(conflicting_shape), unchanged_plan) == BundleTestBindResult::MISMATCH);
 	for (auto &token : unchanged_plan) {
 		REQUIRE(token == sentinel);
 	}
 
 	auto wrong_type_shape = BundleTestShape::Capture(
 	    MakeBundleTestListTree(nullptr, nullptr, nullptr, nullptr, LogicalType::DECIMAL(12, 2)));
-	REQUIRE(bundle.Bind(wrong_type_shape, unchanged_plan) == BundleTestBindResult::MISMATCH);
+	REQUIRE(bundle.Bind(std::move(wrong_type_shape), unchanged_plan) == BundleTestBindResult::MISMATCH);
 	for (auto &token : unchanged_plan) {
 		REQUIRE(token == sentinel);
 	}
 
 	BundleTestTokenPlan wrong_size(1, sentinel);
-	REQUIRE(bundle.Bind(canonical_shape, wrong_size) == BundleTestBindResult::MISMATCH);
+	auto same_shape = BundleTestShape::Capture(MakeBundleTestListTree());
+	REQUIRE(bundle.Bind(std::move(same_shape), wrong_size) == BundleTestBindResult::MISMATCH);
 	REQUIRE(wrong_size[0] == sentinel);
 }
 
@@ -468,12 +418,12 @@ TEST_CASE("Column drop ownership bundle compares the exact runtime layout value"
 	auto canonical_shape = BundleTestShape::Capture(MakeBundleTestGeometryTree(GeometryStorageType::WKB));
 	BundleTestBundle bundle;
 	BundleTestTokenPlan canonical_plan(canonical_shape->NodeCount());
-	REQUIRE(bundle.Bind(canonical_shape, canonical_plan) == BundleTestBindResult::ADOPTED);
+	REQUIRE(bundle.Bind(std::move(canonical_shape), canonical_plan) == BundleTestBindResult::ADOPTED);
 
 	auto different_layout = BundleTestShape::Capture(MakeBundleTestGeometryTree(GeometryStorageType::SPATIAL));
 	auto sentinel = MakeBundleTestToken();
 	BundleTestTokenPlan unchanged_plan(different_layout->NodeCount(), sentinel);
-	REQUIRE(bundle.Bind(different_layout, unchanged_plan) == BundleTestBindResult::MISMATCH);
+	REQUIRE(bundle.Bind(std::move(different_layout), unchanged_plan) == BundleTestBindResult::MISMATCH);
 	for (auto &token : unchanged_plan) {
 		REQUIRE(token == sentinel);
 	}
@@ -483,11 +433,11 @@ TEST_CASE("Spatial geometry reload preserves canonical ownership tokens", "[stor
 	auto checkpoint_shape = BundleTestShape::Capture(MakeBundleTestGeometryTree(GeometryStorageType::SPATIAL, true));
 	BundleTestBundle bundle;
 	BundleTestTokenPlan checkpoint_plan(checkpoint_shape->NodeCount());
-	REQUIRE_NOTHROW(bundle.Initialize(checkpoint_shape, checkpoint_plan));
+	REQUIRE_NOTHROW(bundle.Initialize(std::move(checkpoint_shape), checkpoint_plan));
 
 	auto restart_shape = BundleTestShape::Capture(MakeBundleTestGeometryTree(GeometryStorageType::SPATIAL));
 	BundleTestTokenPlan restart_plan(restart_shape->NodeCount());
-	REQUIRE(bundle.Bind(restart_shape, restart_plan) == BundleTestBindResult::VERIFIED);
+	REQUIRE(bundle.Bind(std::move(restart_shape), restart_plan) == BundleTestBindResult::VERIFIED);
 	REQUIRE(restart_plan.size() == checkpoint_plan.size());
 	for (idx_t node_index = 0; node_index < restart_plan.size(); node_index++) {
 		REQUIRE(restart_plan[node_index] == checkpoint_plan[node_index]);
@@ -508,13 +458,13 @@ TEST_CASE("Concurrent column drop ownership binding adopts only one candidate", 
 		while (!start.load()) {
 			std::this_thread::yield();
 		}
-		first_result = bundle.Bind(first_shape, first_plan);
+		first_result = bundle.Bind(std::move(first_shape), first_plan);
 	});
 	std::thread second([&]() {
 		while (!start.load()) {
 			std::this_thread::yield();
 		}
-		second_result = bundle.Bind(second_shape, second_plan);
+		second_result = bundle.Bind(std::move(second_shape), second_plan);
 	});
 	start = true;
 	first.join();

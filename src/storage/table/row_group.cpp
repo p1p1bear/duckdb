@@ -42,7 +42,7 @@ shared_ptr<ColumnDropOwnershipBundle> RowGroup::InitializeColumnDropOwnership(Co
 	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
 	auto bundle = make_shared_ptr<ColumnDropOwnershipBundle>();
 	vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
-	bundle->Initialize(runtime_tree.shape, canonical_tokens);
+	bundle->Initialize(std::move(runtime_tree.shape), canonical_tokens);
 	if (!runtime_tree.ApplyTokenPlan(canonical_tokens)) {
 		throw InternalException("Failed to initialize column drop ownership tokens");
 	}
@@ -52,7 +52,7 @@ shared_ptr<ColumnDropOwnershipBundle> RowGroup::InitializeColumnDropOwnership(Co
 void RowGroup::BindColumnDropOwnership(ColumnData &column, ColumnDropOwnershipBundle &bundle) {
 	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
 	vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
-	if (bundle.Bind(runtime_tree.shape, canonical_tokens) == ColumnDropOwnershipBindResult::MISMATCH ||
+	if (bundle.Bind(std::move(runtime_tree.shape), canonical_tokens) == ColumnDropOwnershipBindResult::MISMATCH ||
 	    !runtime_tree.ApplyTokenPlan(canonical_tokens)) {
 		throw InternalException("Loaded column does not match its drop ownership bundle");
 	}

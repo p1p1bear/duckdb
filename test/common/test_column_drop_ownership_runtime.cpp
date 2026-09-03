@@ -306,7 +306,8 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 
 			vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
 			auto bundle = pre_checkpoint_row_group->GetColumnDropOwnershipBundle(0);
-			REQUIRE(bundle->Bind(runtime_tree.shape, canonical_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
+			REQUIRE(bundle->Bind(std::move(runtime_tree.shape), canonical_tokens) ==
+			        ColumnDropOwnershipBindResult::VERIFIED);
 			REQUIRE(runtime_tree.ApplyTokenPlan(canonical_tokens));
 			for (idx_t node_index = 0; node_index < runtime_tree.nodes.size(); node_index++) {
 				REQUIRE(canonical_tokens[node_index]);
@@ -315,7 +316,8 @@ TEST_CASE("Persistent nested columns expose direct drop ownership nodes", "[stor
 
 			auto rebound_tree = CaptureColumnDropOwnershipRuntimeTree(clone_column);
 			vector<shared_ptr<RowGroupColumnDropOwnership>> rebound_tokens(rebound_tree.nodes.size());
-			REQUIRE(bundle->Bind(rebound_tree.shape, rebound_tokens) == ColumnDropOwnershipBindResult::VERIFIED);
+			REQUIRE(bundle->Bind(std::move(rebound_tree.shape), rebound_tokens) ==
+			        ColumnDropOwnershipBindResult::VERIFIED);
 			REQUIRE(rebound_tree.ApplyTokenPlan(rebound_tokens));
 			REQUIRE(rebound_tokens == canonical_tokens);
 

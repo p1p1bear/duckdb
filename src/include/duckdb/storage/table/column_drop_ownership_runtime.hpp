@@ -22,7 +22,7 @@ public:
 };
 
 struct ColumnDropOwnershipRuntimeTree {
-	shared_ptr<const ColumnDropOwnershipShape> shape;
+	unique_ptr<ColumnDropOwnershipShape> shape;
 	vector<reference<ColumnData>> nodes;
 
 	//! Applies a pre-sized canonical token plan without partially modifying the tree.

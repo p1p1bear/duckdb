@@ -6,8 +6,6 @@
 
 namespace duckdb {
 
-class ColumnDropOwnershipBundleIdentity final {};
-
 ColumnDropOwnershipLayoutTag::ColumnDropOwnershipLayoutTag(ColumnDropOwnershipRuntimeKind runtime_kind_p,
                                                            LogicalType logical_type_p, uint64_t layout_value_p)
     : runtime_kind(runtime_kind_p), logical_type(std::move(logical_type_p)), layout_value(layout_value_p) {
@@ -277,54 +275,38 @@ static bool HasUniqueExistingTokens(const vector<ColumnDropOwnershipNodeDescript
 	return true;
 }
 
-ColumnDropOwnershipShape::ColumnDropOwnershipShape(vector<ColumnDropOwnershipNodeDescriptor> ordered_nodes_p,
-                                                   vector<uint8_t> had_existing_token_p)
-    : ordered_nodes(std::move(ordered_nodes_p)), had_existing_token(std::move(had_existing_token_p)) {
+ColumnDropOwnershipShape::ColumnDropOwnershipShape(vector<ColumnDropOwnershipNodeDescriptor> ordered_nodes_p)
+    : ordered_nodes(std::move(ordered_nodes_p)) {
 }
 
 ColumnDropOwnershipShape::ColumnDropOwnershipShape(ColumnDropOwnershipShape &&other) noexcept
-    : ordered_nodes(std::move(other.ordered_nodes)), had_existing_token(std::move(other.had_existing_token)),
-      affiliation(std::move(other.affiliation)) {
-}
-
-bool ColumnDropOwnershipShape::TryAffiliate(const shared_ptr<ColumnDropOwnershipBundleIdentity> &identity) const {
-	if (!identity) {
-		return false;
-	}
-	lock_guard<mutex> guard(affiliation_lock);
-	if (affiliation && affiliation != identity) {
-		return false;
-	}
-	if (!affiliation) {
-		affiliation = identity;
-	}
-	return true;
+    : ordered_nodes(std::move(other.ordered_nodes)) {
 }
 
 bool ColumnDropOwnershipShape::HasExistingTokens() const noexcept {
-	for (auto existing : had_existing_token) {
-		if (existing) {
+	for (auto &node : ordered_nodes) {
+		if (node.direct_token) {
 			return true;
 		}
 	}
 	return false;
 }
 
-shared_ptr<const ColumnDropOwnershipShape>
-ColumnDropOwnershipShape::Capture(vector<ColumnDropOwnershipNodeDescriptor> observed_tree) {
-	if (!IsValidOrderedTree(observed_tree) || !HasUniqueExistingTokens(observed_tree)) {
-		throw InternalException("Invalid column drop ownership shape");
-	}
-	vector<uint8_t> had_existing_token;
-	had_existing_token.reserve(observed_tree.size());
-	for (auto &node : observed_tree) {
-		had_existing_token.push_back(node.direct_token ? 1 : 0);
+void ColumnDropOwnershipShape::InitializeMissingTokens() {
+	for (auto &node : ordered_nodes) {
 		if (!node.direct_token) {
 			node.direct_token = make_shared_ptr<RowGroupColumnDropOwnership>();
 		}
 	}
-	ColumnDropOwnershipShape captured(std::move(observed_tree), std::move(had_existing_token));
-	return make_shared_ptr<ColumnDropOwnershipShape>(std::move(captured));
+}
+
+unique_ptr<ColumnDropOwnershipShape>
+ColumnDropOwnershipShape::Capture(vector<ColumnDropOwnershipNodeDescriptor> observed_tree) {
+	if (!IsValidOrderedTree(observed_tree) || !HasUniqueExistingTokens(observed_tree)) {
+		throw InternalException("Invalid column drop ownership shape");
+	}
+	ColumnDropOwnershipShape captured(std::move(observed_tree));
+	return make_uniq<ColumnDropOwnershipShape>(std::move(captured));
 }
 
 static bool IsSpatialStorageRepresentation(const ColumnDropOwnershipNodeDescriptor &node,
@@ -378,11 +360,14 @@ static bool ShapesMatch(const ColumnDropOwnershipShape &left, const ColumnDropOw
 	return true;
 }
 
-ColumnDropOwnershipBundle::ColumnDropOwnershipBundle()
-    : identity(make_shared_ptr<ColumnDropOwnershipBundleIdentity>()) {
+static void CopyTokenPlan(const ColumnDropOwnershipShape &shape,
+                          vector<shared_ptr<RowGroupColumnDropOwnership>> &canonical_tokens) noexcept {
+	for (idx_t node_index = 0; node_index < shape.NodeCount(); node_index++) {
+		canonical_tokens[node_index] = shape.GetNodes()[node_index].direct_token;
+	}
 }
 
-void ColumnDropOwnershipBundle::Initialize(const shared_ptr<const ColumnDropOwnershipShape> &candidate,
+void ColumnDropOwnershipBundle::Initialize(unique_ptr<ColumnDropOwnershipShape> candidate,
                                            vector<shared_ptr<RowGroupColumnDropOwnership>> &canonical_tokens) {
 	if (!candidate) {
 		throw InternalException("Cannot initialize column drop ownership bundle from a null shape");
@@ -394,17 +379,13 @@ void ColumnDropOwnershipBundle::Initialize(const shared_ptr<const ColumnDropOwne
 	if (bound_shape) {
 		throw InternalException("Column drop ownership bundle is already initialized");
 	}
-	if (!candidate->TryAffiliate(identity)) {
-		throw InternalException("Column drop ownership shape belongs to another bundle");
-	}
-	bound_shape = candidate;
-	for (idx_t node_index = 0; node_index < bound_shape->NodeCount(); node_index++) {
-		canonical_tokens[node_index] = bound_shape->ordered_nodes[node_index].direct_token;
-	}
+	candidate->InitializeMissingTokens();
+	CopyTokenPlan(*candidate, canonical_tokens);
+	bound_shape = std::move(candidate);
 }
 
 ColumnDropOwnershipBindResult
-ColumnDropOwnershipBundle::Bind(const shared_ptr<const ColumnDropOwnershipShape> &candidate,
+ColumnDropOwnershipBundle::Bind(unique_ptr<ColumnDropOwnershipShape> candidate,
                                 vector<shared_ptr<RowGroupColumnDropOwnership>> &canonical_tokens) noexcept {
 	try {
 		if (!candidate || canonical_tokens.size() != candidate->NodeCount()) {
@@ -412,30 +393,25 @@ ColumnDropOwnershipBundle::Bind(const shared_ptr<const ColumnDropOwnershipShape>
 		}
 		lock_guard<mutex> guard(bind_lock);
 		if (!bound_shape) {
-			if (candidate->HasExistingTokens() || !candidate->TryAffiliate(identity)) {
+			if (candidate->HasExistingTokens()) {
 				return ColumnDropOwnershipBindResult::MISMATCH;
 			}
-			bound_shape = candidate;
-			for (idx_t node_index = 0; node_index < bound_shape->NodeCount(); node_index++) {
-				canonical_tokens[node_index] = bound_shape->ordered_nodes[node_index].direct_token;
-			}
+			candidate->InitializeMissingTokens();
+			CopyTokenPlan(*candidate, canonical_tokens);
+			bound_shape = std::move(candidate);
 			return ColumnDropOwnershipBindResult::ADOPTED;
 		}
 		if (!ShapesMatch(*bound_shape, *candidate)) {
 			return ColumnDropOwnershipBindResult::MISMATCH;
 		}
 		for (idx_t node_index = 0; node_index < bound_shape->NodeCount(); node_index++) {
-			if (candidate->had_existing_token[node_index] && candidate->ordered_nodes[node_index].direct_token !=
-			                                                     bound_shape->ordered_nodes[node_index].direct_token) {
+			if (candidate->ordered_nodes[node_index].direct_token &&
+			    candidate->ordered_nodes[node_index].direct_token !=
+			        bound_shape->ordered_nodes[node_index].direct_token) {
 				return ColumnDropOwnershipBindResult::MISMATCH;
 			}
 		}
-		if (!candidate->TryAffiliate(identity)) {
-			return ColumnDropOwnershipBindResult::MISMATCH;
-		}
-		for (idx_t node_index = 0; node_index < bound_shape->NodeCount(); node_index++) {
-			canonical_tokens[node_index] = bound_shape->ordered_nodes[node_index].direct_token;
-		}
+		CopyTokenPlan(*bound_shape, canonical_tokens);
 		return ColumnDropOwnershipBindResult::VERIFIED;
 	} catch (...) { // NOLINT: this is a no-throw publication mapping
 		return ColumnDropOwnershipBindResult::MISMATCH;
