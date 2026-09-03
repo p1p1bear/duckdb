@@ -447,7 +447,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			auto preparation_layout_lock = GetSharedLayoutPublishLock();
 			current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
 			if (!current_layout || current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
-			    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
+			    storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() !=
 			        current_layout->layout_version) {
 				return FailFinalizeTask(*state, task);
 			}
@@ -548,7 +548,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		    storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
 		    catalog_state.checkpoint.get() != current_checkpoint.get() ||
 		    current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
-		    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
+		    storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() !=
 		        current_layout->layout_version) {
 			return FailFinalizeTask(*state, task);
 		}

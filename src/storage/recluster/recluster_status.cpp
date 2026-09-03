@@ -178,7 +178,7 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	result.table_id = metadata.table_id;
 	result.enabled = metadata.IsEnabled();
 	result.current_sort_order_id = metadata.current_sort_order_id;
-	result.layout_version = table_info.GetSortStorage().current_layout_version.load();
+	result.layout_version = table_info.GetSortStorage()->current_layout_version.load();
 	result.retired_layout_bytes = retirement_registry.GetRetiredBytes(table_info);
 	if (!result.enabled) {
 		if (state_matches_catalog) {

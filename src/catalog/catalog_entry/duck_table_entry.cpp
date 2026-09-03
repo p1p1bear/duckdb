@@ -585,7 +585,7 @@ void DuckTableEntry::PublishAlter(ClientContext &context, CatalogEntry &previous
 	}
 	if (HasSortHistory() && !storage->GetRowGroupCollection()->HasLayoutHistory()) {
 		storage->GetRowGroupCollection()->InitializeLayoutHistory(
-		    storage_info.GetSortStorage().current_layout_version.load());
+		    storage_info.GetSortStorage()->current_layout_version.load());
 	}
 	auto local_storage = LocalStorage::Get(context, storage->db).GetStorage(*storage);
 	if (local_storage) {

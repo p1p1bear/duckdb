@@ -228,7 +228,7 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 			throw SerializationException("Table \"%s\" has SORTED BY catalog metadata but no storage state",
 			                             table.name);
 		}
-		auto sort_storage = info.GetSortStorage().GetPersistentSnapshot(checkpoint_lock);
+		auto sort_storage = info.GetSortStorage()->GetPersistentSnapshot(checkpoint_lock);
 		serializer.WriteProperty(106, "next_run_id", sort_storage.next_run_id);
 		serializer.WriteProperty(107, "layout_version", sort_storage.current_layout_version);
 	}

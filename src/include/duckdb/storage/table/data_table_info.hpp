@@ -63,8 +63,7 @@ public:
 	void InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata);
 	void ResetSortStorage();
 	bool HasSortStorage() const;
-	TableSortStorageState &GetSortStorage();
-	const TableSortStorageState &GetSortStorage() const;
+	shared_ptr<TableSortStorageState> GetSortStorage() const;
 	shared_ptr<TableReclusterState> GetOrCreateReclusterState(uint64_t initialization_token);
 	shared_ptr<TableReclusterState> GetReclusterState() const;
 
@@ -76,7 +75,6 @@ public:
 
 private:
 	DataTableSortRuntime &GetOrCreateSortRuntime() const;
-	optional_ptr<DataTableSortRuntime> GetSortRuntime() const;
 
 private:
 	//! The database instance of the table

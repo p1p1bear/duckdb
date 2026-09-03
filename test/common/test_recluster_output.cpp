@@ -731,7 +731,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	auto collection = storage->GetRowGroupCollection();
 	auto state = storage->GetDataTableInfo()->GetReclusterState();
 	auto old_layout = collection->GetCurrentLayout();
-	auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load();
+	auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load();
 	REQUIRE(old_layout);
 	REQUIRE(old_layout->layout_version == old_layout_version);
 	auto old_ownership = CaptureLayoutDropOwnership(old_layout, start.task->GetRange());
@@ -798,7 +798,7 @@ TEST_CASE("Recluster finalize atomically publishes a replacement layout", "[stor
 	REQUIRE(published_layout->layout_version == old_layout_version + 1);
 	REQUIRE(published_layout->patches.size() == 1);
 	REQUIRE(published_layout->patches[0]->task_id == start.task->GetTaskId());
-	REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version + 1);
+	REQUIRE(storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() == old_layout_version + 1);
 	duckdb::weak_ptr<const RowGroupLayout> old_layout_reference(old_layout);
 	old_layout.reset();
 
@@ -868,7 +868,7 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 		auto collection = storage->GetRowGroupCollection();
 		auto state = storage->GetDataTableInfo()->GetReclusterState();
 		auto old_layout = collection->GetCurrentLayout();
-		auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load();
+		auto old_layout_version = storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load();
 
 		REQUIRE_NO_FAIL(con.Query("SET debug_force_commit_failure=true"));
 		string error;
@@ -887,7 +887,7 @@ TEST_CASE("Recluster finalize restores the old layout after commit failure", "[s
 		REQUIRE(storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Count() == 0);
 		REQUIRE(storage->GetAttached().GetReclusterManager().GetWALBlockRetention().Count() == 0);
 		REQUIRE(collection->GetCurrentLayout().get() == old_layout.get());
-		REQUIRE(storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() == old_layout_version);
+		REQUIRE(storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() == old_layout_version);
 		auto rows = con.Query("SELECT count(*), sum(payload) FROM tbl");
 		REQUIRE(rows);
 		REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
@@ -1093,12 +1093,12 @@ static void CheckRecoveredRecluster(Connection &con, bool payload_deleted, layou
 		REQUIRE(layout);
 		REQUIRE(layout->layout_version == expected_version);
 		REQUIRE(layout->patches.size() == expected_patch_count);
-		auto &sort_storage = storage.GetDataTableInfo()->GetSortStorage();
-		REQUIRE(sort_storage.current_layout_version.load() == expected_version);
+		auto sort_storage = storage.GetDataTableInfo()->GetSortStorage();
+		REQUIRE(sort_storage->current_layout_version.load() == expected_version);
 		for (auto &patch : layout->patches) {
 			REQUIRE(patch->sort_order_id != INVALID_SORT_ORDER_ID);
 			REQUIRE(patch->run_id != INVALID_SORT_RUN_ID);
-			REQUIRE(sort_storage.next_run_id.load() > patch->run_id);
+			REQUIRE(sort_storage->next_run_id.load() > patch->run_id);
 		}
 		if (expected_version > INITIAL_LAYOUT_VERSION) {
 			CheckCollectionRows(con, *collection, expected->Cast<MaterializedQueryResult>());

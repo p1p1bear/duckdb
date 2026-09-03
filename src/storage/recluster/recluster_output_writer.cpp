@@ -524,7 +524,7 @@ void WriteReclusterOutput(RangeTask &task) {
 		throw InternalException("Recluster output physical column count changed during Prepare");
 	}
 
-	auto run_id = storage.GetDataTableInfo()->GetSortStorage().AllocateRunId();
+	auto run_id = storage.GetDataTableInfo()->GetSortStorage()->AllocateRunId();
 	auto organization = AppendOrganization::Sorted(task_context.GetSortDefinition().sort_order_id, run_id);
 	auto persistent_data = make_uniq<PersistentCollectionData>();
 	persistent_data->row_group_data.reserve(task_context.GetCandidate().expected_row_groups.size());

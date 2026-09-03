@@ -203,7 +203,8 @@ void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_
 		storage->GetRowGroupCollection()->PublishLayout(pending_layout);
 		layout_published = true;
 
-		auto &layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version;
+		auto sort_storage = storage->GetDataTableInfo()->GetSortStorage();
+		auto &layout_version = sort_storage->current_layout_version;
 		auto expected_version = old_layout->layout_version;
 		if (!layout_version.compare_exchange_strong(expected_version, pending_layout->layout_version)) {
 			throw InternalException("Recluster storage layout version changed during commit");
@@ -227,7 +228,8 @@ void ReclusterCommitInfo::RevertLayout() {
 	}
 	storage->GetRowGroupCollection()->RevertPublishedLayout(pending_layout, old_layout);
 	if (layout_version_advanced) {
-		auto &layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version;
+		auto sort_storage = storage->GetDataTableInfo()->GetSortStorage();
+		auto &layout_version = sort_storage->current_layout_version;
 		auto expected_version = pending_layout->layout_version;
 		if (!layout_version.compare_exchange_strong(expected_version, old_layout->layout_version)) {
 			throw InternalException("Recluster storage layout version changed during revert");
@@ -252,7 +254,7 @@ void ReclusterCommitInfo::FinalizeCommit() {
 	}
 	if (!task) {
 		storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Commit(std::move(retirement));
-		storage->GetDataTableInfo()->GetSortStorage().AdvancePastRunId(recovered_run_id);
+		storage->GetDataTableInfo()->GetSortStorage()->AdvancePastRunId(recovered_run_id);
 		recovered_owned_block_count = 0;
 		recovered_blocks.clear();
 		state = ReclusterCommitLifecycle::FINALIZED;

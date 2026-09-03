@@ -182,7 +182,7 @@ SinkResultType AdaptiveSortedWrite::SinkInternal(ExecutionContext &context, Data
 
 			auto prefix_count = row_group_size - previous_total;
 			AppendOwned(context.client, chunk, 0, prefix_count, resolved_token);
-			run_id = table.GetStorage().GetDataTableInfo()->GetSortStorage().AllocateRunId();
+			run_id = table.GetStorage().GetDataTableInfo()->GetSortStorage()->AllocateRunId();
 			phase = AdaptiveInsertPhase::INITIALIZING_SORT;
 			initial_staging = std::move(staging);
 			suffix_offset = prefix_count;

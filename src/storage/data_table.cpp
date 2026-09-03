@@ -45,9 +45,8 @@ namespace duckdb {
 struct DataTableSortRuntime {
 	StorageLock write_gate;
 	StorageLock ddl_gate;
-	mutex recluster_state_lock;
 	shared_ptr<TableReclusterState> recluster_state;
-	unique_ptr<TableSortStorageState> sort_storage;
+	shared_ptr<TableSortStorageState> sort_storage;
 };
 
 DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p,
@@ -66,11 +65,6 @@ DataTableSortRuntime &DataTableInfo::GetOrCreateSortRuntime() const {
 		sort_runtime = make_uniq<DataTableSortRuntime>();
 	}
 	return *sort_runtime;
-}
-
-optional_ptr<DataTableSortRuntime> DataTableInfo::GetSortRuntime() const {
-	lock_guard<mutex> guard(sort_runtime_lock);
-	return sort_runtime.get();
 }
 
 unique_ptr<StorageLockKey> DataTableInfo::GetSharedReclusterWriteLock() {
@@ -98,57 +92,55 @@ void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) 
 }
 
 void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata) {
-	if (sort_storage_initialized.load()) {
+	auto storage = make_shared_ptr<TableSortStorageState>(metadata);
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (sort_storage_initialized.load(std::memory_order_relaxed)) {
 		throw InternalException("Sort storage state has already been initialized");
 	}
-	GetOrCreateSortRuntime().sort_storage = make_uniq<TableSortStorageState>(metadata);
-	sort_storage_initialized.store(true);
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
+	}
+	sort_runtime->sort_storage = std::move(storage);
+	sort_storage_initialized.store(true, std::memory_order_release);
 }
 
 void DataTableInfo::ResetSortStorage() {
-	sort_storage_initialized.store(false);
-	auto runtime = GetSortRuntime();
-	if (runtime) {
-		runtime->sort_storage.reset();
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (sort_runtime) {
+		sort_runtime->sort_storage.reset();
 	}
+	sort_storage_initialized.store(false, std::memory_order_release);
 }
 
 bool DataTableInfo::HasSortStorage() const {
-	return sort_storage_initialized.load();
+	return sort_storage_initialized.load(std::memory_order_acquire);
 }
 
-TableSortStorageState &DataTableInfo::GetSortStorage() {
-	auto runtime = GetSortRuntime();
-	if (!runtime || !runtime->sort_storage) {
+shared_ptr<TableSortStorageState> DataTableInfo::GetSortStorage() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime || !sort_runtime->sort_storage) {
 		throw InternalException("Table does not have sort storage state");
 	}
-	return *runtime->sort_storage;
-}
-
-const TableSortStorageState &DataTableInfo::GetSortStorage() const {
-	auto runtime = GetSortRuntime();
-	if (!runtime || !runtime->sort_storage) {
-		throw InternalException("Table does not have sort storage state");
-	}
-	return *runtime->sort_storage;
+	return sort_runtime->sort_storage;
 }
 
 shared_ptr<TableReclusterState> DataTableInfo::GetOrCreateReclusterState(uint64_t initialization_token) {
-	auto &runtime = GetOrCreateSortRuntime();
-	lock_guard<mutex> guard(runtime.recluster_state_lock);
-	if (!runtime.recluster_state) {
-		runtime.recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
 	}
-	return runtime.recluster_state;
+	if (!sort_runtime->recluster_state) {
+		sort_runtime->recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
+	}
+	return sort_runtime->recluster_state;
 }
 
 shared_ptr<TableReclusterState> DataTableInfo::GetReclusterState() const {
-	auto runtime = GetSortRuntime();
-	if (!runtime) {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
 		return nullptr;
 	}
-	lock_guard<mutex> guard(runtime->recluster_state_lock);
-	return runtime->recluster_state;
+	return sort_runtime->recluster_state;
 }
 
 bool DataTableInfo::IsTemporary() const {
@@ -188,7 +180,7 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
 		D_ASSERT(row_groups->GetTotalRows() == 0);
 	}
 	if (info->HasSortStorage()) {
-		row_groups->InitializeLayoutHistory(info->GetSortStorage().current_layout_version.load());
+		row_groups->InitializeLayoutHistory(info->GetSortStorage()->current_layout_version.load());
 	}
 	row_groups->Verify();
 }

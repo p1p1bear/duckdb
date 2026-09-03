@@ -490,10 +490,10 @@ public:
 		if (!storage->GetDataTableInfo()->HasSortStorage()) {
 			throw DataCorruptionException("Recluster WAL references a table without SORTED BY storage state");
 		}
-		auto &sort_storage = storage->GetDataTableInfo()->GetSortStorage();
-		auto current_version = sort_storage.current_layout_version.load();
+		auto sort_storage = storage->GetDataTableInfo()->GetSortStorage();
+		auto current_version = sort_storage->current_layout_version.load();
 		if (current_version >= record.header.target_layout_version) {
-			if (sort_storage.next_run_id.load() <= record.manifest.header.run_id) {
+			if (sort_storage->next_run_id.load() <= record.manifest.header.run_id) {
 				throw DataCorruptionException("Checkpointed SORTED BY run ID is behind skipped recluster WAL");
 			}
 			return;

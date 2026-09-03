@@ -171,6 +171,7 @@ TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loa
 		REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i INTEGER)"));
 
 		duckdb::shared_ptr<RowGroupCollection> original_collection;
+		duckdb::shared_ptr<TableSortStorageState> retained_sort_storage;
 		con.context->RunFunctionInTransaction([&]() {
 			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
 			original_collection = entry.GetStorage().GetRowGroupCollection();
@@ -183,6 +184,7 @@ TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loa
 		con.context->RunFunctionInTransaction([&]() {
 			auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
 			REQUIRE(entry.GetStorage().GetDataTableInfo()->HasSortStorage());
+			retained_sort_storage = entry.GetStorage().GetDataTableInfo()->GetSortStorage();
 			REQUIRE(entry.GetStorage().GetRowGroupCollection()->HasLayoutHistory());
 		});
 		REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
@@ -193,6 +195,7 @@ TEST_CASE("Table sort layout state follows first SET rollback and checkpoint loa
 			REQUIRE(!entry.GetStorage().GetDataTableInfo()->HasSortStorage());
 			REQUIRE(!entry.GetStorage().GetRowGroupCollection()->HasLayoutHistory());
 		});
+		REQUIRE(retained_sort_storage->current_layout_version.load() == INITIAL_LAYOUT_VERSION);
 
 		REQUIRE_NO_FAIL(con.Query("ALTER TABLE tbl SET SORTED BY (i)"));
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));

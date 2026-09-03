@@ -689,7 +689,7 @@ TEST_CASE("Checkpoint materializes the current row group layout", "[storage][row
 			REQUIRE(first->GetRowStart() == 0);
 			collection->PublishLayout(BuildPublishedLayout(
 			    *collection, 1, MakeEmptyReplacementPatch(0, NumericCast<row_t>(first->GetCount()), 7)));
-			entry.GetStorage().GetDataTableInfo()->GetSortStorage().current_layout_version.store(1);
+			entry.GetStorage().GetDataTableInfo()->GetSortStorage()->current_layout_version.store(1);
 		});
 
 		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (5000)"));
@@ -1001,7 +1001,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(collection->GetRowGroupCount() == 1);
 		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
 		REQUIRE(!collection->GetRowGroup(0)->IsSealed());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (4095 - i)::INTEGER FROM range(4096) t(i)"));
@@ -1015,7 +1015,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 			REQUIRE(row_group->GetSortMetadata() == RowGroupSortMetadata {1, 1});
 			REQUIRE(row_group->IsSealed());
 		}
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 2);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT (2047 - i)::INTEGER FROM range(2048) t(i)"));
@@ -1025,7 +1025,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(collection->GetRowGroupCount() == 4);
 		REQUIRE(collection->GetRowGroup(3)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
 		REQUIRE(collection->GetRowGroup(3)->IsSealed());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 3);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (6), (4), (5)"));
@@ -1035,7 +1035,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(collection->GetRowGroupCount() == 5);
 		REQUIRE(collection->GetRowGroup(4)->GetSortMetadata() == RowGroupSortMetadata());
 		REQUIRE(!collection->GetRowGroup(4)->IsSealed());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 3);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("SET threads = 4"));
@@ -1053,7 +1053,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 			REQUIRE(row_group->GetSortMetadata() == RowGroupSortMetadata {1, 1});
 			REQUIRE(row_group->IsSealed());
 		}
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 2);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE trigger_target(i INTEGER) SORTED BY (i)"));
@@ -1069,7 +1069,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 			REQUIRE(collection->GetRowGroup(NumericCast<int64_t>(row_group_idx))->GetSortMetadata() ==
 			        RowGroupSortMetadata());
 		}
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO trigger_target "
@@ -1080,7 +1080,7 @@ TEST_CASE("Adaptive sorted writes preserve threshold and run boundaries", "[stor
 		REQUIRE(collection->GetRowGroupCount() == 3);
 		REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
 		REQUIRE(collection->GetRowGroup(2)->IsSealed());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 2);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 2);
 	});
 	DeleteDatabase(path);
 }
@@ -1111,7 +1111,7 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 		auto collection = entry.GetStorage().GetRowGroupCollection();
 		REQUIRE(collection->GetRowGroupCount() == 1);
 		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
 	});
 
 	for (idx_t i = 0; i < 2048; i++) {
@@ -1132,7 +1132,7 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 		REQUIRE(collection->GetRowGroup(1)->IsSealed());
 		REQUIRE(collection->GetRowGroup(2)->GetSortMetadata() == RowGroupSortMetadata {1, 2});
 		REQUIRE(collection->GetRowGroup(2)->IsSealed());
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 3);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 3);
 	});
 
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE internal_target(i INTEGER) SORTED BY (i)"));
@@ -1154,7 +1154,7 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 			REQUIRE(collection->GetRowGroup(NumericCast<int64_t>(row_group_idx))->GetSortMetadata() ==
 			        RowGroupSortMetadata());
 		}
-		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage().next_run_id.load() == 1);
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
 	});
 	DeleteDatabase(path);
 }
