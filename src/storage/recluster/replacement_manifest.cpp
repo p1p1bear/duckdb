@@ -262,7 +262,6 @@ void ReplacementManifest::Seal() {
 }
 
 vector<uint8_t> ReplacementManifest::SerializeVerifiedPayload() const {
-	Validate();
 	auto payload = SerializePayload();
 	if (payload.size() != payload_size || payload.size() > REPLACEMENT_MANIFEST_MAX_PAYLOAD_SIZE ||
 	    Checksum(payload.data(), payload.size()) != checksum) {

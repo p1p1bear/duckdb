@@ -189,7 +189,7 @@ static void CancelTaskForDeleteJournalFailure(const shared_ptr<RangeTask> &task)
 	if (!task) {
 		return;
 	}
-	task->DisablePublishForJournalFailure();
+	task->RequestCancel();
 }
 
 void DuckTransaction::RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[],

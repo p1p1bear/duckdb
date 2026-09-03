@@ -71,7 +71,6 @@ public:
 	}
 
 	void RequestCancel() noexcept;
-	void DisablePublishForJournalFailure() noexcept;
 
 	bool TryAdvance(RangeTaskState expected, RangeTaskState target) noexcept;
 	bool TryEnterCancelling() noexcept;

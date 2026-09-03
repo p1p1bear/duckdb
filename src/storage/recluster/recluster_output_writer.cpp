@@ -246,7 +246,6 @@ ReclusterOutput::ReclusterOutput(BlockManager &block_manager_p, shared_ptr<RowGr
 	    !manifest_pointer.IsValid()) {
 		throw InternalException("Invalid recluster private output");
 	}
-	manifest.Validate();
 	idx_t manifest_row_count = 0;
 	for (auto &row_group : manifest.replacement_groups) {
 		manifest_row_count += row_group.tuple_count;

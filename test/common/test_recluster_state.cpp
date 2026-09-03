@@ -25,7 +25,6 @@ TEST_CASE("Range task control word preserves cancellation and publication flags"
 	REQUIRE(!task->IsFinished());
 
 	REQUIRE(task->TryAdvance(RangeTaskState::STARTING, RangeTaskState::PREPARING));
-	task->DisablePublishForJournalFailure();
 	task->RequestCancel();
 	REQUIRE(task->IsAbortRequested());
 	REQUIRE(!task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));

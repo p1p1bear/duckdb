@@ -22,7 +22,6 @@ using delete_sequence_t = uint64_t;
 
 using persistent_table_id_t = hugeint_t;
 using recluster_task_id_t = hugeint_t;
-using retirement_id_t = uint64_t;
 
 static constexpr sort_order_id_t INVALID_SORT_ORDER_ID = 0;
 static constexpr sort_run_id_t INVALID_SORT_RUN_ID = 0;

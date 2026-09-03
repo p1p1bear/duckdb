@@ -9,6 +9,7 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/read_stream.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -131,7 +132,7 @@ private:
 		if (!block_manager.Cast<SingleFileBlockManager>().BlockExistsOnDisk(block_id)) {
 			throw DataCorruptionException("Recluster manifest references block %d outside the database file", block_id);
 		}
-		if (std::find(protected_blocks.begin(), protected_blocks.end(), block_id) != protected_blocks.end()) {
+		if (!protected_block_ids.insert(block_id).second) {
 			return;
 		}
 		reservation.AddPhysicalBlock(block_id);
@@ -143,11 +144,9 @@ private:
 			throw DataCorruptionException("Recluster manifest metadata chain ended before its payload");
 		}
 		if (!next_pointer.IsValid() || next_pointer.GetBlockIndex() >= MetadataManager::METADATA_BLOCK_COUNT ||
-		    std::find(visited_pointers.begin(), visited_pointers.end(), next_pointer.block_pointer) !=
-		        visited_pointers.end()) {
+		    !visited_pointers.insert(next_pointer.block_pointer).second) {
 			throw DataCorruptionException("Recluster manifest contains an invalid metadata chain");
 		}
-		visited_pointers.push_back(next_pointer.block_pointer);
 		ProtectBlock(next_pointer.GetBlockId());
 
 		auto block_handle = block_manager.RegisterBlock(next_pointer.GetBlockId());
@@ -184,7 +183,8 @@ private:
 	MetaBlockPointer next_pointer;
 	vector<block_id_t> &protected_blocks;
 	AllocatorBlockReservation &reservation;
-	vector<idx_t> visited_pointers;
+	unordered_set<block_id_t> protected_block_ids;
+	unordered_set<idx_t> visited_pointers;
 	BufferHandle block;
 	uint32_t block_index = 0;
 	bool has_next_block;
@@ -222,9 +222,6 @@ static vector<row_t> ValidateWALTransaction(const PendingReclusterWALTransaction
 	}
 
 	vector<row_t> result;
-	if (pending.header->final_delete_row_count > NumericLimits<idx_t>::Maximum()) {
-		throw DataCorruptionException("Recluster WAL DELETE row count exceeds the addressable range");
-	}
 	result.reserve(NumericCast<idx_t>(pending.header->final_delete_row_count));
 	for (idx_t chunk_index = 0; chunk_index < pending.deletes.size(); chunk_index++) {
 		auto &chunk = pending.deletes[chunk_index];

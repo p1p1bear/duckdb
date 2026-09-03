@@ -125,10 +125,6 @@ void RangeTask::RequestCancel() noexcept {
 	control.fetch_or(RANGE_TASK_ABORT_REQUESTED, std::memory_order_acq_rel);
 }
 
-void RangeTask::DisablePublishForJournalFailure() noexcept {
-	control.fetch_or(RANGE_TASK_ABORT_REQUESTED, std::memory_order_acq_rel);
-}
-
 bool RangeTask::IsProgressTransition(RangeTaskState expected, RangeTaskState target) {
 	switch (expected) {
 	case RangeTaskState::STARTING:

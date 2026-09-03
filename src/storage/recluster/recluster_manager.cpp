@@ -39,6 +39,9 @@
 namespace duckdb {
 
 static constexpr idx_t RECLUSTER_CONVERSION_ROW_GROUP_TARGET = 32;
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_TIMEOUT {5000};
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_INITIAL_DELAY {1};
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_MAX_DELAY {50};
 
 ReclusterManager::ReclusterManager(AttachedDatabase &db_p)
     : db(db_p), wal_block_retention(db_p), retirement_registry(db_p) {
@@ -792,7 +795,8 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 			}
 			auto task_output_bytes = start.task->GetTaskContext().GetOutput().GetByteSize();
 
-			auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			auto retry_deadline = std::chrono::steady_clock::now() + EXPLICIT_FINALIZE_RETRY_TIMEOUT;
+			auto retry_delay = EXPLICIT_FINALIZE_RETRY_INITIAL_DELAY;
 			while (true) {
 				context.InterruptCheck();
 				auto finalize_status = FinalizeTask(table, start.task);
@@ -805,7 +809,11 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				if (std::chrono::steady_clock::now() >= retry_deadline) {
 					throw IOException("Explicit recluster timed out waiting for concurrent DELETE transactions");
 				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				std::this_thread::sleep_for(retry_delay);
+				retry_delay *= 2;
+				if (retry_delay > EXPLICIT_FINALIZE_RETRY_MAX_DELAY) {
+					retry_delay = EXPLICIT_FINALIZE_RETRY_MAX_DELAY;
+				}
 			}
 			result.tasks_completed++;
 			result.input_bytes = SaturatingAddReclusterValue(result.input_bytes, candidate_bytes);
