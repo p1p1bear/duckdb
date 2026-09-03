@@ -102,14 +102,11 @@ void AdaptiveSortedWrite::AppendOwned(ClientContext &context, DataChunk &chunk, 
 }
 
 void AdaptiveSortedWrite::SetFailure(std::exception_ptr exception) {
-	{
-		lock_guard<mutex> guard(lock);
-		if (phase != AdaptiveInsertPhase::FAILED) {
-			failure = std::move(exception);
-			phase = AdaptiveInsertPhase::FAILED;
-		}
+	lock_guard<mutex> guard(lock);
+	if (phase != AdaptiveInsertPhase::FAILED) {
+		failure = std::move(exception);
+		phase = AdaptiveInsertPhase::FAILED;
 	}
-	phase_changed.notify_all();
 }
 
 void AdaptiveSortedWrite::ThrowFailure(unique_lock<mutex> &guard) const {
@@ -123,20 +120,18 @@ void AdaptiveSortedWrite::ThrowFailure(unique_lock<mutex> &guard) const {
 }
 
 void AdaptiveSortedWrite::InitializeSort(ClientContext &context) {
-	auto physical_indexes = BindPersistentSortIndexes(table.GetStorage().Columns(), sort_definition);
-	auto orders = BuildPersistentSortOrders(sort_definition, physical_indexes, input_types, input_types.size());
-	auto initialized_sort = make_uniq<Sort>(context, orders, input_types, vector<idx_t>());
-	auto initialized_sink = initialized_sort->GetGlobalSinkState(context);
-	{
-		lock_guard<mutex> guard(lock);
-		if (phase != AdaptiveInsertPhase::INITIALIZING_SORT) {
-			throw InternalException("Adaptive sorted write changed phase while initializing its sorter");
-		}
-		sort = std::move(initialized_sort);
-		sort_sink = std::move(initialized_sink);
-		phase = AdaptiveInsertPhase::SORTING;
+	D_ASSERT(phase == AdaptiveInsertPhase::BUFFERING);
+	try {
+		auto physical_indexes = BindPersistentSortIndexes(table.GetStorage().Columns(), sort_definition);
+		auto orders = BuildPersistentSortOrders(sort_definition, physical_indexes, input_types, input_types.size());
+		sort = make_uniq<Sort>(context, orders, input_types, vector<idx_t>());
+		sort_sink = sort->GetGlobalSinkState(context);
+	} catch (...) {
+		failure = std::current_exception();
+		phase = AdaptiveInsertPhase::FAILED;
+		throw;
 	}
-	phase_changed.notify_all();
+	phase = AdaptiveInsertPhase::SORTING;
 }
 
 void AdaptiveSortedWrite::SinkToSort(ExecutionContext &context, DataChunk &chunk,
@@ -161,7 +156,7 @@ SinkResultType AdaptiveSortedWrite::SinkInternal(ExecutionContext &context, Data
 
 	OrderedInsertStaging initial_staging;
 	idx_t suffix_offset = 0;
-	bool initialize_sort = false;
+	bool initialized_sort = false;
 	{
 		unique_lock<mutex> guard(lock);
 		if (phase == AdaptiveInsertPhase::FAILED) {
@@ -183,14 +178,11 @@ SinkResultType AdaptiveSortedWrite::SinkInternal(ExecutionContext &context, Data
 			auto prefix_count = row_group_size - previous_total;
 			AppendOwned(context.client, chunk, 0, prefix_count, resolved_token);
 			run_id = table.GetStorage().GetDataTableInfo()->GetSortStorage()->AllocateRunId();
-			phase = AdaptiveInsertPhase::INITIALIZING_SORT;
 			initial_staging = std::move(staging);
 			suffix_offset = prefix_count;
-			initialize_sort = true;
+			InitializeSort(context.client);
+			initialized_sort = true;
 		} else {
-			while (phase == AdaptiveInsertPhase::INITIALIZING_SORT) {
-				phase_changed.wait(guard);
-			}
 			if (phase == AdaptiveInsertPhase::FAILED) {
 				ThrowFailure(guard);
 			}
@@ -200,8 +192,7 @@ SinkResultType AdaptiveSortedWrite::SinkInternal(ExecutionContext &context, Data
 		}
 	}
 
-	if (initialize_sort) {
-		InitializeSort(context.client);
+	if (initialized_sort) {
 		for (auto &entry : initial_staging) {
 			SinkToSort(context, *entry.second, local_state, interrupt_state);
 		}
@@ -233,9 +224,6 @@ SinkCombineResultType AdaptiveSortedWrite::CombineInternal(ExecutionContext &con
                                                            InterruptState &interrupt_state) {
 	{
 		unique_lock<mutex> guard(lock);
-		while (phase == AdaptiveInsertPhase::INITIALIZING_SORT) {
-			phase_changed.wait(guard);
-		}
 		if (phase == AdaptiveInsertPhase::FAILED) {
 			ThrowFailure(guard);
 		}
@@ -370,14 +358,11 @@ void AdaptiveSortedWrite::RollbackDrainWriters() noexcept {
 }
 
 void AdaptiveSortedWrite::MarkFinished() {
-	{
-		lock_guard<mutex> guard(lock);
-		if (phase != AdaptiveInsertPhase::DRAINING) {
-			throw InternalException("Adaptive sorted write finished from an invalid phase");
-		}
-		phase = AdaptiveInsertPhase::FINISHED;
+	lock_guard<mutex> guard(lock);
+	if (phase != AdaptiveInsertPhase::DRAINING) {
+		throw InternalException("Adaptive sorted write finished from an invalid phase");
 	}
-	phase_changed.notify_all();
+	phase = AdaptiveInsertPhase::FINISHED;
 }
 
 class AdaptiveSortedWriteDrainTask : public ExecutorTask {
@@ -514,9 +499,6 @@ SinkFinalizeType AdaptiveSortedWrite::FinalizeInternal(Pipeline &pipeline, Event
 	bool needs_sort_drain = false;
 	{
 		unique_lock<mutex> guard(lock);
-		while (phase == AdaptiveInsertPhase::INITIALIZING_SORT) {
-			phase_changed.wait(guard);
-		}
 		if (phase == AdaptiveInsertPhase::FAILED) {
 			ThrowFailure(guard);
 		}

@@ -13,7 +13,6 @@
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
-#include <condition_variable>
 #include <exception>
 #include <map>
 
@@ -28,7 +27,7 @@ class Sort;
 class OptimisticDataWriter;
 struct OptimisticWriteCollection;
 
-enum class AdaptiveInsertPhase : uint8_t { BUFFERING, INITIALIZING_SORT, SORTING, DRAINING, FINISHED, FAILED };
+enum class AdaptiveInsertPhase : uint8_t { BUFFERING, SORTING, DRAINING, FINISHED, FAILED };
 
 struct InsertOrderToken {
 	optional_idx batch_index;
@@ -103,7 +102,6 @@ private:
 	SortOrderDefinition sort_definition;
 
 	mutable mutex lock;
-	std::condition_variable phase_changed;
 	AdaptiveInsertPhase phase = AdaptiveInsertPhase::BUFFERING;
 	idx_t total_count = 0;
 	idx_t row_group_size;

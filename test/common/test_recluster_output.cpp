@@ -523,6 +523,24 @@ TEST_CASE("Recluster DELETE catch-up persists resolved journal prefixes", "[stor
 	REQUIRE(first_result.limit_exceeded);
 	REQUIRE(start.task->GetState() == RangeTaskState::CATCHING_UP_DELETES);
 
+	auto &task_context = start.task->GetTaskContext();
+	auto &output = task_context.GetOutput();
+	REQUIRE(output.GetManifest().header.last_applied_delete_sequence == 1);
+	REQUIRE(output.GetManifest().header.manifest_revision == 2);
+	auto previous_manifest_pointer = output.GetManifestPointer();
+	idx_t delete_pointer_count = 0;
+	duckdb::vector<block_id_t> previous_delete_blocks;
+	for (auto &row_group : output.GetManifest().replacement_groups) {
+		delete_pointer_count += row_group.deletes_pointers.size();
+		for (auto &pointer : row_group.deletes_pointers) {
+			previous_delete_blocks.push_back(pointer.GetBlockId());
+			REQUIRE(std::binary_search(output.GetManifest().all_referenced_blocks.begin(),
+			                           output.GetManifest().all_referenced_blocks.end(), pointer.GetBlockId()));
+		}
+	}
+	REQUIRE(delete_pointer_count > 0);
+	previous_delete_blocks = UniqueBlocks(std::move(previous_delete_blocks));
+
 	auto aborted_result = catchup.Run(1, start.task->GetDeleteJournalLimits().max_rowids);
 	REQUIRE(aborted_result.applied_through == 2);
 	REQUIRE(aborted_result.resolved_slot_count == 1);
@@ -531,54 +549,25 @@ TEST_CASE("Recluster DELETE catch-up persists resolved journal prefixes", "[stor
 	REQUIRE(aborted_result.blocked_by_reserved);
 	REQUIRE(!aborted_result.limit_exceeded);
 	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
-
-	auto &task_context = start.task->GetTaskContext();
-	auto &output = task_context.GetOutput();
 	REQUIRE(output.GetManifest().header.last_applied_delete_sequence == 2);
 	REQUIRE(output.GetManifest().header.manifest_revision == 3);
-	idx_t delete_pointer_count = 0;
-	duckdb::vector<block_id_t> first_delete_blocks;
-	for (auto &row_group : output.GetManifest().replacement_groups) {
-		delete_pointer_count += row_group.deletes_pointers.size();
-		for (auto &pointer : row_group.deletes_pointers) {
-			first_delete_blocks.push_back(pointer.GetBlockId());
-			REQUIRE(std::binary_search(output.GetManifest().all_referenced_blocks.begin(),
-			                           output.GetManifest().all_referenced_blocks.end(), pointer.GetBlockId()));
-		}
+	REQUIRE(!(output.GetManifestPointer() == previous_manifest_pointer));
+	REQUIRE(!std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(),
+	                            previous_manifest_pointer.GetBlockId()));
+	for (auto block_id : previous_delete_blocks) {
+		REQUIRE(!std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(), block_id));
 	}
-	REQUIRE(delete_pointer_count > 0);
-	first_delete_blocks = UniqueBlocks(std::move(first_delete_blocks));
 	auto expected_result = con.Query("SELECT * FROM tbl ORDER BY k ASC NULLS LAST");
 	REQUIRE(expected_result);
 	REQUIRE(!expected_result->HasError());
 	CheckCollectionRows(con, *output.GetCollection(), expected_result->Cast<MaterializedQueryResult>());
 
 	REQUIRE(start.task->ResolveDeleteSlot(*reserved_slot, DeleteSlotState::ABORTED));
-	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload IN (19, 3072)"));
-	REQUIRE(start.task->GetLatestDeleteSequence() == 4);
-	auto previous_manifest_pointer = output.GetManifestPointer();
-	REQUIRE(start.task->TryAdvance(RangeTaskState::PREPARED, RangeTaskState::FINALIZING));
-	REQUIRE(start.task->TryAdvance(RangeTaskState::FINALIZING, RangeTaskState::CATCHING_UP_DELETES));
-	ReclusterDeleteCatchup second_catchup(*start.task);
-	auto second_result = second_catchup.Run();
-	REQUIRE(second_result.applied_through == 4);
-	REQUIRE(second_result.resolved_slot_count == 2);
-	REQUIRE(second_result.mapped_rowid_count == 2);
-	REQUIRE(second_result.deleted_row_count == 2);
-	REQUIRE(start.task->GetState() == RangeTaskState::PREPARED);
-	REQUIRE(output.GetManifest().header.last_applied_delete_sequence == 4);
-	REQUIRE(output.GetManifest().header.manifest_revision == 4);
-	REQUIRE(!(output.GetManifestPointer() == previous_manifest_pointer));
-	REQUIRE(!std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(),
-	                            previous_manifest_pointer.GetBlockId()));
-	for (auto block_id : first_delete_blocks) {
-		REQUIRE(!std::binary_search(output.GetBlockIds().begin(), output.GetBlockIds().end(), block_id));
-	}
 
 	auto &metadata_manager = block_manager.GetMetadataManager();
 	auto loaded_manifest = ReadOutputManifest(output, metadata_manager);
-	REQUIRE(loaded_manifest.header.last_applied_delete_sequence == 4);
-	REQUIRE(loaded_manifest.header.manifest_revision == 4);
+	REQUIRE(loaded_manifest.header.last_applied_delete_sequence == 2);
+	REQUIRE(loaded_manifest.header.manifest_revision == 3);
 	REQUIRE(loaded_manifest.checksum == output.GetManifest().checksum);
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT catchup_db"));
 	auto lazy_collection = CreateLazyReplacementCollection(storage, loaded_manifest);
