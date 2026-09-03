@@ -20,6 +20,8 @@
 #include "duckdb/storage/write_ahead_log.hpp"
 #include "duckdb/transaction/commit_state.hpp"
 
+#include <exception>
+
 namespace duckdb {
 
 struct PreparedReclusterWAL {
@@ -183,12 +185,15 @@ void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) {
 	prepared_wal.reset();
 }
 
-void ReclusterCommitInfo::CommitRuntimeWALRetention() noexcept {
-	D_ASSERT(task);
-	D_ASSERT(wal_retention.IsActive());
+void ReclusterCommitInfo::CommitRuntimeWALRetention() {
+	if (!task || !wal_retention.IsActive() || wal_checkpoint_iteration == 0) {
+		throw InternalException("Invalid recluster WAL retention commit state");
+	}
 	auto &attached = storage->GetAttached();
 	auto transaction_end = ReclusterWALPosition {wal_checkpoint_iteration, attached.GetStorageManager().GetWALSize()};
-	D_ASSERT(transaction_end.file_offset > 0);
+	if (transaction_end.file_offset == 0) {
+		throw InternalException("Invalid recluster WAL retention commit position");
+	}
 	attached.GetReclusterManager().GetWALBlockRetention().Commit(std::move(wal_retention), transaction_end);
 }
 
@@ -197,6 +202,7 @@ void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_
 	    (task && task->GetState() != RangeTaskState::COMMITTING)) {
 		throw InternalException("Invalid recluster commit transition");
 	}
+	drop_state.AddRecluster(*this);
 
 	try {
 		pending_layout->visible_from = commit_id;
@@ -211,14 +217,29 @@ void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_
 		}
 		layout_version_advanced = true;
 		state = ReclusterCommitLifecycle::APPLIED;
-		drop_state.AddRecluster(*this);
 	} catch (...) {
-		if (layout_published) {
-			RevertLayout();
+		auto commit_error = std::current_exception();
+		string commit_error_message = "unknown exception";
+		try {
+			std::rethrow_exception(commit_error);
+		} catch (std::exception &ex) {
+			commit_error_message = ex.what();
+		} catch (...) {
+		}
+		try {
+			if (layout_published) {
+				RevertLayout();
+			}
+		} catch (std::exception &ex) {
+			throw FatalException("Failed to revert a recluster layout after commit error: %s. Revert error: %s",
+			                     commit_error_message, ex.what());
+		} catch (...) {
+			throw FatalException("Failed to revert a recluster layout after commit error: %s. Revert error is unknown",
+			                     commit_error_message);
 		}
 		pending_layout->visible_from = 0;
 		state = ReclusterCommitLifecycle::PREPARED;
-		throw;
+		std::rethrow_exception(commit_error);
 	}
 }
 

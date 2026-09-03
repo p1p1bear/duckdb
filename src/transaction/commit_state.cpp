@@ -63,7 +63,10 @@ void CommitDropState::RemoveIndex(TableIndexList &indexes, Identifier name) {
 }
 
 void CommitDropState::AddRecluster(ReclusterCommitInfo &info) {
-	pending_reclusters.emplace_back(info);
+	if (pending_recluster) {
+		throw InternalException("A transaction cannot finalize multiple recluster changes");
+	}
+	pending_recluster = info;
 }
 
 void CommitDropState::PrepareFinalize() {
@@ -163,7 +166,7 @@ void CommitDropState::RevertPrepared() noexcept {
 void CommitDropState::FinalizeCommit() {
 	PrepareFinalize();
 	irreversible_finalization_started =
-	    !pending_column_drops.empty() || !pending_index_removals.empty() || !pending_reclusters.empty();
+	    !pending_column_drops.empty() || !pending_index_removals.empty() || pending_recluster;
 	if (prepared) {
 		if (prepared->block_batch) {
 			block_manager->Cast<SingleFileBlockManager>().ApplyPreparedBlockDrops(std::move(*prepared->block_batch));
@@ -183,17 +186,17 @@ void CommitDropState::FinalizeCommit() {
 	for (auto &removal : pending_index_removals) {
 		removal.indexes.get().RemoveIndex(removal.name);
 	}
-	for (auto &recluster : pending_reclusters) {
-		recluster.get().FinalizeCommit();
+	if (pending_recluster) {
+		pending_recluster->FinalizeCommit();
 	}
 	pending_column_drops.clear();
 	pending_index_removals.clear();
-	pending_reclusters.clear();
+	pending_recluster = nullptr;
 	prepare_complete = false;
 }
 
 bool CommitDropState::Empty() const {
-	return pending_column_drops.empty() && pending_index_removals.empty() && pending_reclusters.empty();
+	return pending_column_drops.empty() && pending_index_removals.empty() && !pending_recluster;
 }
 
 //===--------------------------------------------------------------------===//

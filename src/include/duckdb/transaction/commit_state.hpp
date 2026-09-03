@@ -80,7 +80,7 @@ private:
 	optional_ptr<BlockManager> block_manager;
 	vector<PendingColumnDropOwnership> pending_column_drops;
 	vector<PendingIndexRemoval> pending_index_removals;
-	vector<reference<ReclusterCommitInfo>> pending_reclusters;
+	optional_ptr<ReclusterCommitInfo> pending_recluster;
 	unique_ptr<CommitDropStatePrepared> prepared;
 	bool prepare_complete = false;
 	bool irreversible_finalization_started = false;

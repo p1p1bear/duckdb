@@ -54,7 +54,7 @@ private:
 	void RevertLayout();
 	void ReleaseRecoveredBlocks();
 	void ReleaseRecoveredBlocksNoThrow() noexcept;
-	void CommitRuntimeWALRetention() noexcept;
+	void CommitRuntimeWALRetention();
 
 private:
 	enum class ReclusterCommitLifecycle : uint8_t { PREPARED, APPLIED, FINALIZED, ROLLED_BACK };
