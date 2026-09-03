@@ -160,18 +160,19 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	if (shared_state) {
 		scheduling = shared_state->GetSchedulingSnapshot();
 	}
-	auto state_matches_catalog = shared_state && scheduling.table_id == metadata.table_id &&
-	                             scheduling.sort_order_id == metadata.current_sort_order_id &&
-	                             scheduling.storage_generation_id == storage_generation_id;
+	auto matches_catalog = [&]() {
+		return shared_state && scheduling.table_id == metadata.table_id &&
+		       scheduling.sort_order_id == metadata.current_sort_order_id &&
+		       scheduling.storage_generation_id == storage_generation_id;
+	};
+	auto state_matches_catalog = matches_catalog();
 	if (!state_matches_catalog && table.timestamp.load() < TRANSACTION_ID_START) {
 		auto ddl_coordination_lock = table_info.GetReclusterDDLCoordinationLock();
 		if (storage.IsMainTable()) {
 			shared_state = SynchronizeTable(table);
 			D_ASSERT(shared_state);
 			scheduling = shared_state->GetSchedulingSnapshot();
-			state_matches_catalog = scheduling.table_id == metadata.table_id &&
-			                        scheduling.sort_order_id == metadata.current_sort_order_id &&
-			                        scheduling.storage_generation_id == storage_generation_id;
+			state_matches_catalog = matches_catalog();
 		}
 	}
 	result.table_id = metadata.table_id;
@@ -180,7 +181,7 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	result.layout_version = table_info.GetSortStorage().current_layout_version.load();
 	result.retired_layout_bytes = retirement_registry.GetRetiredBytes(table_info);
 	if (!result.enabled) {
-		if (shared_state) {
+		if (state_matches_catalog) {
 			result.last_error = shared_state->GetLastError();
 			shared_state->ObserveRemainingWorkAgeMsIfMatches(metadata.table_id, metadata.current_sort_order_id,
 			                                                 storage_generation_id, false);
@@ -213,6 +214,7 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 	vector<ReclusterRunStatus> runs;
 	idx_t total_live_bytes = 0;
 	idx_t current_live_bytes = 0;
+	idx_t largest_run_bytes = 0;
 	bool previous_was_current = false;
 	bool has_remaining_work = false;
 	idx_t transient_remaining_bytes = 0;
@@ -233,13 +235,14 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		auto is_current = organization.sort_order_id == result.current_sort_order_id;
 		if (is_current) {
 			current_live_bytes = SaturatingAddReclusterValue(current_live_bytes, live_bytes);
-			if (!previous_was_current || runs.empty() || runs.back().run_id != organization.run_id) {
+			if (!previous_was_current || runs.back().run_id != organization.run_id) {
 				ReclusterRunStatus run;
 				run.run_id = organization.run_id;
 				runs.push_back(std::move(run));
 			}
 			auto &run = runs.back();
 			run.live_bytes = SaturatingAddReclusterValue(run.live_bytes, live_bytes);
+			largest_run_bytes = MaxValue(largest_run_bytes, run.live_bytes);
 			AddRunStatistics(run, row_group, first_sort_index.GetIndex(), live_rows);
 		}
 
@@ -269,10 +272,6 @@ ReclusterTableStatus ReclusterManager::GetTableStatus(DuckTableEntry &table) {
 		result.current_order_coverage = 1;
 	} else {
 		result.current_order_coverage = static_cast<double>(current_live_bytes) / static_cast<double>(total_live_bytes);
-	}
-	idx_t largest_run_bytes = 0;
-	for (auto &run : runs) {
-		largest_run_bytes = MaxValue(largest_run_bytes, run.live_bytes);
 	}
 	if (total_live_bytes > 0) {
 		result.largest_run_fraction = static_cast<double>(largest_run_bytes) / static_cast<double>(total_live_bytes);

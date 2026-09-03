@@ -109,18 +109,18 @@ public:
 		return retirement_registry;
 	}
 
-	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
-		return layout_publish_lock.GetSharedLock();
-	}
 	unique_ptr<StorageLockKey> GetExclusiveLayoutPublishLock() {
 		return layout_publish_lock.GetExclusiveLock();
-	}
-	unique_ptr<StorageLockKey> TryGetSharedLayoutPublishLock() {
-		return layout_publish_lock.TryGetSharedLock();
 	}
 
 private:
 	friend class ReclusterAutoTask;
+	unique_ptr<StorageLockKey> GetSharedLayoutPublishLock() {
+		return layout_publish_lock.GetSharedLock();
+	}
+	unique_ptr<StorageLockKey> TryGetSharedLayoutPublishLock() {
+		return layout_publish_lock.TryGetSharedLock();
+	}
 
 	bool InitializeAutoScheduler();
 	void RunAutoReclusterPass() noexcept;

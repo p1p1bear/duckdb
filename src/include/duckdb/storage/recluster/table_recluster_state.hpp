@@ -17,6 +17,8 @@
 
 namespace duckdb {
 
+class ReclusterManager;
+
 struct TableReclusterTaskStatus {
 	idx_t active_prepare_tasks = 0;
 	idx_t pending_finalize_tasks = 0;
@@ -63,15 +65,18 @@ public:
 	void SetLastError(string error);
 	optional<string> GetLastError() const;
 
+	idx_t GetTaskCount() const;
+
+private:
+	friend class ReclusterManager;
+
 	unique_lock<mutex> LockFinalize() {
 		return unique_lock<mutex>(finalize_mutex);
 	}
 	unique_lock<mutex> TryLockExplicit() {
 		return unique_lock<mutex>(explicit_mutex, std::try_to_lock);
 	}
-	idx_t GetTaskCount() const;
 
-private:
 	struct RangeReservation {
 		RowGroupRange range;
 		recluster_task_id_t task_id;
