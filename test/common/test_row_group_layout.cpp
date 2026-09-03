@@ -1159,6 +1159,65 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 	DeleteDatabase(path);
 }
 
+TEST_CASE("Concurrent sorted inserts publish independent mergeable runs", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("concurrent_sorted_insert.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection setup(db);
+	Connection first_writer(db);
+	Connection second_writer(db);
+	REQUIRE_NO_FAIL(setup.Query("SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(
+	    setup.Query("ATTACH '" + path + "' AS concurrent_sorted (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(setup.Query("USE concurrent_sorted"));
+	REQUIRE_NO_FAIL(first_writer.Query("USE concurrent_sorted"));
+	REQUIRE_NO_FAIL(second_writer.Query("USE concurrent_sorted"));
+	REQUIRE_NO_FAIL(setup.Query("CREATE TABLE target(k BIGINT, source INTEGER) SORTED BY (k)"));
+
+	std::promise<void> start_writes;
+	auto write_signal = start_writes.get_future().share();
+	auto first_result = std::async(std::launch::async, [&]() {
+		write_signal.wait();
+		return first_writer.Query("INSERT INTO target SELECT i * 2, 1 FROM range(8192) t(i)");
+	});
+	auto second_result = std::async(std::launch::async, [&]() {
+		write_signal.wait();
+		return second_writer.Query("INSERT INTO target SELECT i * 2 + 1, 2 FROM range(8192) t(i)");
+	});
+	start_writes.set_value();
+	auto first_status = first_result.wait_for(std::chrono::seconds(10));
+	auto second_status = second_result.wait_for(std::chrono::seconds(10));
+	if (first_status != std::future_status::ready || second_status != std::future_status::ready) {
+		first_writer.Interrupt();
+		second_writer.Interrupt();
+	}
+	REQUIRE(first_status == std::future_status::ready);
+	REQUIRE(second_status == std::future_status::ready);
+	REQUIRE_NO_FAIL(first_result.get());
+	REQUIRE_NO_FAIL(second_result.get());
+
+	auto before = setup.Query("SELECT count(*), sum(source) FROM target");
+	REQUIRE(CHECK_COLUMN(before, 0, {16384}));
+	REQUIRE(CHECK_COLUMN(before, 1, {24576}));
+	auto runs_before = setup.Query("SELECT run_count FROM duckdb_recluster_status() WHERE table_name = 'target'");
+	REQUIRE(CHECK_COLUMN(runs_before, 0, {2}));
+	auto inversions_before =
+	    setup.Query("SELECT count(*) > 0 FROM (SELECT k, lag(k) OVER () previous_k FROM target) WHERE k < previous_k");
+	REQUIRE(CHECK_COLUMN(inversions_before, 0, {true}));
+
+	REQUIRE_NO_FAIL(setup.Query("CHECKPOINT concurrent_sorted"));
+	auto recluster =
+	    setup.Query("SELECT tasks_completed, state FROM recluster('concurrent_sorted.main.target', mode='full')");
+	REQUIRE(CHECK_COLUMN(recluster, 0, {1}));
+	REQUIRE(CHECK_COLUMN(recluster, 1, {"COMPLETE"}));
+	auto inversions =
+	    setup.Query("SELECT count(*) FROM (SELECT k, lag(k) OVER () previous_k FROM target) WHERE k < previous_k");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	auto runs_after = setup.Query("SELECT run_count FROM duckdb_recluster_status() WHERE table_name = 'target'");
+	REQUIRE(CHECK_COLUMN(runs_after, 0, {1}));
+	DeleteDatabase(path);
+}
+
 TEST_CASE("Sorted table ALTER waits for transaction write gates", "[storage][row_group_layout]") {
 	auto path = TestCreatePath("sorted_write_gate.db");
 	DeleteDatabase(path);

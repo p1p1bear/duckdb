@@ -441,7 +441,7 @@ TEST_CASE("Recluster output supports an empty replacement", "[storage][recluster
 	DeleteDatabase(path);
 }
 
-TEST_CASE("Recluster run merge catches up concurrent deletes", "[storage][recluster_delete_catchup]") {
+TEST_CASE("Recluster run merge preserves concurrent appends and deletes", "[storage][recluster_delete_catchup]") {
 	auto path = TestCreatePath("recluster_run_merge_delete.db");
 	DeleteDatabase(path);
 	DuckDB db;
@@ -460,6 +460,9 @@ TEST_CASE("Recluster run merge catches up concurrent deletes", "[storage][reclus
 	REQUIRE(start.task);
 	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
 	REQUIRE(start.task->GetTaskContext().GetCandidate().type == ReclusterCandidateType::RUN_MERGE);
+	Connection writer(db);
+	REQUIRE_NO_FAIL(writer.Query("USE merge_delete_db"));
+	REQUIRE_NO_FAIL(writer.Query("INSERT INTO tbl SELECT 2047 - i, 10000 + i FROM range(2048) t(i)"));
 	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload = 17"));
 	REQUIRE(start.task->GetLatestDeleteSequence() == 1);
 	PrepareOutputTask(start);
@@ -472,12 +475,24 @@ TEST_CASE("Recluster run merge catches up concurrent deletes", "[storage][reclus
 		status = entry.GetStorage().GetDataTableInfo()->GetDB().GetReclusterManager().FinalizeTask(entry, start.task);
 	});
 	REQUIRE(status == ReclusterTaskFinalizeStatus::PUBLISHED);
-	auto result = con.Query("SELECT count(*), count(*) FILTER (WHERE payload = 17) FROM tbl");
-	REQUIRE(CHECK_COLUMN(result, 0, {8191}));
+	auto result = con.Query("SELECT count(*), count(*) FILTER (WHERE payload = 17), "
+	                        "count(*) FILTER (WHERE payload >= 10000) FROM tbl");
+	REQUIRE(CHECK_COLUMN(result, 0, {10239}));
 	REQUIRE(CHECK_COLUMN(result, 1, {0}));
-	auto inversions =
+	REQUIRE(CHECK_COLUMN(result, 2, {2048}));
+	auto original_inversions = con.Query("SELECT count(*) FROM ("
+	                                     "SELECT k, lag(k) OVER () previous_k FROM tbl WHERE payload < 10000"
+	                                     ") WHERE k < previous_k");
+	REQUIRE(CHECK_COLUMN(original_inversions, 0, {0}));
+	auto appended_inversions = con.Query("SELECT count(*) FROM ("
+	                                     "SELECT k, lag(k) OVER () previous_k FROM tbl WHERE payload >= 10000"
+	                                     ") WHERE k < previous_k");
+	REQUIRE(CHECK_COLUMN(appended_inversions, 0, {0}));
+	auto global_inversions =
 	    con.Query("SELECT count(*) FROM (SELECT k, lag(k) OVER () previous_k FROM tbl) WHERE k < previous_k");
-	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	REQUIRE(CHECK_COLUMN(global_inversions, 0, {1}));
+	auto runs = con.Query("SELECT run_count FROM duckdb_recluster_status() WHERE table_name = 'tbl'");
+	REQUIRE(CHECK_COLUMN(runs, 0, {2}));
 	start.task.reset();
 	DeleteDatabase(path);
 }

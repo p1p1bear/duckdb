@@ -361,6 +361,93 @@ SELECT count(*) FROM (
 ----
 0
 
+# Empty and single-row tables follow the same explicit maintenance path.
+statement ok
+SET auto_recluster=false
+
+statement ok
+CREATE TABLE empty_sorted(k INTEGER) SORTED BY (k)
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.empty_sorted', create_checkpoint=true)
+----
+0	0	COMPLETE
+
+statement ok
+CREATE TABLE single_sorted(k INTEGER) SORTED BY (k)
+
+statement ok
+INSERT INTO single_sorted VALUES (42)
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.single_sorted', create_checkpoint=true)
+----
+1	0	COMPLETE
+
+query I
+SELECT k FROM single_sorted
+----
+42
+
+# Recluster uses DuckDB's existing sort implementation for scalar and nested
+# keys, including NULLS LAST semantics.
+statement ok
+CREATE TABLE typed_keys(
+    v VARCHAR,
+    ts TIMESTAMP,
+    amount DECIMAL(18, 2),
+    nested_key INTEGER[],
+    payload BIGINT
+)
+
+statement ok
+INSERT INTO typed_keys
+SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE lpad(((4095 - i) % 97)::VARCHAR, 3, '0') END,
+       CASE WHEN i % 19 = 0 THEN NULL
+            ELSE TIMESTAMP '2026-01-01' + ((4095 - i) % 113) * INTERVAL 1 MINUTE END,
+       CASE WHEN i % 23 = 0 THEN NULL ELSE (((4095 - i) % 101) - 50)::DECIMAL(18, 2) END,
+       CASE WHEN i % 29 = 0 THEN NULL ELSE [((4095 - i) % 31)::INTEGER, (i % 7)::INTEGER] END,
+       i
+FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE typed_keys SET SORTED BY (v, ts, amount, nested_key)
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.typed_keys')
+----
+1	0	COMPLETE
+
+query I
+SELECT count(*)
+FROM (
+    SELECT sort_key, lag(sort_key) OVER () AS previous_key
+    FROM (
+        SELECT create_sort_key(v, 'ASC NULLS LAST',
+                               ts, 'ASC NULLS LAST',
+                               amount, 'ASC NULLS LAST',
+                               nested_key, 'ASC NULLS LAST') AS sort_key
+        FROM typed_keys
+    ) keys
+)
+WHERE previous_key IS NOT NULL AND sort_key < previous_key
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM typed_keys
+----
+4096	8386560
+
 statement ok
 CHECKPOINT r
 
