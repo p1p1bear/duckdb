@@ -1,8 +1,10 @@
 #include "duckdb/storage/recluster/recluster_run_merger.hpp"
 
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/storage/recluster/range_task.hpp"
 #include "duckdb/storage/recluster/recluster_range_scanner.hpp"
 #include "duckdb/storage/recluster/recluster_task_context.hpp"
@@ -12,15 +14,21 @@
 namespace duckdb {
 
 struct ReclusterRunMerger::RunState {
-	RunState(ReclusterTaskContext &task_context, RowGroupRange range_p, idx_t slot_offset_p)
-	    : slot_offset(slot_offset_p), scanner(make_uniq<ReclusterRangeScanner>(task_context, range_p)) {
+	RunState(ReclusterTaskContext &task_context, RowGroupRange range_p, idx_t slot_offset_p,
+	         const vector<LogicalType> &key_types)
+	    : slot_offset(slot_offset_p), scanner(make_uniq<ReclusterRangeScanner>(task_context, range_p)),
+	      sort_key_cache(Allocator::Get(task_context.GetSnapshotContext()), LogicalType::BLOB),
+	      sort_keys(sort_key_cache) {
 		scanner->InitializeChunk(input);
+		key_input.InitializeEmpty(key_types);
 	}
 
 	idx_t slot_offset;
 	unique_ptr<ReclusterRangeScanner> scanner;
 	DataChunk input;
-	unique_ptr<Vector> sort_keys;
+	DataChunk key_input;
+	VectorCache sort_key_cache;
+	Vector sort_keys;
 	const string_t *key_data = nullptr;
 	idx_t position = 0;
 	idx_t count = 0;
@@ -53,6 +61,11 @@ void ReclusterRunMerger::BuildRunStates() {
 	if (candidate.type == ReclusterCandidateType::CONVERSION || candidate.run_count == 0) {
 		throw InternalException("Recluster run merger requires at least one current sorted run");
 	}
+	vector<LogicalType> key_types;
+	key_types.reserve(sort_columns.size());
+	for (auto column_index : sort_columns) {
+		key_types.push_back(output_types[column_index]);
+	}
 
 	optional<RowGroupSortMetadata> active_metadata;
 	RowGroupRange active_range {0, 0};
@@ -65,7 +78,7 @@ void ReclusterRunMerger::BuildRunStates() {
 		if (!active_metadata || identity.sort_metadata != *active_metadata) {
 			if (active_metadata) {
 				auto slot_offset = runs.size() * STANDARD_VECTOR_SIZE;
-				runs.push_back(make_uniq<RunState>(task_context, active_range, slot_offset));
+				runs.push_back(make_uniq<RunState>(task_context, active_range, slot_offset, key_types));
 			}
 			active_metadata = identity.sort_metadata;
 			active_range = {identity.start, identity_end};
@@ -78,7 +91,7 @@ void ReclusterRunMerger::BuildRunStates() {
 	}
 	if (active_metadata) {
 		auto slot_offset = runs.size() * STANDARD_VECTOR_SIZE;
-		runs.push_back(make_uniq<RunState>(task_context, active_range, slot_offset));
+		runs.push_back(make_uniq<RunState>(task_context, active_range, slot_offset, key_types));
 	}
 	if (runs.size() != candidate.run_count) {
 		throw InternalException("Recluster run merger input run count changed");
@@ -124,7 +137,7 @@ bool ReclusterRunMerger::FillRun(RunState &run) {
 		run.position = 0;
 		run.count = 0;
 		run.key_data = nullptr;
-		run.sort_keys.reset();
+		run.sort_keys.ResetFromCache(run.sort_key_cache);
 		return false;
 	}
 	if (run.input.size() == 0 || run.input.size() > STANDARD_VECTOR_SIZE) {
@@ -136,17 +149,10 @@ bool ReclusterRunMerger::FillRun(RunState &run) {
 		                       run.slot_offset);
 	}
 
-	DataChunk key_input;
-	vector<LogicalType> key_types;
-	key_types.reserve(sort_columns.size());
-	for (auto column_index : sort_columns) {
-		key_types.push_back(output_types[column_index]);
-	}
-	key_input.InitializeEmpty(key_types);
-	key_input.ReferenceColumns(run.input, sort_columns);
-	run.sort_keys = make_uniq<Vector>(LogicalType::BLOB, run.input.size());
-	CreateSortKeyHelpers::CreateSortKey(key_input, sort_modifiers, *run.sort_keys);
-	run.key_data = FlatVector::GetData<string_t>(*run.sort_keys);
+	run.key_input.ReferenceColumns(run.input, sort_columns);
+	run.sort_keys.ResetFromCache(run.sort_key_cache);
+	CreateSortKeyHelpers::CreateSortKey(run.key_input, sort_modifiers, run.sort_keys);
+	run.key_data = FlatVector::GetData<string_t>(run.sort_keys);
 	run.position = 0;
 	run.count = run.input.size();
 
