@@ -256,7 +256,7 @@ bool ReclusterRunMerger::Scan(DataChunk &chunk) {
 	if (output_count == 0 || !has_previous_key) {
 		throw InternalException("Recluster run merger produced an empty output batch");
 	}
-	chunk.Append(source_rows, selection, output_count);
+	chunk.Slice(source_rows, selection, output_count);
 	last_output_key.assign(previous_key.GetData(), previous_key.GetSize());
 	has_last_output_key = true;
 	return true;

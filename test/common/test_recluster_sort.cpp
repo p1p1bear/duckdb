@@ -161,20 +161,22 @@ TEST_CASE("Recluster sorter streams existing sorted runs", "[storage][recluster_
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS merge_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
 	REQUIRE_NO_FAIL(con.Query("USE merge_db"));
-	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k1 INTEGER, k2 VARCHAR, payload BIGINT) SORTED BY (k1, k2)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k1 INTEGER, k2 VARCHAR, payload BIGINT, "
+	                          "nested_payload STRUCT(id BIGINT, tags VARCHAR[])) SORTED BY (k1, k2)"));
 	for (idx_t run_index = 0; run_index < 3; run_index++) {
-		auto query = "INSERT INTO tbl SELECT CASE WHEN i % 31 = 0 THEN NULL ELSE ((i * 3 + " +
-		             std::to_string(run_index) +
+		auto run = std::to_string(run_index);
+		auto query = "INSERT INTO tbl SELECT CASE WHEN i % 31 = 0 THEN NULL ELSE ((i * 3 + " + run +
 		             ") % 2048)::INTEGER END, CASE WHEN i % 47 = 0 THEN NULL ELSE "
 		             "lpad(((i + " +
-		             std::to_string(run_index) + ") % 97)::VARCHAR, 3, '0') END, (" + std::to_string(run_index) +
-		             " * 10000 + i)::BIGINT FROM range(4096) t(i)";
+		             run + ") % 97)::VARCHAR, 3, '0') END, (" + run +
+		             " * 10000 + i)::BIGINT, {'id': i, 'tags': [i::VARCHAR, " + run +
+		             "::VARCHAR]} FROM range(4096) t(i)";
 		REQUIRE_NO_FAIL(con.Query(query));
 	}
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT merge_db"));
 	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE payload % 997 = 0"));
-	auto expected_result =
-	    con.Query("SELECT k1, k2, payload, rowid FROM tbl ORDER BY k1 ASC NULLS LAST, k2 ASC NULLS LAST, rowid");
+	auto expected_result = con.Query("SELECT k1, k2, payload, nested_payload, rowid FROM tbl "
+	                                 "ORDER BY k1 ASC NULLS LAST, k2 ASC NULLS LAST, rowid");
 	REQUIRE(expected_result);
 	REQUIRE(!expected_result->HasError());
 	auto &expected = expected_result->Cast<MaterializedQueryResult>();
@@ -192,12 +194,13 @@ TEST_CASE("Recluster sorter streams existing sorted runs", "[storage][recluster_
 	sorter.InitializeChunk(chunk);
 	idx_t output_row = 0;
 	while (sorter.Scan(chunk)) {
+		REQUIRE(chunk.data[0].GetVectorType() == VectorType::DICTIONARY_VECTOR);
 		for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
 			for (idx_t column_index = 0; column_index < chunk.ColumnCount(); column_index++) {
 				REQUIRE(Value::NotDistinctFrom(chunk.GetValue(column_index, row_index),
 				                               expected.GetValue(column_index, output_row)));
 			}
-			auto old_rowid = chunk.GetValue(3, row_index).GetValue<row_t>();
+			auto old_rowid = chunk.GetValue(4, row_index).GetValue<row_t>();
 			REQUIRE(start.task->GetTaskContext().GetRowIdRemap().GetNewRowId(old_rowid) ==
 			        start.task->GetRange().start + NumericCast<row_t>(output_row));
 			output_row++;
