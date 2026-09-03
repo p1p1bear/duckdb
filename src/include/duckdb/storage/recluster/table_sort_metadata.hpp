@@ -47,7 +47,6 @@ struct TableSortCatalogMetadata {
 	vector<SortOrderDefinition> definitions;
 
 	const SortOrderDefinition *GetCurrent() const;
-	const SortOrderDefinition *GetDefinition(sort_order_id_t id) const;
 	bool IsEnabled() const;
 
 	void Serialize(Serializer &serializer) const;

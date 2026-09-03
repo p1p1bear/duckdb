@@ -37,9 +37,6 @@ public:
 	void InitializeChunk(DataChunk &chunk) const;
 	bool Scan(DataChunk &chunk);
 
-	const vector<LogicalType> &GetOutputTypes() const {
-		return output_types;
-	}
 	idx_t GetInputRowCount() const {
 		return input_row_count.load();
 	}

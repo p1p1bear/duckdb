@@ -21,23 +21,20 @@ static void AdvanceToFinalizing(RangeTask &task) {
 TEST_CASE("Range task control word preserves cancellation and publication flags", "[storage][recluster_state]") {
 	auto task = MakeRangeTask(1, 0, 100);
 	REQUIRE(task->GetState() == RangeTaskState::STARTING);
-	REQUIRE(!task->IsCancelRequested());
-	REQUIRE(!task->IsPublishForbidden());
+	REQUIRE(!task->IsAbortRequested());
 	REQUIRE(!task->IsFinished());
 
 	REQUIRE(task->TryAdvance(RangeTaskState::STARTING, RangeTaskState::PREPARING));
 	task->DisablePublishForJournalFailure();
 	task->RequestCancel();
-	REQUIRE(task->IsPublishForbidden());
-	REQUIRE(task->IsCancelRequested());
+	REQUIRE(task->IsAbortRequested());
 	REQUIRE(!task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
 	REQUIRE(task->TryEnterCancelling());
 	REQUIRE(task->GetState() == RangeTaskState::CANCELLING);
 	REQUIRE(task->TryDetach());
 	REQUIRE(task->GetState() == RangeTaskState::DETACHED);
 	REQUIRE(task->IsFinished());
-	REQUIRE(task->IsCancelRequested());
-	REQUIRE(task->IsPublishForbidden());
+	REQUIRE(task->IsAbortRequested());
 }
 
 TEST_CASE("Range task cancellation races atomically with commit entry", "[storage][recluster_state]") {
@@ -51,12 +48,12 @@ TEST_CASE("Range task cancellation races atomically with commit entry", "[storag
 		committer.join();
 		canceller.join();
 
-		REQUIRE(task->IsCancelRequested());
+		REQUIRE(task->IsAbortRequested());
 		if (entered_commit) {
 			REQUIRE(task->GetState() == RangeTaskState::COMMITTING);
 			REQUIRE(task->TryFinishCommit(true));
 			REQUIRE(task->GetState() == RangeTaskState::PUBLISHED);
-			REQUIRE(task->IsCancelRequested());
+			REQUIRE(task->IsAbortRequested());
 		} else {
 			REQUIRE(task->GetState() == RangeTaskState::FINALIZING);
 			REQUIRE(task->TryEnterCancelling());
@@ -69,10 +66,10 @@ TEST_CASE("Range task cancellation races atomically with commit entry", "[storag
 TEST_CASE("Table recluster state reserves non-overlapping ranges", "[storage][recluster_state]") {
 	TableReclusterState state(42);
 	REQUIRE(state.GetInitializationToken() == 42);
-	REQUIRE(!state.AcceptsNewTasks());
+	REQUIRE(!state.GetCatalogSnapshot().accepts_new_tasks);
 	REQUIRE(!state.TryRegisterTask(MakeRangeTask(1, 0, 10)));
 
-	state.SetAcceptNewTasks(true);
+	state.SynchronizeCatalog(hugeint_t(0, 42), 1, 1, true);
 	auto first = MakeRangeTask(1, 0, 10);
 	auto adjacent = MakeRangeTask(2, 10, 20);
 	REQUIRE(state.TryRegisterTask(first));
@@ -81,7 +78,7 @@ TEST_CASE("Table recluster state reserves non-overlapping ranges", "[storage][re
 	REQUIRE(!state.TryRegisterTask(MakeRangeTask(1, 20, 30)));
 	REQUIRE(state.GetTask(1).get() == first.get());
 
-	auto ranges = state.GetReservedRanges();
+	auto ranges = state.GetSchedulingSnapshot().reserved_ranges;
 	REQUIRE(ranges.size() == 2);
 	REQUIRE(ranges[0].start == 0);
 	REQUIRE(ranges[0].end == 10);
@@ -93,7 +90,7 @@ TEST_CASE("Table recluster state reserves non-overlapping ranges", "[storage][re
 	REQUIRE(state.TryRegisterTask(MakeRangeTask(3, 0, 10)));
 	auto tasks = state.DisableAndGetTasks();
 	REQUIRE(tasks.size() == 2);
-	REQUIRE(!state.AcceptsNewTasks());
+	REQUIRE(!state.GetCatalogSnapshot().accepts_new_tasks);
 	REQUIRE(!state.TryRegisterTask(MakeRangeTask(4, 20, 30)));
 }
 
@@ -101,11 +98,12 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	TableReclusterState state(99);
 	auto table_id = hugeint_t(7, 11);
 	state.SynchronizeCatalog(table_id, 3, 17, true);
-	REQUIRE(state.AcceptsNewTasks());
-	REQUIRE(state.GetTableId() == table_id);
-	REQUIRE(state.GetCurrentSortOrderId() == 3);
-	REQUIRE(state.GetCurrentStorageGenerationId() == 17);
-	REQUIRE(!state.GetLastCheckpoint());
+	auto catalog = state.GetCatalogSnapshot();
+	REQUIRE(catalog.accepts_new_tasks);
+	REQUIRE(catalog.table_id == table_id);
+	REQUIRE(catalog.sort_order_id == 3);
+	REQUIRE(catalog.storage_generation_id == 17);
+	REQUIRE(!catalog.checkpoint);
 
 	CheckpointLayoutSnapshot snapshot_data;
 	snapshot_data.checkpoint_number = 8;
@@ -115,7 +113,7 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	REQUIRE(!state.TryInstallCheckpointSnapshot(4, 17, snapshot));
 	REQUIRE(!state.TryInstallCheckpointSnapshot(3, 18, snapshot));
 	REQUIRE(state.TryInstallCheckpointSnapshot(3, 17, snapshot));
-	auto installed = state.GetLastCheckpoint();
+	auto installed = state.GetCatalogSnapshot().checkpoint;
 	REQUIRE(installed.get() == snapshot.get());
 	REQUIRE(installed->checkpoint_number == 8);
 
@@ -136,18 +134,18 @@ TEST_CASE("Table recluster state installs snapshots for the active catalog gener
 	state.RemoveTask(task->GetTaskId());
 
 	state.SynchronizeCatalog(table_id, 3, 17, true);
-	REQUIRE(state.GetLastCheckpoint().get() == snapshot.get());
+	REQUIRE(state.GetCatalogSnapshot().checkpoint.get() == snapshot.get());
 	CheckpointLayoutSnapshot replacement_data;
 	replacement_data.checkpoint_number = 9;
 	replacement_data.storage_generation_id = 17;
 	auto replacement = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(replacement_data));
 	REQUIRE(state.TryInstallCheckpointSnapshot(3, 17, replacement));
-	REQUIRE(state.GetLastCheckpoint().get() == replacement.get());
+	REQUIRE(state.GetCatalogSnapshot().checkpoint.get() == replacement.get());
 	REQUIRE(installed->checkpoint_number == 8);
 	state.SynchronizeCatalog(table_id, 3, 18, true);
-	REQUIRE(!state.GetLastCheckpoint());
+	REQUIRE(!state.GetCatalogSnapshot().checkpoint);
 	state.SynchronizeCatalog(table_id, INVALID_SORT_ORDER_ID, 18, true);
-	REQUIRE(!state.AcceptsNewTasks());
+	REQUIRE(!state.GetCatalogSnapshot().accepts_new_tasks);
 	REQUIRE_THROWS_AS(state.SynchronizeCatalog(hugeint_t(8, 11), 3, 18, true), InternalException);
 }
 

@@ -64,7 +64,6 @@ private:
 	shared_ptr<DataTable> storage;
 	shared_ptr<const RowGroupLayout> old_layout;
 	shared_ptr<RowGroupLayout> pending_layout;
-	shared_ptr<const RowGroupLayout> published_layout;
 	unique_ptr<PreparedReclusterWAL> prepared_wal;
 	sort_run_id_t recovered_run_id = INVALID_SORT_RUN_ID;
 	vector<block_id_t> recovered_blocks;
@@ -73,7 +72,6 @@ private:
 	ReclusterWALRetentionReservation wal_retention;
 	uint64_t wal_checkpoint_iteration = 0;
 	ReclusterCommitLifecycle state = ReclusterCommitLifecycle::PREPARED;
-	bool is_recovery = false;
 	bool layout_published = false;
 	bool layout_version_advanced = false;
 };

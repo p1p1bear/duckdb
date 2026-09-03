@@ -117,9 +117,12 @@ void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &
 			continue;
 		}
 		auto current_state = pending.storage->GetDataTableInfo()->GetReclusterState();
-		if (current_state.get() != pending.state.get() ||
-		    current_state->GetInitializationToken() != pending.initialization_token ||
-		    current_state->GetTableId() != pending.table_id) {
+		if (current_state.get() != pending.state.get()) {
+			continue;
+		}
+		auto catalog_state = current_state->GetCatalogSnapshot();
+		if (current_state->GetInitializationToken() != pending.initialization_token ||
+		    catalog_state.table_id != pending.table_id) {
 			continue;
 		}
 		auto storage_generation_id = pending.storage->GetRowGroupCollection()->GetStorageGenerationId();
@@ -275,7 +278,8 @@ ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, c
 		}
 		auto &metadata = *table.GetSortMetadata();
 		auto definition = metadata.GetCurrent();
-		if (metadata.table_id != state->GetTableId() || !definition ||
+		auto catalog_state = state->GetCatalogSnapshot();
+		if (metadata.table_id != catalog_state.table_id || !definition ||
 		    definition->sort_order_id != candidate.sort_order_id) {
 			return {};
 		}
@@ -444,7 +448,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 	}
 
 	auto finalize_lock = state->LockFinalize();
-	if (task->IsCancelRequested() || task->IsPublishForbidden()) {
+	if (task->IsAbortRequested()) {
 		return CancelFinalizeTask(*state, task);
 	}
 	if (!state->OwnsTask(task) || !task->TryAdvance(RangeTaskState::PREPARED, RangeTaskState::FINALIZING)) {
@@ -465,7 +469,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 		shared_ptr<const CheckpointLayoutSnapshot> current_checkpoint;
 		unique_ptr<ReclusterCommitInfo> commit_info;
 		while (true) {
-			if (task->IsCancelRequested() || task->IsPublishForbidden()) {
+			if (task->IsAbortRequested()) {
 				return CancelFinalizeTask(*state, task);
 			}
 			auto preparation_layout_lock = GetSharedLayoutPublishLock();
@@ -475,7 +479,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			        current_layout->layout_version) {
 				return FailFinalizeTask(*state, task);
 			}
-			current_checkpoint = state->GetLastCheckpoint();
+			current_checkpoint = state->GetCatalogSnapshot().checkpoint;
 			auto input_check =
 			    CheckFinalizeInputs(*storage->GetRowGroupCollection(), storage->Columns(), candidate, current_layout);
 			if (input_check == FinalizeInputCheck::LAYOUT_CHANGED) {
@@ -540,8 +544,9 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 				    db.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
 				wal_generation_matches = checkpoint_iteration == prepared_wal_checkpoint_iteration;
 			}
+			auto gate_state = state->GetCatalogSnapshot();
 			if (storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
-			    state->GetLastCheckpoint().get() != current_checkpoint.get() ||
+			    gate_state.checkpoint.get() != current_checkpoint.get() ||
 			    task->GetLatestDeleteSequence() != final_scan.resolved_through || !wal_generation_matches) {
 				layout_lock.reset();
 				table_write_gate.reset();
@@ -554,20 +559,22 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			break;
 		}
 
-		if (task->IsCancelRequested() || task->IsPublishForbidden()) {
+		if (task->IsAbortRequested()) {
 			return CancelFinalizeTask(*state, task);
 		}
 		auto current_definition = table.GetSortMetadata() ? table.GetSortMetadata()->GetCurrent() : nullptr;
+		auto catalog_state = state->GetCatalogSnapshot();
 		if (!storage->IsMainTable() || &table.GetStorage() != storage.get() || !table.SortEnabled() ||
 		    !current_definition || !(*current_definition == task_context.GetSortDefinition()) ||
 		    table.GetSortMetadata()->table_id != task_context.GetTableId() ||
 		    state->GetInitializationToken() != task_context.GetInitializationToken() || !state->OwnsTask(task) ||
-		    state->GetCurrentSortOrderId() != candidate.sort_order_id ||
-		    state->GetCurrentStorageGenerationId() != candidate.storage_generation_id ||
+		    !catalog_state.accepts_new_tasks || catalog_state.table_id != task_context.GetTableId() ||
+		    catalog_state.sort_order_id != candidate.sort_order_id ||
+		    catalog_state.storage_generation_id != candidate.storage_generation_id ||
 		    storage->GetRowGroupCollection()->GetStorageGenerationId() != candidate.storage_generation_id ||
 		    !current_layout || !commit_info ||
 		    storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
-		    state->GetLastCheckpoint().get() != current_checkpoint.get() ||
+		    catalog_state.checkpoint.get() != current_checkpoint.get() ||
 		    current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
 		    storage->GetDataTableInfo()->GetSortStorage().current_layout_version.load() !=
 		        current_layout->layout_version) {
@@ -803,8 +810,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		stale_attempts = 0;
 
 		try {
-			ReclusterOutputWriter writer(*start.task);
-			writer.Write();
+			WriteReclusterOutput(*start.task);
 			if (!start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES)) {
 				throw InternalException("Failed to begin explicit recluster DELETE catch-up");
 			}

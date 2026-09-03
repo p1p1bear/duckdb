@@ -43,15 +43,11 @@ bool SortOrderDefinition::operator==(const SortOrderDefinition &other) const {
 }
 
 const SortOrderDefinition *TableSortCatalogMetadata::GetCurrent() const {
-	return GetDefinition(current_sort_order_id);
-}
-
-const SortOrderDefinition *TableSortCatalogMetadata::GetDefinition(sort_order_id_t id) const {
-	if (id == INVALID_SORT_ORDER_ID) {
+	if (!IsEnabled()) {
 		return nullptr;
 	}
 	for (auto &definition : definitions) {
-		if (definition.sort_order_id == id) {
+		if (definition.sort_order_id == current_sort_order_id) {
 			return &definition;
 		}
 	}

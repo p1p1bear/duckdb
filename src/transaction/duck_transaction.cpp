@@ -190,7 +190,6 @@ static void CancelTaskForDeleteJournalFailure(const shared_ptr<RangeTask> &task)
 		return;
 	}
 	task->DisablePublishForJournalFailure();
-	task->RequestCancel();
 }
 
 void DuckTransaction::RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[],
@@ -205,7 +204,7 @@ void DuckTransaction::RecordReclusterDeletes(DataTableInfo &info, row_t vector_b
 
 	auto first_row_id = vector_base + rows[0];
 	auto task = state->GetTaskForRow(first_row_id);
-	if (!task || task->IsCancelRequested() || task->IsPublishForbidden() || task->IsFinished()) {
+	if (!task || task->IsAbortRequested() || task->IsFinished()) {
 		return;
 	}
 	for (idx_t row_index = 0; row_index < count; row_index++) {
@@ -304,7 +303,7 @@ ErrorData DuckTransaction::PrepareReclusterCommit() noexcept {
 
 	for (auto &pending_ref : ordered_deletes) {
 		auto &pending = pending_ref.get();
-		if (pending.task->IsCancelRequested() || pending.task->IsPublishForbidden() || pending.task->IsFinished()) {
+		if (pending.task->IsAbortRequested() || pending.task->IsFinished()) {
 			continue;
 		}
 		auto slot = pending.task->TryReserveDeleteSlot(std::move(pending.old_rowids));

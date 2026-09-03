@@ -13,11 +13,10 @@ namespace duckdb {
 
 struct ReclusterRunMerger::RunState {
 	RunState(ReclusterTaskContext &task_context, RowGroupRange range_p, idx_t slot_offset_p)
-	    : range(range_p), slot_offset(slot_offset_p), scanner(make_uniq<ReclusterRangeScanner>(task_context, range)) {
+	    : slot_offset(slot_offset_p), scanner(make_uniq<ReclusterRangeScanner>(task_context, range_p)) {
 		scanner->InitializeChunk(input);
 	}
 
-	RowGroupRange range;
 	idx_t slot_offset;
 	unique_ptr<ReclusterRangeScanner> scanner;
 	DataChunk input;
@@ -40,7 +39,7 @@ ReclusterRunMerger::~ReclusterRunMerger() {
 }
 
 void ReclusterRunMerger::CheckTask() const {
-	if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+	if (task.IsAbortRequested()) {
 		throw InterruptException("Recluster task was cancelled during run merge");
 	}
 	if (task.GetState() != RangeTaskState::PREPARING) {
@@ -109,7 +108,7 @@ void ReclusterRunMerger::Prepare() {
 	if (runs.size() > NumericLimits<idx_t>::Maximum() / STANDARD_VECTOR_SIZE) {
 		throw InternalException("Recluster run merger source capacity overflow");
 	}
-	source_capacity = runs.size() * STANDARD_VECTOR_SIZE;
+	auto source_capacity = runs.size() * STANDARD_VECTOR_SIZE;
 	source_rows.Initialize(task_context.GetSnapshotContext(), output_types, source_capacity);
 	source_rows.SetChildCardinality(source_capacity);
 	prepared = true;
@@ -254,7 +253,6 @@ bool ReclusterRunMerger::Scan(DataChunk &chunk) {
 	chunk.Append(source_rows, selection, output_count);
 	last_output_key.assign(previous_key.GetData(), previous_key.GetSize());
 	has_last_output_key = true;
-	output_row_count += output_count;
 	return true;
 }
 

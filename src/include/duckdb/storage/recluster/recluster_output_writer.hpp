@@ -45,14 +45,12 @@ public:
 	vector<shared_ptr<RowGroup>> GetRowGroups() const;
 
 	sort_order_id_t GetSortOrderId() const {
-		return sort_order_id;
+		return manifest.header.sort_order_id;
 	}
 	sort_run_id_t GetRunId() const {
-		return run_id;
+		return manifest.header.run_id;
 	}
-	idx_t GetRowCount() const {
-		return row_count;
-	}
+	idx_t GetRowCount() const;
 	idx_t GetByteSize() const;
 
 	void MarkPublished();
@@ -61,11 +59,10 @@ public:
 private:
 	friend class ReclusterDeleteCatchup;
 	friend class ReclusterCommitInfo;
-	friend class ReclusterOutputWriter;
+	friend void WriteReclusterOutput(RangeTask &task);
 
 	ReclusterOutput(BlockManager &block_manager, shared_ptr<RowGroupCollection> collection,
-	                unique_ptr<PersistentCollectionData> persistent_data, sort_order_id_t sort_order_id,
-	                sort_run_id_t run_id, idx_t row_count,
+	                unique_ptr<PersistentCollectionData> persistent_data,
 	                unique_ptr<TaskPrivateMetadataBlockOwner> replacement_metadata_owner,
 	                unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner, ReplacementManifest manifest,
 	                MetaBlockPointer manifest_pointer);
@@ -87,23 +84,9 @@ private:
 	MetaBlockPointer manifest_pointer;
 	vector<block_id_t> data_block_ids;
 	vector<block_id_t> block_ids;
-	sort_order_id_t sort_order_id;
-	sort_run_id_t run_id;
-	idx_t row_count;
 	bool owns_blocks = false;
 };
 
-class ReclusterOutputWriter {
-public:
-	explicit ReclusterOutputWriter(RangeTask &task);
-
-	void Write();
-
-private:
-	void CheckTask() const;
-
-private:
-	RangeTask &task;
-};
+void WriteReclusterOutput(RangeTask &task);
 
 } // namespace duckdb

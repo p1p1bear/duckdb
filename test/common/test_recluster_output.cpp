@@ -67,8 +67,7 @@ static ReclusterTableStatus GetReclusterStatus(Connection &con, const string &ta
 }
 
 static void PrepareOutputTask(ReclusterTaskStartResult &start) {
-	ReclusterOutputWriter writer(*start.task);
-	writer.Write();
+	WriteReclusterOutput(*start.task);
 	REQUIRE(start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
 	ReclusterDeleteCatchup catchup(*start.task);
 	catchup.Run();
@@ -260,9 +259,8 @@ TEST_CASE("Recluster output writes sorted task-private row groups", "[storage][r
 	REQUIRE(initial_status.pending_finalize_tasks == 0);
 	REQUIRE(initial_status.prepared_bytes == 0);
 
-	ReclusterOutputWriter writer(*start.task);
 	try {
-		writer.Write();
+		WriteReclusterOutput(*start.task);
 	} catch (...) {
 		RemoveOutputTask(con, start, "tbl");
 		throw;
@@ -415,9 +413,8 @@ TEST_CASE("Recluster output supports an empty replacement", "[storage][recluster
 	auto start = StartOutputTask(con, "tbl");
 	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
 	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
-	ReclusterOutputWriter writer(*start.task);
 	try {
-		writer.Write();
+		WriteReclusterOutput(*start.task);
 	} catch (...) {
 		RemoveOutputTask(con, start, "tbl");
 		throw;
@@ -515,8 +512,7 @@ TEST_CASE("Recluster DELETE catch-up persists resolved journal prefixes", "[stor
 	REQUIRE(reserved_slot);
 	REQUIRE(start.task->GetLatestDeleteSequence() == 3);
 
-	ReclusterOutputWriter writer(*start.task);
-	writer.Write();
+	WriteReclusterOutput(*start.task);
 	REQUIRE(start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES));
 	ReclusterDeleteCatchup catchup(*start.task);
 	auto first_result = catchup.Run(1, start.task->GetDeleteJournalLimits().max_rowids);
@@ -619,8 +615,7 @@ TEST_CASE("Recluster DELETE catch-up skips rows absent from an empty replacement
 	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
 	REQUIRE(start.task);
 	OutputTaskCleanupGuard cleanup_guard(con, start, "tbl");
-	ReclusterOutputWriter writer(*start.task);
-	writer.Write();
+	WriteReclusterOutput(*start.task);
 	auto committed_slot = start.task->TryReserveDeleteSlot({start.task->GetRange().start});
 	REQUIRE(committed_slot);
 	REQUIRE(start.task->ResolveDeleteSlot(*committed_slot, DeleteSlotState::COMMITTED));

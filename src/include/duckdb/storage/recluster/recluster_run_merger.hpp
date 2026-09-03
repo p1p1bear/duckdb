@@ -26,10 +26,6 @@ public:
 	void Prepare();
 	bool Scan(DataChunk &chunk);
 
-	idx_t GetOutputRowCount() const {
-		return output_row_count;
-	}
-
 private:
 	struct RunState;
 
@@ -49,8 +45,6 @@ private:
 	vector<unique_ptr<RunState>> runs;
 	vector<idx_t> heap;
 	DataChunk source_rows;
-	idx_t source_capacity = 0;
-	idx_t output_row_count = 0;
 	string last_output_key;
 	bool has_last_output_key = false;
 	bool prepared = false;

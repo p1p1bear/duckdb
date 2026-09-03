@@ -137,8 +137,7 @@ TEST_CASE("Recluster journal exhaustion cancels only the background task", "[sto
 	                                               ReclusterDeleteJournalLimits {1, 1});
 	REQUIRE(state->TryRegisterTask(task));
 	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE i IN (1, 2)"));
-	REQUIRE(task->IsPublishForbidden());
-	REQUIRE(task->IsCancelRequested());
+	REQUIRE(task->IsAbortRequested());
 	REQUIRE(task->GetLatestDeleteSequence() == 0);
 	auto remaining = con.Query("SELECT count(*) FROM tbl WHERE i IN (1, 2)");
 	REQUIRE(remaining);

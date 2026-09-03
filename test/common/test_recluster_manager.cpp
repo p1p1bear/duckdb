@@ -36,7 +36,7 @@ static ReclusterManager &GetReclusterManager(Connection &con, const string &tabl
 static uint64_t GetReclusterCheckpointNumber(Connection &con, const string &table_name) {
 	auto state = GetReclusterState(con, table_name);
 	REQUIRE(state);
-	auto checkpoint = state->GetLastCheckpoint();
+	auto checkpoint = state->GetCatalogSnapshot().checkpoint;
 	REQUIRE(checkpoint);
 	return checkpoint->checkpoint_number;
 }
@@ -69,8 +69,8 @@ TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage]
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT manager_test"));
 		state = GetReclusterState(con, "tbl");
 		REQUIRE(state);
-		REQUIRE(state->AcceptsNewTasks());
-		successful_snapshot = state->GetLastCheckpoint();
+		REQUIRE(state->GetCatalogSnapshot().accepts_new_tasks);
+		successful_snapshot = state->GetCatalogSnapshot().checkpoint;
 		REQUIRE(successful_snapshot);
 		REQUIRE(successful_snapshot->checkpoint_number > 0);
 		REQUIRE(successful_snapshot->row_groups.size() == 2);
@@ -78,7 +78,7 @@ TEST_CASE("Only successful checkpoints publish recluster candidates", "[storage]
 		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i::INTEGER FROM range(4096, 6144) t(i)"));
 		REQUIRE_NO_FAIL(con.Query("SET debug_checkpoint_abort = 'before_header_non_fatal'"));
 		REQUIRE_FAIL(con.Query("CHECKPOINT manager_test"));
-		REQUIRE(state->GetLastCheckpoint() == successful_snapshot);
+		REQUIRE(state->GetCatalogSnapshot().checkpoint == successful_snapshot);
 	}
 	DeleteDatabase(path);
 }
@@ -113,7 +113,7 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 
 		auto checkpoint_state = GetReclusterState(con, "checkpoint_sorted");
 		REQUIRE(checkpoint_state);
-		auto checkpoint_snapshot = checkpoint_state->GetLastCheckpoint();
+		auto checkpoint_snapshot = checkpoint_state->GetCatalogSnapshot().checkpoint;
 		REQUIRE(checkpoint_snapshot);
 		REQUIRE(checkpoint_snapshot->checkpoint_number == 0);
 		REQUIRE(checkpoint_snapshot->row_groups.size() == 2);
@@ -127,11 +127,11 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 
 		auto wal_state = GetReclusterState(con, "wal_sorted");
 		REQUIRE(wal_state);
-		REQUIRE(wal_state->AcceptsNewTasks());
-		REQUIRE(!wal_state->GetLastCheckpoint());
+		REQUIRE(wal_state->GetCatalogSnapshot().accepts_new_tasks);
+		REQUIRE(!wal_state->GetCatalogSnapshot().checkpoint);
 
 		REQUIRE_NO_FAIL(con.Query("CHECKPOINT recovered"));
-		checkpoint_snapshot = checkpoint_state->GetLastCheckpoint();
+		checkpoint_snapshot = checkpoint_state->GetCatalogSnapshot().checkpoint;
 		REQUIRE(checkpoint_snapshot);
 		REQUIRE(checkpoint_snapshot->checkpoint_number > 0);
 		idx_t checkpoint_rows = 0;
@@ -139,7 +139,7 @@ TEST_CASE("Recovery distinguishes checkpoint candidates from WAL-only changes", 
 			checkpoint_rows += row_group.count;
 		}
 		REQUIRE(checkpoint_rows == 6144);
-		auto wal_snapshot = wal_state->GetLastCheckpoint();
+		auto wal_snapshot = wal_state->GetCatalogSnapshot().checkpoint;
 		REQUIRE(wal_snapshot);
 		REQUIRE(wal_snapshot->checkpoint_number == checkpoint_snapshot->checkpoint_number);
 		idx_t wal_rows = 0;
@@ -191,7 +191,7 @@ TEST_CASE("Recluster status keeps old catalog snapshots out of shared state", "[
 	REQUIRE(CHECK_COLUMN(current_result, 0, {"NO_ELIGIBLE_RANGE"}));
 	auto current_state = GetReclusterState(ddl, "initialized");
 	REQUIRE(current_state);
-	auto current_sort_order_id = current_state->GetCurrentSortOrderId();
+	auto current_sort_order_id = current_state->GetCatalogSnapshot().sort_order_id;
 	REQUIRE(current_sort_order_id != INVALID_SORT_ORDER_ID);
 	REQUIRE(current_sort_order_id != old_sort_order_id);
 	REQUIRE(!GetReclusterState(ddl, "uninitialized"));
@@ -205,7 +205,7 @@ TEST_CASE("Recluster status keeps old catalog snapshots out of shared state", "[
 	auto uninitialized_status =
 	    old_reader.Query("SELECT count(*) FROM duckdb_recluster_status() WHERE table_name = 'uninitialized'");
 	REQUIRE(CHECK_COLUMN(uninitialized_status, 0, {1}));
-	REQUIRE(current_state->GetCurrentSortOrderId() == current_sort_order_id);
+	REQUIRE(current_state->GetCatalogSnapshot().sort_order_id == current_sort_order_id);
 	REQUIRE(!GetReclusterState(ddl, "uninitialized"));
 	REQUIRE_NO_FAIL(old_reader.Query("ROLLBACK"));
 	DeleteDatabase(path);
@@ -231,9 +231,10 @@ TEST_CASE("Explicit recluster rejects an old catalog snapshot before synchronizi
 
 	auto state = GetReclusterState(setup, "tbl");
 	REQUIRE(state);
-	auto table_id = state->GetTableId();
-	auto storage_generation_id = state->GetCurrentStorageGenerationId();
-	REQUIRE(state->GetCurrentSortOrderId() != INVALID_SORT_ORDER_ID);
+	auto catalog_state = state->GetCatalogSnapshot();
+	auto table_id = catalog_state.table_id;
+	auto storage_generation_id = catalog_state.storage_generation_id;
+	REQUIRE(catalog_state.sort_order_id != INVALID_SORT_ORDER_ID);
 
 	ddl.BeginTransaction();
 	REQUIRE_NO_FAIL(ddl.Query("ALTER TABLE tbl RESET SORTED BY"));
@@ -248,8 +249,9 @@ TEST_CASE("Explicit recluster rejects an old catalog snapshot before synchronizi
 	});
 	caller_started_future.wait();
 	auto blocked_status = recluster_future.wait_for(std::chrono::milliseconds(100));
-	auto sort_order_while_blocked = state->GetCurrentSortOrderId();
-	auto accepts_tasks_while_blocked = state->AcceptsNewTasks();
+	auto state_while_blocked = state->GetCatalogSnapshot();
+	auto sort_order_while_blocked = state_while_blocked.sort_order_id;
+	auto accepts_tasks_while_blocked = state_while_blocked.accepts_new_tasks;
 	ddl.Commit();
 
 	auto finished_status = recluster_future.wait_for(std::chrono::seconds(5));
@@ -264,8 +266,9 @@ TEST_CASE("Explicit recluster rejects an old catalog snapshot before synchronizi
 	REQUIRE(result);
 	REQUIRE(result->HasError());
 	REQUIRE(result->GetError().find("old catalog snapshot") != string::npos);
-	REQUIRE(state->GetCurrentSortOrderId() == INVALID_SORT_ORDER_ID);
-	REQUIRE(!state->AcceptsNewTasks());
+	auto final_state = state->GetCatalogSnapshot();
+	REQUIRE(final_state.sort_order_id == INVALID_SORT_ORDER_ID);
+	REQUIRE(!final_state.accepts_new_tasks);
 	DeleteDatabase(path);
 }
 

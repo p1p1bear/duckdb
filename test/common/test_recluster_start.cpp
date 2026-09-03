@@ -102,7 +102,7 @@ TEST_CASE("Recluster task start revalidates and registers a read snapshot", "[st
 	auto state = GetStartTestState(con, "tbl");
 	REQUIRE(state);
 	REQUIRE(state->GetTask(result.task->GetTaskId()).get() == result.task.get());
-	auto reserved_ranges = state->GetReservedRanges();
+	auto reserved_ranges = state->GetSchedulingSnapshot().reserved_ranges;
 	REQUIRE(reserved_ranges.size() == 1);
 	REQUIRE(reserved_ranges[0].start == 0);
 	REQUIRE(reserved_ranges[0].end == 4096);
@@ -111,7 +111,7 @@ TEST_CASE("Recluster task start revalidates and registers a read snapshot", "[st
 	REQUIRE(next_candidate.range.end == 8192);
 
 	CleanupStartedTask(state, result.task);
-	REQUIRE(state->GetReservedRanges().empty());
+	REQUIRE(state->GetSchedulingSnapshot().reserved_ranges.empty());
 	DeleteDatabase(path);
 }
 
@@ -234,7 +234,7 @@ TEST_CASE("Recluster task start rejects a stale physical identity", "[storage][r
 	REQUIRE(result.status == ReclusterTaskStartStatus::STALE_CANDIDATE);
 	REQUIRE(!result.task);
 	auto state = GetStartTestState(con, "tbl");
-	REQUIRE(state->GetReservedRanges().empty());
+	REQUIRE(state->GetSchedulingSnapshot().reserved_ranges.empty());
 	DeleteDatabase(path);
 }
 

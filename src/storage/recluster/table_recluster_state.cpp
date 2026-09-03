@@ -13,16 +13,6 @@ TableReclusterState::TableReclusterState(uint64_t initialization_token_p)
 	}
 }
 
-bool TableReclusterState::AcceptsNewTasks() const {
-	lock_guard<mutex> guard(task_lock);
-	return accept_new_tasks;
-}
-
-void TableReclusterState::SetAcceptNewTasks(bool accept) {
-	lock_guard<mutex> guard(task_lock);
-	accept_new_tasks = accept;
-}
-
 void TableReclusterState::SynchronizeCatalog(persistent_table_id_t table_id_p, sort_order_id_t sort_order_id,
                                              uint64_t storage_generation_id, bool accept_new_tasks_p) {
 	lock_guard<mutex> guard(task_lock);
@@ -42,21 +32,6 @@ void TableReclusterState::SynchronizeCatalog(persistent_table_id_t table_id_p, s
 	accept_new_tasks = accept_new_tasks_p && sort_order_id != INVALID_SORT_ORDER_ID;
 }
 
-persistent_table_id_t TableReclusterState::GetTableId() const {
-	lock_guard<mutex> guard(task_lock);
-	return table_id;
-}
-
-sort_order_id_t TableReclusterState::GetCurrentSortOrderId() const {
-	lock_guard<mutex> guard(task_lock);
-	return current_sort_order_id;
-}
-
-uint64_t TableReclusterState::GetCurrentStorageGenerationId() const {
-	lock_guard<mutex> guard(task_lock);
-	return current_storage_generation_id;
-}
-
 bool TableReclusterState::TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
                                                        shared_ptr<const CheckpointLayoutSnapshot> snapshot) noexcept {
 	lock_guard<mutex> guard(task_lock);
@@ -74,9 +49,15 @@ bool TableReclusterState::HasUsableCheckpoint() const {
 	return last_checkpoint && last_checkpoint->checkpoint_number > 0;
 }
 
-shared_ptr<const CheckpointLayoutSnapshot> TableReclusterState::GetLastCheckpoint() const {
+TableReclusterCatalogSnapshot TableReclusterState::GetCatalogSnapshot() const {
 	lock_guard<mutex> guard(task_lock);
-	return last_checkpoint;
+	TableReclusterCatalogSnapshot result;
+	result.accepts_new_tasks = accept_new_tasks;
+	result.table_id = table_id;
+	result.sort_order_id = current_sort_order_id;
+	result.storage_generation_id = current_storage_generation_id;
+	result.checkpoint = last_checkpoint;
+	return result;
 }
 
 TableReclusterSchedulingSnapshot TableReclusterState::GetSchedulingSnapshot() const {
@@ -92,11 +73,6 @@ TableReclusterSchedulingSnapshot TableReclusterState::GetSchedulingSnapshot() co
 		result.reserved_ranges.push_back(entry.second.range);
 	}
 	return result;
-}
-
-void TableReclusterState::ClearLastCheckpoint() {
-	lock_guard<mutex> guard(task_lock);
-	last_checkpoint.reset();
 }
 
 bool TableReclusterState::RangeIsAvailable(const RowGroupRange &range) const {
@@ -121,22 +97,18 @@ bool TableReclusterState::TryRegisterTask(shared_ptr<RangeTask> task) {
 	auto range = task->GetRange();
 
 	lock_guard<mutex> guard(task_lock);
-	if (!accept_new_tasks || tasks.find(task_id) != tasks.end() ||
-	    reservation_starts.find(task_id) != reservation_starts.end() || !RangeIsAvailable(range)) {
+	if (!accept_new_tasks || tasks.find(task_id) != tasks.end() || !RangeIsAvailable(range)) {
 		return false;
 	}
 
-	reservation_starts.reserve(reservation_starts.size() + 1);
 	tasks.reserve(tasks.size() + 1);
 	auto reservation = reserved_ranges.emplace(range.start, RangeReservation {range, task_id});
 	if (!reservation.second) {
 		return false;
 	}
 	try {
-		reservation_starts.emplace(task_id, range.start);
 		tasks.emplace(task_id, std::move(task));
 	} catch (...) {
-		reservation_starts.erase(task_id);
 		tasks.erase(task_id);
 		reserved_ranges.erase(reservation.first);
 		throw;
@@ -150,12 +122,10 @@ bool TableReclusterState::OwnsTask(const shared_ptr<RangeTask> &task) const {
 	}
 	lock_guard<mutex> guard(task_lock);
 	auto task_entry = tasks.find(task->GetTaskId());
-	auto reservation_entry = reservation_starts.find(task->GetTaskId());
-	if (task_entry == tasks.end() || task_entry->second.get() != task.get() ||
-	    reservation_entry == reservation_starts.end() || reservation_entry->second != task->GetRange().start) {
+	if (task_entry == tasks.end() || task_entry->second.get() != task.get()) {
 		return false;
 	}
-	auto range_entry = reserved_ranges.find(reservation_entry->second);
+	auto range_entry = reserved_ranges.find(task->GetRange().start);
 	return range_entry != reserved_ranges.end() && range_entry->second.task_id == task->GetTaskId() &&
 	       range_entry->second.range.start == task->GetRange().start &&
 	       range_entry->second.range.end == task->GetRange().end;
@@ -196,27 +166,21 @@ vector<shared_ptr<RangeTask>> TableReclusterState::DisableAndGetTasks() {
 }
 
 void TableReclusterState::RemoveTaskInternal(recluster_task_id_t task_id) {
-	auto range_entry = reservation_starts.find(task_id);
-	if (range_entry != reservation_starts.end()) {
-		reserved_ranges.erase(range_entry->second);
-		reservation_starts.erase(range_entry);
+	auto task_entry = tasks.find(task_id);
+	if (task_entry == tasks.end()) {
+		return;
 	}
-	tasks.erase(task_id);
+	auto range_entry = reserved_ranges.find(task_entry->second->GetRange().start);
+	D_ASSERT(range_entry != reserved_ranges.end() && range_entry->second.task_id == task_id);
+	if (range_entry != reserved_ranges.end() && range_entry->second.task_id == task_id) {
+		reserved_ranges.erase(range_entry);
+	}
+	tasks.erase(task_entry);
 }
 
 void TableReclusterState::RemoveTask(recluster_task_id_t task_id) {
 	lock_guard<mutex> guard(task_lock);
 	RemoveTaskInternal(task_id);
-}
-
-vector<RowGroupRange> TableReclusterState::GetReservedRanges() const {
-	lock_guard<mutex> guard(task_lock);
-	vector<RowGroupRange> result;
-	result.reserve(reserved_ranges.size());
-	for (auto &entry : reserved_ranges) {
-		result.push_back(entry.second.range);
-	}
-	return result;
 }
 
 TableReclusterTaskStatus TableReclusterState::GetTaskStatus() const {

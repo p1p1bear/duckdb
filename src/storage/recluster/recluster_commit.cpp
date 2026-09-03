@@ -120,7 +120,7 @@ ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared
                                          shared_ptr<RowGroupLayout> pending_layout_p, sort_run_id_t recovered_run_id_p,
                                          vector<block_id_t> recovered_blocks_p, RowGroupRange retired_range)
     : storage(std::move(storage_p)), old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
-      recovered_run_id(recovered_run_id_p), recovered_blocks(std::move(recovered_blocks_p)), is_recovery(true) {
+      recovered_run_id(recovered_run_id_p), recovered_blocks(std::move(recovered_blocks_p)) {
 	if (!storage || !old_layout || !pending_layout || pending_layout->visible_from != 0 ||
 	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
 	    pending_layout->layout_version != old_layout->layout_version + 1 ||
@@ -173,7 +173,7 @@ void ReclusterCommitInfo::ReleaseRecoveredBlocksNoThrow() noexcept {
 }
 
 void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) {
-	if (is_recovery || state != ReclusterCommitLifecycle::PREPARED || !wal_retention.IsActive() || !prepared_wal) {
+	if (!task || state != ReclusterCommitLifecycle::PREPARED || !wal_retention.IsActive() || !prepared_wal) {
 		throw InternalException("Cannot write an applied recluster commit to the WAL");
 	}
 	wal.WriteRecluster(prepared_wal->header);
@@ -184,7 +184,7 @@ void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) {
 }
 
 void ReclusterCommitInfo::CommitRuntimeWALRetention() noexcept {
-	D_ASSERT(!is_recovery);
+	D_ASSERT(task);
 	D_ASSERT(wal_retention.IsActive());
 	auto &attached = storage->GetAttached();
 	auto transaction_end = ReclusterWALPosition {wal_checkpoint_iteration, attached.GetStorageManager().GetWALSize()};
@@ -194,14 +194,13 @@ void ReclusterCommitInfo::CommitRuntimeWALRetention() noexcept {
 
 void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_state) {
 	if (state != ReclusterCommitLifecycle::PREPARED || layout_published ||
-	    (!is_recovery && (!task || task->GetState() != RangeTaskState::COMMITTING))) {
+	    (task && task->GetState() != RangeTaskState::COMMITTING)) {
 		throw InternalException("Invalid recluster commit transition");
 	}
 
 	try {
 		pending_layout->visible_from = commit_id;
-		published_layout = pending_layout;
-		storage->GetRowGroupCollection()->PublishLayout(published_layout);
+		storage->GetRowGroupCollection()->PublishLayout(pending_layout);
 		layout_published = true;
 
 		auto &layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version;
@@ -217,17 +216,16 @@ void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_
 			RevertLayout();
 		}
 		pending_layout->visible_from = 0;
-		published_layout.reset();
 		state = ReclusterCommitLifecycle::PREPARED;
 		throw;
 	}
 }
 
 void ReclusterCommitInfo::RevertLayout() {
-	if (!layout_published || !published_layout) {
+	if (!layout_published) {
 		return;
 	}
-	storage->GetRowGroupCollection()->RevertPublishedLayout(published_layout, old_layout);
+	storage->GetRowGroupCollection()->RevertPublishedLayout(pending_layout, old_layout);
 	if (layout_version_advanced) {
 		auto &layout_version = storage->GetDataTableInfo()->GetSortStorage().current_layout_version;
 		auto expected_version = pending_layout->layout_version;
@@ -245,7 +243,6 @@ void ReclusterCommitInfo::RevertCommit() {
 	}
 	RevertLayout();
 	pending_layout->visible_from = 0;
-	published_layout.reset();
 	state = ReclusterCommitLifecycle::PREPARED;
 }
 
@@ -253,7 +250,7 @@ void ReclusterCommitInfo::FinalizeCommit() {
 	if (state != ReclusterCommitLifecycle::APPLIED || !layout_published) {
 		throw InternalException("Cannot finalize an unapplied recluster commit");
 	}
-	if (is_recovery) {
+	if (!task) {
 		storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Commit(std::move(retirement));
 		storage->GetDataTableInfo()->GetSortStorage().AdvancePastRunId(recovered_run_id);
 		recovered_owned_block_count = 0;
@@ -280,7 +277,7 @@ void ReclusterCommitInfo::Rollback() {
 	if (layout_published) {
 		RevertLayout();
 	}
-	if (is_recovery) {
+	if (!task) {
 		ReleaseRecoveredBlocks();
 		retirement = PreparedReclusterRetirement();
 		state = ReclusterCommitLifecycle::ROLLED_BACK;

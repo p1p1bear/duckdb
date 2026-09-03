@@ -41,7 +41,7 @@ public:
 
 	void ExecuteTask() override {
 		for (idx_t row_group_index = begin; row_group_index < end; row_group_index++) {
-			if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+			if (task.IsAbortRequested()) {
 				throw InterruptException("Recluster task was cancelled");
 			}
 			task.GetTaskContext().InterruptCheck();
@@ -235,21 +235,25 @@ static void FinalizeReclusterRowGroupBatch(DataTable &storage, RowGroupCollectio
 
 ReclusterOutput::ReclusterOutput(BlockManager &block_manager_p, shared_ptr<RowGroupCollection> collection_p,
                                  unique_ptr<PersistentCollectionData> persistent_data_p,
-                                 sort_order_id_t sort_order_id_p, sort_run_id_t run_id_p, idx_t row_count_p,
                                  unique_ptr<TaskPrivateMetadataBlockOwner> replacement_metadata_owner_p,
                                  unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner_p,
                                  ReplacementManifest manifest_p, MetaBlockPointer manifest_pointer_p)
     : block_manager(block_manager_p), collection(std::move(collection_p)),
       persistent_data(std::move(persistent_data_p)),
       replacement_metadata_owner(std::move(replacement_metadata_owner_p)), manifest_owner(std::move(manifest_owner_p)),
-      manifest(std::move(manifest_p)), manifest_pointer(manifest_pointer_p), sort_order_id(sort_order_id_p),
-      run_id(run_id_p), row_count(row_count_p) {
-	if (!collection || !persistent_data || sort_order_id == INVALID_SORT_ORDER_ID || run_id == INVALID_SORT_RUN_ID ||
-	    collection->GetTotalRows() != row_count || !replacement_metadata_owner || !manifest_owner ||
+      manifest(std::move(manifest_p)), manifest_pointer(manifest_pointer_p) {
+	if (!collection || !persistent_data || !replacement_metadata_owner || !manifest_owner ||
 	    !manifest_pointer.IsValid()) {
 		throw InternalException("Invalid recluster private output");
 	}
 	manifest.Validate();
+	idx_t manifest_row_count = 0;
+	for (auto &row_group : manifest.replacement_groups) {
+		manifest_row_count += row_group.tuple_count;
+	}
+	if (collection->GetTotalRows() != manifest_row_count) {
+		throw InternalException("Recluster output row count does not match its manifest");
+	}
 	auto manifest_blocks = manifest_owner->GetBlockIds();
 	if (!std::binary_search(manifest_blocks.begin(), manifest_blocks.end(), manifest_pointer.GetBlockId())) {
 		throw InternalException("Recluster manifest pointer is not owned by its metadata chain");
@@ -281,6 +285,10 @@ vector<shared_ptr<RowGroup>> ReclusterOutput::GetRowGroups() const {
 		result.push_back(row_group->ReferenceNode());
 	}
 	return result;
+}
+
+idx_t ReclusterOutput::GetRowCount() const {
+	return collection->GetTotalRows();
 }
 
 idx_t ReclusterOutput::GetByteSize() const {
@@ -325,7 +333,7 @@ void ReclusterOutput::RefreshBlockIds() {
 
 idx_t ReclusterOutput::ApplyCommittedDeletes(const vector<row_t> &new_rowids) {
 	auto replacement_start = manifest.header.input_range.start;
-	auto replacement_end = replacement_start + NumericCast<row_t>(row_count);
+	auto replacement_end = replacement_start + NumericCast<row_t>(GetRowCount());
 	auto row_groups = collection->GetRowGroups();
 	idx_t deleted_count = 0;
 	idx_t row_index = 0;
@@ -471,17 +479,11 @@ void ReclusterOutput::Abort() {
 	owns_blocks = false;
 }
 
-ReclusterOutputWriter::ReclusterOutputWriter(RangeTask &task_p) : task(task_p) {
-	if (task.GetState() != RangeTaskState::PREPARING || !task.HasTaskContext()) {
-		throw InternalException("Recluster output writer requires a preparing task");
+static void CheckOutputTask(RangeTask &task) {
+	if (!task.HasTaskContext()) {
+		throw InternalException("Recluster output writer requires a task context");
 	}
-	if (task.GetTaskContext().HasOutput()) {
-		throw InternalException("Recluster task already has private output");
-	}
-}
-
-void ReclusterOutputWriter::CheckTask() const {
-	if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+	if (task.IsAbortRequested()) {
 		throw InterruptException("Recluster task was cancelled");
 	}
 	if (task.GetState() != RangeTaskState::PREPARING) {
@@ -499,8 +501,8 @@ static vector<column_t> ReclusterPhysicalColumns(idx_t column_count) {
 	return result;
 }
 
-void ReclusterOutputWriter::Write() {
-	CheckTask();
+void WriteReclusterOutput(RangeTask &task) {
+	CheckOutputTask(task);
 	auto &task_context = task.GetTaskContext();
 	if (task_context.HasOutput()) {
 		throw InternalException("Recluster task already has private output");
@@ -537,7 +539,6 @@ void ReclusterOutputWriter::Write() {
 			sorter.Prepare();
 
 			TableAppendState append_state;
-			bool append_initialized = false;
 			DataChunk sorted_chunk;
 			sorter.InitializeChunk(sorted_chunk);
 			auto physical_columns = ReclusterPhysicalColumns(types.size());
@@ -564,13 +565,12 @@ void ReclusterOutputWriter::Write() {
 				pending_row_groups.clear();
 			};
 			while (sorter.Scan(sorted_chunk)) {
-				CheckTask();
+				CheckOutputTask(task);
 				DataChunk table_chunk;
 				table_chunk.InitializeEmpty(types);
 				table_chunk.ReferenceColumns(sorted_chunk, physical_columns);
-				if (!append_initialized) {
+				if (!append_state.start_row_group) {
 					collection->InitializeAppend(TransactionData(0, 0), append_state, organization);
-					append_initialized = true;
 				}
 				auto completed_row_group = collection->Append(table_chunk, append_state);
 				if (completed_row_group.IsValid()) {
@@ -581,7 +581,7 @@ void ReclusterOutputWriter::Write() {
 					schedule_write_batch();
 				}
 			}
-			if (append_initialized) {
+			if (append_state.start_row_group) {
 				collection->FinalizeAppend(TransactionData(0, 0), append_state);
 				pending_row_groups.push_back(NumericCast<int64_t>(collection->GetRowGroupCount() - 1));
 			}
@@ -609,7 +609,7 @@ void ReclusterOutputWriter::Write() {
 			throw InternalException("Recluster output row IDs exceed the candidate range");
 		}
 		collection->Verify();
-		CheckTask();
+		CheckOutputTask(task);
 	} catch (...) {
 		for (auto &partial_manager : partial_managers) {
 			partial_manager->Rollback();
@@ -619,7 +619,7 @@ void ReclusterOutputWriter::Write() {
 
 	try {
 		auto data_blocks = UniqueSortedBlocks(persistent_data->GetBlockIds());
-		CheckTask();
+		CheckOutputTask(task);
 
 		ReplacementManifest manifest;
 		manifest.header.task_id = task.GetTaskId();
@@ -652,11 +652,10 @@ void ReclusterOutputWriter::Write() {
 		}
 		manifest_owner->Flush();
 		block_manager.FileSync();
-		CheckTask();
-		auto output = unique_ptr<ReclusterOutput>(
-		    new ReclusterOutput(block_manager, collection, std::move(persistent_data), organization.sort_order_id,
-		                        run_id, collection->GetTotalRows(), std::move(replacement_metadata_owner),
-		                        std::move(manifest_owner), std::move(manifest), manifest_pointer));
+		CheckOutputTask(task);
+		auto output = unique_ptr<ReclusterOutput>(new ReclusterOutput(
+		    block_manager, collection, std::move(persistent_data), std::move(replacement_metadata_owner),
+		    std::move(manifest_owner), std::move(manifest), manifest_pointer));
 		vector<block_id_t> task_blocks;
 		for (auto &partial_manager : partial_managers) {
 			auto manager_blocks = partial_manager->TakeTaskPrivateBlocks();

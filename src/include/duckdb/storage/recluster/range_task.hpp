@@ -52,8 +52,7 @@ public:
 	}
 
 	RangeTaskState GetState() const;
-	bool IsCancelRequested() const;
-	bool IsPublishForbidden() const;
+	bool IsAbortRequested() const;
 	bool IsFinished() const;
 	bool HasTaskContext() const {
 		return task_context != nullptr;

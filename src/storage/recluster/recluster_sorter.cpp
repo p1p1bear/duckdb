@@ -30,7 +30,7 @@ ReclusterSorter::~ReclusterSorter() {
 }
 
 void ReclusterSorter::CheckTask() const {
-	if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+	if (task.IsAbortRequested()) {
 		throw InterruptException("Recluster task was cancelled");
 	}
 	if (task.GetState() != RangeTaskState::PREPARING) {

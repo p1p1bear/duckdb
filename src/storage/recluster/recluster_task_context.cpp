@@ -98,11 +98,4 @@ void ReclusterTaskContext::SetOutput(unique_ptr<ReclusterOutput> output_p) {
 	output = std::move(output_p);
 }
 
-unique_ptr<ReclusterOutput> ReclusterTaskContext::TakeOutput() {
-	if (!output) {
-		throw InternalException("Recluster task has no private output");
-	}
-	return std::move(output);
-}
-
 } // namespace duckdb

@@ -16,7 +16,7 @@ ReclusterDeleteCatchup::ReclusterDeleteCatchup(RangeTask &task_p) : task(task_p)
 }
 
 void ReclusterDeleteCatchup::CheckTask() const {
-	if (task.IsCancelRequested() || task.IsPublishForbidden()) {
+	if (task.IsAbortRequested()) {
 		throw InterruptException("Recluster task was cancelled during DELETE catch-up");
 	}
 	if (task.GetState() != RangeTaskState::CATCHING_UP_DELETES) {

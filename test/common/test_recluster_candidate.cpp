@@ -65,7 +65,7 @@ static void InstallCandidateTestRuns(Connection &con, const string &table_name,
 		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
 		REQUIRE(state);
 		REQUIRE(collection->GetRowGroupCount() == run_ids.size());
-		auto sort_order_id = state->GetCurrentSortOrderId();
+		auto sort_order_id = state->GetCatalogSnapshot().sort_order_id;
 		for (idx_t row_group_index = 0; row_group_index < run_ids.size(); row_group_index++) {
 			auto row_group = collection->GetRowGroup(NumericCast<int64_t>(row_group_index));
 			REQUIRE(row_group);
@@ -121,7 +121,7 @@ TEST_CASE("Recluster candidates convert the earliest checkpointed inputs", "[sto
 		auto collection = entry.GetStorage().GetRowGroupCollection();
 		auto row_group = collection->GetRowGroup(0);
 		REQUIRE(row_group);
-		row_group->SetSortMetadata({state->GetCurrentSortOrderId(), 100}, true);
+		row_group->SetSortMetadata({state->GetCatalogSnapshot().sort_order_id, 100}, true);
 	});
 	selection = SelectCandidateForTest(con, "tbl", limits);
 	REQUIRE(selection.candidate);
@@ -135,7 +135,9 @@ TEST_CASE("Recluster candidates convert the earliest checkpointed inputs", "[sto
 		REQUIRE(analysis.IsCheckpointedRowGroup(1));
 	});
 
-	state->ClearLastCheckpoint();
+	auto catalog_state = state->GetCatalogSnapshot();
+	state->SynchronizeCatalog(catalog_state.table_id, catalog_state.sort_order_id,
+	                          catalog_state.storage_generation_id + 1, true);
 	selection = SelectCandidateForTest(con, "tbl", limits);
 	REQUIRE(selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE);
 	REQUIRE(!selection.candidate);

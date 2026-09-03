@@ -79,8 +79,6 @@ TEST_CASE("Table sort catalog metadata round trips", "[storage][sort_metadata]")
 	REQUIRE(output.table_metadata.IsEnabled());
 	REQUIRE(output.table_metadata.GetCurrent() != nullptr);
 	REQUIRE(output.table_metadata.GetCurrent()->sort_order_id == 2);
-	REQUIRE(output.table_metadata.GetDefinition(1) != nullptr);
-	REQUIRE(output.table_metadata.GetDefinition(99) == nullptr);
 }
 
 TEST_CASE("Table sort catalog metadata validates stable identifier bounds", "[storage][sort_metadata]") {

@@ -70,7 +70,6 @@ public:
 	ReclusterOutput &GetOutput();
 	const ReclusterOutput &GetOutput() const;
 	void SetOutput(unique_ptr<ReclusterOutput> output);
-	unique_ptr<ReclusterOutput> TakeOutput();
 
 private:
 	persistent_table_id_t table_id;
