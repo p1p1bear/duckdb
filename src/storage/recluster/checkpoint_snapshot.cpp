@@ -1,5 +1,6 @@
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 
+#include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/checksum.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -172,6 +173,45 @@ optional<RowGroupPhysicalIdentity> ComputeRowGroupPhysicalIdentityV1(const RowGr
 	}
 	result.immutable_data_checksum = ComputeRowGroupPhysicalIdentityChecksumV1(result);
 	return result;
+}
+
+bool MatchRowGroupPhysicalIdentityV1(const RowGroupCollectionSnapshot &snapshot,
+                                     const vector<ColumnDefinition> &columns, const RowGroupPhysicalIdentity &expected,
+                                     LayoutRowGroupEntry &result) {
+	if (!snapshot.Lookup(expected.start, result) || result.row_start != expected.start ||
+	    result.GetRowEnd() != expected.start + NumericCast<row_t>(expected.count)) {
+		return false;
+	}
+	auto identity = ComputeRowGroupPhysicalIdentityV1(*result.row_group, result.row_start, columns);
+	return identity && *identity == expected;
+}
+
+bool MatchRowGroupPhysicalIdentitiesV1(const RowGroupCollectionSnapshot &snapshot,
+                                       const vector<ColumnDefinition> &columns,
+                                       const vector<RowGroupPhysicalIdentity> &expected) {
+	for (auto &row_group : expected) {
+		LayoutRowGroupEntry current;
+		if (!MatchRowGroupPhysicalIdentityV1(snapshot, columns, row_group, current)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+optional_idx FindCheckpointRowGroups(const CheckpointLayoutSnapshot &checkpoint,
+                                     const vector<RowGroupPhysicalIdentity> &expected) {
+	if (expected.empty()) {
+		return optional_idx();
+	}
+	auto entry =
+	    std::lower_bound(checkpoint.row_groups.begin(), checkpoint.row_groups.end(), expected.front().start,
+	                     [](const RowGroupPhysicalIdentity &identity, row_t start) { return identity.start < start; });
+	if (entry == checkpoint.row_groups.end() ||
+	    expected.size() > NumericCast<idx_t>(checkpoint.row_groups.end() - entry) ||
+	    !std::equal(expected.begin(), expected.end(), entry)) {
+		return optional_idx();
+	}
+	return optional_idx(NumericCast<idx_t>(entry - checkpoint.row_groups.begin()));
 }
 
 optional<CheckpointLayoutSnapshot> BuildCheckpointLayoutSnapshot(RowGroupCollection &collection,

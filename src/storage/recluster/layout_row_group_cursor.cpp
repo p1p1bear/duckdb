@@ -32,6 +32,18 @@ const shared_ptr<RowGroupSegmentTree> &RowGroupCollectionSnapshot::GetBaseTree()
 	throw InternalException("Unsupported row group snapshot kind");
 }
 
+bool RowGroupCollectionSnapshot::HasPatch(const RowGroupRange &range) const {
+	D_ASSERT(range.start <= range.end);
+	if (kind != Kind::VERSIONED_LAYOUT || range.start == range.end) {
+		return false;
+	}
+	if (layout->FindPatch(range.start).IsValid()) {
+		return true;
+	}
+	auto next_patch = layout->FindNextPatch(range.start);
+	return next_patch < layout->patches.size() && layout->patches[next_patch]->range.start < range.end;
+}
+
 row_t LayoutRowGroupEntry::GetRowEnd() const {
 	if (!row_group) {
 		throw InternalException("Cannot get the end of an empty row group entry");

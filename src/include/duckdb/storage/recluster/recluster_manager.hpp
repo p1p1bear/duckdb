@@ -11,7 +11,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional.hpp"
 #include "duckdb/common/shared_ptr.hpp"
-#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
 #include "duckdb/storage/recluster/recluster_candidate.hpp"
@@ -126,12 +126,14 @@ private:
 	void RunAutoReclusterPass() noexcept;
 	void FinishAutoReclusterTask() noexcept;
 	void ScheduleAutoReclusterTask() noexcept;
+	void QueueAutoRecluster(const vector<QualifiedName> &table_names, bool discover_tables) noexcept;
 	void RequestAutoCheckpoint() noexcept;
 	void ScheduleAutoCheckpointRetry(int64_t retry_at_ms) noexcept;
 	void ClearAutoCheckpointRequest() noexcept;
 	bool AutoReclusterEnabled() const noexcept;
 	bool AutoCheckpointEnabled() const noexcept;
 	idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const;
+	vector<QualifiedName> DiscoverSortedTables();
 	shared_ptr<TableReclusterState> SynchronizeTable(DuckTableEntry &table);
 	uint64_t AllocateInitializationToken();
 
@@ -145,7 +147,7 @@ private:
 	atomic<bool> auto_scheduler_initialized {false};
 	atomic<bool> auto_scheduler_closing {false};
 	StorageLock layout_publish_lock;
-	unordered_map<persistent_table_id_t, weak_ptr<TableReclusterState>> tables;
+	unordered_set<persistent_table_id_t> enabled_tables;
 	atomic<uint64_t> next_checkpoint_number {1};
 	atomic<uint64_t> next_initialization_token {1};
 };

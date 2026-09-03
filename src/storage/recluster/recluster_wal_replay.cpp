@@ -308,43 +308,14 @@ static bool WALHeadersEqual(const WALReclusterEntry &left, const WALReclusterEnt
 	       left.delete_chunk_count == right.delete_chunk_count;
 }
 
-static bool CheckPhysicalColumns(const DataTable &storage, const ReplacementManifest &manifest) {
-	if (storage.Columns().size() != manifest.physical_columns.size()) {
-		return false;
-	}
-	for (idx_t column_index = 0; column_index < storage.Columns().size(); column_index++) {
-		auto &column = storage.Columns()[column_index];
-		auto &manifest_column = manifest.physical_columns[column_index];
-		if (column.PersistentColumnId() != manifest_column.column_id || column.Type() != manifest_column.type) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static bool CheckOldRowGroups(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
                               const ReplacementManifest &manifest) {
 	auto snapshot = collection.GetCurrentSnapshot();
 	if (snapshot.kind != RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT) {
 		return false;
 	}
-	for (auto &patch : snapshot.layout->patches) {
-		if (patch->range.Overlaps(manifest.header.input_range)) {
-			return false;
-		}
-	}
-	for (auto &expected : manifest.old_groups) {
-		LayoutRowGroupEntry current;
-		if (!snapshot.Lookup(expected.start, current) || current.row_start != expected.start ||
-		    current.GetRowEnd() != expected.start + NumericCast<row_t>(expected.count)) {
-			return false;
-		}
-		auto identity = ComputeRowGroupPhysicalIdentityV1(*current.row_group, current.row_start, columns);
-		if (!identity || !(*identity == expected)) {
-			return false;
-		}
-	}
-	return true;
+	return !snapshot.HasPatch(manifest.header.input_range) &&
+	       MatchRowGroupPhysicalIdentitiesV1(snapshot, columns, manifest.old_groups);
 }
 
 static void RegisterReplacementMetadata(BlockManager &block_manager, const ReplacementManifest &manifest) {
@@ -540,7 +511,7 @@ public:
 		    table.GetSortMetadata()->table_id != record.header.table_id || !old_layout ||
 		    old_layout->layout_version != record.header.expected_layout_version ||
 		    old_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
-		    !CheckPhysicalColumns(*storage, record.manifest) ||
+		    !record.manifest.MatchesPhysicalColumns(storage->Columns()) ||
 		    !CheckOldRowGroups(*collection, storage->Columns(), record.manifest)) {
 			throw DataCorruptionException("Recluster WAL does not match the recovered table layout");
 		}

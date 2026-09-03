@@ -8,6 +8,7 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/storage_compatibility.hpp"
+#include "duckdb/parser/column_definition.hpp"
 #include "duckdb/storage/metadata/metadata_manager.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 
@@ -235,6 +236,19 @@ void ReplacementManifest::Validate() const {
 	if (replacement_groups.empty() && !all_referenced_blocks.empty()) {
 		throw SerializationException("Empty replacement manifest references unused blocks");
 	}
+}
+
+bool ReplacementManifest::MatchesPhysicalColumns(const vector<ColumnDefinition> &columns) const {
+	if (columns.size() != physical_columns.size()) {
+		return false;
+	}
+	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+		if (columns[column_index].PersistentColumnId() != physical_columns[column_index].column_id ||
+		    columns[column_index].Type() != physical_columns[column_index].type) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void ReplacementManifest::Seal() {

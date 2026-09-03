@@ -249,8 +249,6 @@ public:
 	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const;
 	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(const shared_ptr<const RowGroupLayout> &base_layout,
 	                                                     shared_ptr<const LayoutPatch> patch) const;
-	shared_ptr<const RowGroupLayout> BuildPatchedLayout(transaction_t visible_from,
-	                                                    shared_ptr<const LayoutPatch> patch) const;
 	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
 	void RevertPublishedLayout(const shared_ptr<const RowGroupLayout> &published_layout,
 	                           const shared_ptr<const RowGroupLayout> &previous_layout);

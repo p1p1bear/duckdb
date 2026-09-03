@@ -324,13 +324,6 @@ RowGroupCollection::BuildPendingPatchedLayout(const shared_ptr<const RowGroupLay
 	                                       std::move(patches));
 }
 
-shared_ptr<const RowGroupLayout> RowGroupCollection::BuildPatchedLayout(transaction_t visible_from,
-                                                                        shared_ptr<const LayoutPatch> patch) const {
-	auto result = BuildPendingPatchedLayout(std::move(patch));
-	result->visible_from = visible_from;
-	return result;
-}
-
 void RowGroupCollection::PublishLayout(shared_ptr<const RowGroupLayout> layout) {
 	if (!layout) {
 		throw InternalException("Cannot publish a null row group layout");

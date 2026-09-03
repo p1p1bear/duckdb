@@ -2,8 +2,6 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/thread.hpp"
@@ -341,42 +339,24 @@ void ReclusterManager::ScheduleAutoReclusterTask() noexcept {
 }
 
 void ReclusterManager::RequestAutoRecluster() noexcept {
-	if (!AutoReclusterEnabled()) {
-		return;
-	}
 	auto allow_catalog_discovery = AutoCheckpointEnabled();
 	{
 		lock_guard<mutex> guard(queue_lock);
-		if (tables.empty() && !allow_catalog_discovery) {
+		if (enabled_tables.empty() && !allow_catalog_discovery) {
 			return;
 		}
 	}
-	try {
-		if (!InitializeAutoScheduler()) {
-			return;
-		}
-	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
-		return;
-	}
-	{
-		lock_guard<mutex> guard(auto_scheduler_state->lock);
-		if (auto_scheduler_state->closing) {
-			return;
-		}
-		auto_scheduler_state->discover_tables = true;
-		if (auto_scheduler_state->active) {
-			auto_scheduler_state->rerun_requested = true;
-			return;
-		}
-		auto_scheduler_state->active = true;
-	}
-	ScheduleAutoReclusterTask();
+	QueueAutoRecluster({}, true);
 }
 
 void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_names) noexcept {
 	if (table_names.empty() && !auto_scheduler_initialized.load()) {
 		return;
 	}
+	QueueAutoRecluster(table_names, false);
+}
+
+void ReclusterManager::QueueAutoRecluster(const vector<QualifiedName> &table_names, bool discover_tables) noexcept {
 	if (!AutoReclusterEnabled()) {
 		return;
 	}
@@ -389,10 +369,11 @@ void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_n
 			if (auto_scheduler_state->closing) {
 				return;
 			}
-			if (table_names.empty() && auto_scheduler_state->pending_tables.empty() &&
+			if (!discover_tables && table_names.empty() && auto_scheduler_state->pending_tables.empty() &&
 			    !auto_scheduler_state->checkpoint_requested) {
 				return;
 			}
+			auto_scheduler_state->discover_tables |= discover_tables;
 			for (auto &table_name : table_names) {
 				if (std::find(auto_scheduler_state->pending_tables.begin(), auto_scheduler_state->pending_tables.end(),
 				              table_name) == auto_scheduler_state->pending_tables.end()) {
@@ -472,20 +453,12 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 
 	if (discover_tables) {
 		try {
-			auto &catalog = db.GetCatalog().Cast<DuckCatalog>();
-			catalog.ScanSchemas([&](SchemaCatalogEntry &schema) {
-				schema.Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-					if (!entry.internal && entry.type == CatalogType::TABLE_ENTRY) {
-						auto &table = entry.Cast<DuckTableEntry>();
-						if (table.SortEnabled()) {
-							auto table_name = schema.GetQualifiedName(table.name);
-							if (std::find(table_names.begin(), table_names.end(), table_name) == table_names.end()) {
-								table_names.push_back(std::move(table_name));
-							}
-						}
-					}
-				});
-			});
+			auto discovered = DiscoverSortedTables();
+			for (auto &table_name : discovered) {
+				if (std::find(table_names.begin(), table_names.end(), table_name) == table_names.end()) {
+					table_names.push_back(std::move(table_name));
+				}
+			}
 		} catch (std::exception &ex) {
 			LogAutoReclusterError(db, ex.what());
 			return;

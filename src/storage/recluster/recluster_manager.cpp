@@ -78,9 +78,9 @@ shared_ptr<TableReclusterState> ReclusterManager::SynchronizeTable(DuckTableEntr
 
 	lock_guard<mutex> guard(queue_lock);
 	if (accept_new_tasks) {
-		tables[sort_metadata.table_id] = state;
+		enabled_tables.insert(sort_metadata.table_id);
 	} else {
-		tables.erase(sort_metadata.table_id);
+		enabled_tables.erase(sort_metadata.table_id);
 	}
 	return state;
 }
@@ -157,6 +157,16 @@ static void ScanReclusterTables(AttachedDatabase &db, CALLBACK &&callback) {
 	});
 }
 
+vector<QualifiedName> ReclusterManager::DiscoverSortedTables() {
+	vector<QualifiedName> result;
+	ScanReclusterTables(db, [&](DuckTableEntry &table) {
+		if (table.SortEnabled()) {
+			result.push_back(table.schema.GetQualifiedName(table.name));
+		}
+	});
+	return result;
+}
+
 void ReclusterManager::InitializeCheckpointTables() {
 	ScanReclusterTables(db, [&](DuckTableEntry &table) {
 		if (!table.SortEnabled()) {
@@ -177,7 +187,7 @@ void ReclusterManager::InitializeCheckpointTables() {
 void ReclusterManager::SynchronizeLoadedCatalog() {
 	{
 		lock_guard<mutex> guard(queue_lock);
-		tables.clear();
+		enabled_tables.clear();
 	}
 	ScanReclusterTables(db, [&](DuckTableEntry &table) {
 		if (table.HasSortHistory()) {
@@ -311,20 +321,6 @@ ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, c
 	return {ReclusterTaskStartStatus::STARTED, std::move(task)};
 }
 
-static bool CheckFinalizePhysicalColumns(const DataTable &storage, const ReplacementManifest &manifest) {
-	if (storage.Columns().size() != manifest.physical_columns.size()) {
-		return false;
-	}
-	for (idx_t column_index = 0; column_index < storage.Columns().size(); column_index++) {
-		auto &column = storage.Columns()[column_index];
-		auto &manifest_column = manifest.physical_columns[column_index];
-		if (column.PersistentColumnId() != manifest_column.column_id || column.Type() != manifest_column.type) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static bool CheckFinalizeManifest(const ReplacementManifest &manifest) {
 	try {
 		manifest.VerifySeal();
@@ -339,19 +335,7 @@ static bool CheckFinalizeCheckpoint(const shared_ptr<const CheckpointLayoutSnaps
 	if (!checkpoint || checkpoint->storage_generation_id != candidate.storage_generation_id) {
 		return false;
 	}
-	idx_t checkpoint_index = 0;
-	for (auto &expected : candidate.expected_row_groups) {
-		while (checkpoint_index < checkpoint->row_groups.size() &&
-		       checkpoint->row_groups[checkpoint_index].start < expected.start) {
-			checkpoint_index++;
-		}
-		if (checkpoint_index >= checkpoint->row_groups.size() ||
-		    !(checkpoint->row_groups[checkpoint_index] == expected)) {
-			return false;
-		}
-		checkpoint_index++;
-	}
-	return true;
+	return FindCheckpointRowGroups(*checkpoint, candidate.expected_row_groups).IsValid();
 }
 
 enum class FinalizeInputCheck : uint8_t { VALID, LAYOUT_CHANGED, INVALID };
@@ -366,21 +350,9 @@ static FinalizeInputCheck CheckFinalizeInputs(RowGroupCollection &collection, co
 	if (snapshot.layout.get() != expected_layout.get()) {
 		return FinalizeInputCheck::LAYOUT_CHANGED;
 	}
-	for (auto &patch : snapshot.layout->patches) {
-		if (patch->range.Overlaps(candidate.range)) {
-			return FinalizeInputCheck::INVALID;
-		}
-	}
-	for (auto &expected : candidate.expected_row_groups) {
-		LayoutRowGroupEntry current;
-		if (!snapshot.Lookup(expected.start, current) || current.row_start != expected.start ||
-		    current.GetRowEnd() != expected.start + NumericCast<row_t>(expected.count)) {
-			return FinalizeInputCheck::INVALID;
-		}
-		auto identity = ComputeRowGroupPhysicalIdentityV1(*current.row_group, current.row_start, columns);
-		if (!identity || !(*identity == expected)) {
-			return FinalizeInputCheck::INVALID;
-		}
+	if (snapshot.HasPatch(candidate.range) ||
+	    !MatchRowGroupPhysicalIdentitiesV1(snapshot, columns, candidate.expected_row_groups)) {
+		return FinalizeInputCheck::INVALID;
 	}
 	return FinalizeInputCheck::VALID;
 }
@@ -494,7 +466,7 @@ ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table
 			    manifest.header.input_range.end != task->GetRange().end ||
 			    manifest.old_groups != candidate.expected_row_groups ||
 			    manifest.sort_columns != task_context.GetSortDefinition().columns ||
-			    !CheckFinalizePhysicalColumns(*storage, manifest) || !CheckFinalizeManifest(manifest) ||
+			    !manifest.MatchesPhysicalColumns(storage->Columns()) || !CheckFinalizeManifest(manifest) ||
 			    !CheckFinalizeCheckpoint(current_checkpoint, candidate) || input_check != FinalizeInputCheck::VALID) {
 				return FailFinalizeTask(*state, task);
 			}

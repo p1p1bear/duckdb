@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parser/column_definition.hpp"
@@ -20,6 +21,8 @@ class Deserializer;
 class RowGroup;
 class RowGroupCollection;
 class Serializer;
+struct LayoutRowGroupEntry;
+struct RowGroupCollectionSnapshot;
 
 struct RowGroupColumnPhysicalIdentity {
 	persistent_column_id_t column_id = 0;
@@ -57,6 +60,14 @@ struct CheckpointLayoutSnapshot {
 uint64_t ComputeRowGroupPhysicalIdentityChecksumV1(const RowGroupPhysicalIdentity &identity);
 optional<RowGroupPhysicalIdentity> ComputeRowGroupPhysicalIdentityV1(const RowGroup &row_group, row_t row_start,
                                                                      const vector<ColumnDefinition> &columns);
+bool MatchRowGroupPhysicalIdentityV1(const RowGroupCollectionSnapshot &snapshot,
+                                     const vector<ColumnDefinition> &columns, const RowGroupPhysicalIdentity &expected,
+                                     LayoutRowGroupEntry &result);
+bool MatchRowGroupPhysicalIdentitiesV1(const RowGroupCollectionSnapshot &snapshot,
+                                       const vector<ColumnDefinition> &columns,
+                                       const vector<RowGroupPhysicalIdentity> &expected);
+optional_idx FindCheckpointRowGroups(const CheckpointLayoutSnapshot &checkpoint,
+                                     const vector<RowGroupPhysicalIdentity> &expected);
 optional<CheckpointLayoutSnapshot> BuildCheckpointLayoutSnapshot(RowGroupCollection &collection,
                                                                  const vector<ColumnDefinition> &columns,
                                                                  uint64_t checkpoint_number);

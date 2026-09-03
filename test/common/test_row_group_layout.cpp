@@ -122,6 +122,14 @@ MakeReplacementPatch(row_t start, row_t end, uint64_t task_id,
 	return patch;
 }
 
+static duckdb::shared_ptr<const RowGroupLayout> BuildPublishedLayout(RowGroupCollection &collection,
+                                                                     transaction_t visible_from,
+                                                                     duckdb::shared_ptr<const LayoutPatch> patch) {
+	auto result = collection.BuildPendingPatchedLayout(std::move(patch));
+	result->visible_from = visible_from;
+	return result;
+}
+
 TEST_CASE("Table layout history selects layouts by transaction start time", "[storage][row_group_layout]") {
 	DuckDB db;
 	Connection con(db);
@@ -630,7 +638,7 @@ TEST_CASE("Row group collection selects and installs versioned layouts", "[stora
 
 	auto replacement = make_shared_ptr<RowGroup>(*collection, 8);
 	auto patch = MakeReplacementPatch(0, 10, 1, {replacement});
-	auto published_layout = collection->BuildPatchedLayout(10, patch);
+	auto published_layout = BuildPublishedLayout(*collection, 10, patch);
 	REQUIRE(published_layout->layout_version == 1);
 	REQUIRE(published_layout->patches.size() == 1);
 	collection->PublishLayout(published_layout);
@@ -644,7 +652,7 @@ TEST_CASE("Row group collection selects and installs versioned layouts", "[stora
 	REQUIRE(committed_snapshot.layout.get() == published_layout.get());
 
 	auto overlapping_patch = MakeEmptyReplacementPatch(0, 10, 2);
-	REQUIRE_THROWS_AS(collection->BuildPatchedLayout(20, overlapping_patch), InternalException);
+	REQUIRE_THROWS_AS(BuildPublishedLayout(*collection, 20, overlapping_patch), InternalException);
 
 	auto checkpoint_tree = MakeLayoutTestTree(*collection, {8});
 	collection->InstallCheckpointTree(checkpoint_tree);
@@ -679,8 +687,8 @@ TEST_CASE("Checkpoint materializes the current row group layout", "[storage][row
 			auto first = tree->GetRootSegment();
 			REQUIRE(first);
 			REQUIRE(first->GetRowStart() == 0);
-			collection->PublishLayout(collection->BuildPatchedLayout(
-			    1, MakeEmptyReplacementPatch(0, NumericCast<row_t>(first->GetCount()), 7)));
+			collection->PublishLayout(BuildPublishedLayout(
+			    *collection, 1, MakeEmptyReplacementPatch(0, NumericCast<row_t>(first->GetCount()), 7)));
 			entry.GetStorage().GetDataTableInfo()->GetSortStorage().current_layout_version.store(1);
 		});
 
@@ -734,7 +742,7 @@ TEST_CASE("All row group scan entry points honor transaction layouts", "[storage
 
 	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
 	auto replacement_patch = MakeReplacementPatch(0, NumericCast<row_t>(row_count), 1, {root->ReferenceNode()});
-	collection->PublishLayout(collection->BuildPatchedLayout(10, std::move(replacement_patch)));
+	collection->PublishLayout(BuildPublishedLayout(*collection, 10, std::move(replacement_patch)));
 	auto empty_patch = MakeEmptyReplacementPatch(0, NumericCast<row_t>(row_count), 2);
 	collection->PublishLayout(make_shared_ptr<RowGroupLayout>(
 	    2, 20, tree, duckdb::vector<duckdb::shared_ptr<const LayoutPatch>> {std::move(empty_patch)}));
@@ -868,7 +876,8 @@ TEST_CASE("Physical schema transforms consume the current row group layout", "[s
 	auto remaining_rows = 4096 - first->GetCount();
 
 	collection->InitializeLayoutHistory(INITIAL_LAYOUT_VERSION);
-	collection->PublishLayout(collection->BuildPatchedLayout(10, MakeEmptyReplacementPatch(0, first->GetCount(), 1)));
+	collection->PublishLayout(
+	    BuildPublishedLayout(*collection, 10, MakeEmptyReplacementPatch(0, first->GetCount(), 1)));
 	auto source_row_group = collection->GetRowGroup(1);
 	REQUIRE(source_row_group);
 	auto source_i_ownership = source_row_group->GetColumnDropOwnershipBundle(0);

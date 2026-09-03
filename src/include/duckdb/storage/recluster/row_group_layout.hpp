@@ -99,6 +99,7 @@ struct RowGroupCollectionSnapshot {
 	explicit RowGroupCollectionSnapshot(shared_ptr<const RowGroupLayout> layout);
 
 	const shared_ptr<RowGroupSegmentTree> &GetBaseTree() const;
+	bool HasPatch(const RowGroupRange &range) const;
 	bool Lookup(row_t row_id, LayoutRowGroupEntry &result) const;
 
 	Kind kind;

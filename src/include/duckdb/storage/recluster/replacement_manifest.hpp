@@ -15,6 +15,7 @@
 
 namespace duckdb {
 
+class ColumnDefinition;
 class Deserializer;
 class ReadStream;
 class Serializer;
@@ -58,6 +59,7 @@ struct ReplacementManifest {
 	void Write(WriteStream &stream) const;
 	static ReplacementManifest Read(ReadStream &stream);
 	void Validate() const;
+	bool MatchesPhysicalColumns(const vector<ColumnDefinition> &columns) const;
 
 private:
 	vector<uint8_t> SerializePayload() const;
