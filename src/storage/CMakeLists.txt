@@ -3,6 +3,7 @@ add_subdirectory(checkpoint)
 add_subdirectory(compression)
 add_subdirectory(external_file_cache)
 add_subdirectory(metadata)
+add_subdirectory(recluster)
 add_subdirectory(serialization)
 add_subdirectory(statistics)
 add_subdirectory(table)
@@ -15,6 +16,7 @@ endif()
 add_library_unity(
   duckdb_storage
   OBJECT
+  allocator_block_reservation.cpp
   arena_allocator.cpp
   buffer_manager.cpp
   checkpoint_manager.cpp

@@ -3,10 +3,13 @@ add_library_unity(
   OBJECT
   caching_test_utils.cpp
   test_async_file_writer.cpp
+  test_column_drop_ownership_bundle.cpp
+  test_column_drop_ownership_runtime.cpp
   test_managed_async_task_queue.cpp
   test_cast.cpp
   test_checked_integer.cpp
   test_checksum.cpp
+  test_checkpoint_snapshot.cpp
   test_column_data_allocator.cpp
   test_file_buffer_handle_group.cpp
   test_file_system.cpp
@@ -19,11 +22,30 @@ add_library_unity(
   test_parse_load_statement.cpp
   test_parse_logical_type.cpp
   test_recursive_cte_metrics.cpp
+  test_local_storage_alter.cpp
+  test_recluster_candidate.cpp
+  test_recluster_delete_journal.cpp
+  test_recluster_delete_transaction.cpp
+  test_recluster_manager.cpp
+  test_recluster_output.cpp
+  test_recluster_scan.cpp
+  test_recluster_sort.cpp
+  test_recluster_start.cpp
+  test_recluster_state.cpp
+  test_recluster_wal.cpp
+  test_recluster_wal_retention.cpp
+  test_replacement_manifest.cpp
+  test_row_group_column_drop_ownership.cpp
+  test_row_group_layout.cpp
+  test_table_sort_metadata.cpp
+  test_task_private_metadata.cpp
   test_logical_type_is_complete.cpp
   test_utf.cpp
   test_allocator_debug_info.cpp
+  test_allocator_block_reservation.cpp
   test_buffer_pool_reservation.cpp
   test_storage_fuzz.cpp
+  test_storage_lock.cpp
   test_strftime.cpp
   test_string_util.cpp
   test_substring_oob.cpp

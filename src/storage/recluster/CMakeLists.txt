@@ -1,0 +1,32 @@
+add_library_unity(
+  duckdb_storage_recluster
+  OBJECT
+  checkpoint_snapshot.cpp
+  recluster_block_metrics.cpp
+  recluster_candidate.cpp
+  recluster_auto_scheduler.cpp
+  recluster_commit.cpp
+  recluster_delete_catchup.cpp
+  recluster_delete_journal.cpp
+  layout_row_group_cursor.cpp
+  range_task.cpp
+  recluster_manager.cpp
+  recluster_output_writer.cpp
+  recluster_retirement.cpp
+  recluster_range_scanner.cpp
+  recluster_run_merger.cpp
+  recluster_sorter.cpp
+  recluster_status.cpp
+  recluster_task_context.cpp
+  recluster_wal.cpp
+  recluster_wal_retention.cpp
+  recluster_wal_replay.cpp
+  replacement_manifest.cpp
+  row_id_remap_store.cpp
+  row_group_layout.cpp
+  table_recluster_state.cpp
+  table_sort_bind.cpp
+  table_sort_metadata.cpp)
+set(ALL_OBJECT_FILES
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_storage_recluster>
+    PARENT_SCOPE)
