@@ -19,6 +19,8 @@
 namespace duckdb {
 
 struct AlterInfo;
+struct WALReclusterDeleteEntry;
+struct WALReclusterEntry;
 
 class AttachedDatabase;
 class Catalog;
@@ -116,10 +118,14 @@ public:
 	//! -> 1 (second subcolumn of struct)
 	//! -> 0 (first subcolumn of INT)
 	void WriteUpdate(DataChunk &chunk, const vector<column_t> &column_path);
+	void WriteRecluster(const WALReclusterEntry &entry);
+	void WriteReclusterDelete(const WALReclusterDeleteEntry &entry);
 
 	//! Truncate the WAL to a previous size, and clear anything currently set in the writer.
 	//! Used during RevertCommit.
 	void Truncate(idx_t size);
+	//! Truncate the WAL and make the truncation durable before releasing task-private storage.
+	void TruncateAndSync(idx_t size);
 	void Flush();
 	//! Increment the WAL entry count, which is used for the auto-checkpoint threshold.
 	void IncrementWALEntriesCount();

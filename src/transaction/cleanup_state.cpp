@@ -4,6 +4,7 @@
 #include "duckdb/transaction/append_info.hpp"
 
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -45,6 +46,13 @@ void CleanupState::CleanupEntry(UndoFlags type, data_ptr_t data) {
 	case UndoFlags::UPDATE_TUPLE: {
 		auto info = reinterpret_cast<UpdateInfo *>(data);
 		CleanupUpdate(*info);
+		break;
+	}
+	case UndoFlags::RECLUSTER: {
+		auto recluster = reinterpret_cast<ReclusterUndoData *>(data);
+		recluster->info->Cleanup(lowest_active_transaction);
+		delete recluster->info;
+		recluster->info = nullptr;
 		break;
 	}
 	default:

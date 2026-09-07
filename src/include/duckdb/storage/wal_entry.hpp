@@ -14,6 +14,7 @@
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/block.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 
 namespace duckdb {
 class Serializer;
@@ -310,6 +311,36 @@ struct WALUseTable {
 
 	void Serialize(Serializer &serializer) const;
 	static WALUseTable Deserialize(Deserializer &deserializer);
+};
+
+struct WALReclusterEntry {
+	persistent_table_id_t table_id = hugeint_t(0, 0);
+	recluster_task_id_t task_id = hugeint_t(0, 0);
+	layout_version_t expected_layout_version = INITIAL_LAYOUT_VERSION;
+	layout_version_t target_layout_version = INITIAL_LAYOUT_VERSION;
+	row_t range_start = 0;
+	row_t range_end = 0;
+	MetaBlockPointer manifest_pointer;
+	uint64_t manifest_size = 0;
+	uint64_t manifest_checksum = 0;
+	delete_sequence_t journal_resolved_through = 0;
+	uint64_t final_delete_row_count = 0;
+	uint32_t delete_chunk_count = 0;
+
+	void Validate() const;
+	void Serialize(Serializer &serializer) const;
+	static WALReclusterEntry Deserialize(Deserializer &deserializer);
+};
+
+struct WALReclusterDeleteEntry {
+	persistent_table_id_t table_id = hugeint_t(0, 0);
+	recluster_task_id_t task_id = hugeint_t(0, 0);
+	uint32_t chunk_index = 0;
+	vector<row_t> new_rowids;
+
+	void Validate() const;
+	void Serialize(Serializer &serializer) const;
+	static WALReclusterDeleteEntry Deserialize(Deserializer &deserializer);
 };
 
 } // namespace duckdb

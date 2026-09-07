@@ -497,5 +497,97 @@
         "default": "QualifiedName()"
       }
     ]
+  },
+  {
+    "class": "WALReclusterEntry",
+    "pointer_type": "none",
+    "members": [
+      {
+        "id": 101,
+        "name": "table_id",
+        "type": "persistent_table_id_t"
+      },
+      {
+        "id": 102,
+        "name": "task_id",
+        "type": "recluster_task_id_t"
+      },
+      {
+        "id": 103,
+        "name": "expected_layout_version",
+        "type": "layout_version_t"
+      },
+      {
+        "id": 104,
+        "name": "target_layout_version",
+        "type": "layout_version_t"
+      },
+      {
+        "id": 105,
+        "name": "range_start",
+        "type": "row_t"
+      },
+      {
+        "id": 106,
+        "name": "range_end",
+        "type": "row_t"
+      },
+      {
+        "id": 107,
+        "name": "manifest_pointer",
+        "type": "MetaBlockPointer"
+      },
+      {
+        "id": 108,
+        "name": "manifest_size",
+        "type": "uint64_t"
+      },
+      {
+        "id": 109,
+        "name": "manifest_checksum",
+        "type": "uint64_t"
+      },
+      {
+        "id": 110,
+        "name": "journal_resolved_through",
+        "type": "delete_sequence_t"
+      },
+      {
+        "id": 111,
+        "name": "final_delete_row_count",
+        "type": "uint64_t"
+      },
+      {
+        "id": 112,
+        "name": "delete_chunk_count",
+        "type": "uint32_t"
+      }
+    ]
+  },
+  {
+    "class": "WALReclusterDeleteEntry",
+    "pointer_type": "none",
+    "members": [
+      {
+        "id": 101,
+        "name": "table_id",
+        "type": "persistent_table_id_t"
+      },
+      {
+        "id": 102,
+        "name": "task_id",
+        "type": "recluster_task_id_t"
+      },
+      {
+        "id": 103,
+        "name": "chunk_index",
+        "type": "uint32_t"
+      },
+      {
+        "id": 104,
+        "name": "new_rowids",
+        "type": "vector<row_t>"
+      }
+    ]
   }
 ]

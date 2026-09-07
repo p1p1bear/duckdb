@@ -12,6 +12,7 @@
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/vector.hpp"
 #include "duckdb/transaction/undo_buffer.hpp"
 #include "duckdb/common/enums/active_transaction_state.hpp"
 
@@ -21,10 +22,13 @@ class CommitDropState;
 class DuckTableEntry;
 class RowGroupCollection;
 class RowVersionManager;
+class ReclusterCommitInfo;
 class DuckTransactionManager;
 class StorageLockKey;
 class StorageCommitState;
+struct QualifiedName;
 struct DataTableInfo;
+struct DuckTransactionReclusterState;
 struct UndoBufferProperties;
 
 struct CommitInfo {
@@ -70,6 +74,9 @@ public:
 	//! commit failed, or an empty string if the commit was successful
 	ErrorData Commit(AttachedDatabase &db, CommitInfo &commit_info,
 	                 unique_ptr<StorageCommitState> commit_state) noexcept;
+	bool CommitFinalizationIrreversible() const noexcept {
+		return commit_finalization_irreversible;
+	}
 	//! Returns whether or not a commit of this transaction should trigger an automatic checkpoint
 	bool AutomaticCheckpoint(AttachedDatabase &db, const UndoBufferProperties &properties);
 
@@ -83,6 +90,9 @@ public:
 
 	void PushDelete(DuckTableEntry &table_entry, RowVersionManager &info, idx_t vector_idx, row_t rows[], idx_t count,
 	                idx_t base_row);
+	void RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[], idx_t count) noexcept;
+	ErrorData PrepareReclusterCommit() noexcept;
+	void ResolveReclusterDeletes(bool committed) noexcept;
 	void PushSequenceUsage(SequenceCatalogEntry &entry, const SequenceData &data);
 	void PushAppend(DuckTableEntry &table_entry, idx_t row_start, idx_t row_count);
 	UndoBufferReference CreateUpdateInfo(DuckTableEntry &table_entry, idx_t type_size, idx_t entries,
@@ -97,12 +107,26 @@ public:
 
 	//! Get a shared lock on a table
 	shared_ptr<CheckpointLock> SharedLockTable(DataTableInfo &info);
+	//! Hold a sorted-table write gate until this transaction ends.
+	void HoldSharedReclusterWriteLock(DataTableInfo &info);
+	void HoldExclusiveReclusterWriteLock(DataTableInfo &info);
+	void HoldReclusterDDLCoordinationLock(DataTableInfo &info);
+	bool HoldsReclusterWriteLock(DataTableInfo &info);
+	vector<QualifiedName> GetModifiedReclusterTables(bool include_without_checkpoint) noexcept;
+	void ReleaseReclusterWriteLocks() noexcept;
 
 	void SetIsCheckpointTransaction() {
 		is_checkpoint_transaction = true;
+		SetIsReclusterMaintenanceTransaction();
 	}
+	void SetIsReclusterMaintenanceTransaction();
+	void PushRecluster(unique_ptr<ReclusterCommitInfo> info);
 
 private:
+	void HoldReclusterWriteLock(DataTableInfo &info, bool exclusive);
+	DuckTransactionReclusterState &GetOrCreateReclusterState();
+	optional_ptr<DuckTransactionReclusterState> GetReclusterState();
+
 	//! The undo buffer is used to store old versions of rows that are updated
 	//! or deleted
 	UndoBuffer undo_buffer;
@@ -124,6 +148,10 @@ private:
 	};
 	//! Active locks on tables
 	reference_map_t<DataTableInfo, unique_ptr<ActiveTableLock>> active_locks;
+	//! State used only by transactions that touch sorted tables or publish recluster work.
+	unique_ptr<DuckTransactionReclusterState> recluster_state;
+	//! A durable commit reached non-revertible storage finalization before reporting an error.
+	bool commit_finalization_irreversible = false;
 	//! Flag to prevent auto-checkpointing inside a checkpoint transaction.
 	bool is_checkpoint_transaction = false;
 };

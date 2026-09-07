@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/write_ahead_log.hpp"
@@ -21,11 +22,55 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/range_task.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
+#include <algorithm>
+#include <condition_variable>
+#include <exception>
+
 namespace duckdb {
+
+enum class HeldTableGateMode : uint8_t { ACQUIRING_SHARED, ACQUIRING_EXCLUSIVE, SHARED, EXCLUSIVE, FAILED };
+
+struct HeldTableGate {
+	HeldTableGateMode mode;
+	std::condition_variable ready;
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+};
+
+enum class HeldDDLCoordinationState : uint8_t { ACQUIRING, HELD, FAILED };
+
+struct HeldDDLCoordination {
+	HeldDDLCoordinationState state;
+	std::condition_variable ready;
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+};
+
+enum class ReclusterDeleteTransactionState : uint8_t { RECORDING, PREPARING, PREPARED, RESOLVED };
+
+struct PendingTaskDeletes {
+	shared_ptr<RangeTask> task;
+	vector<row_t> old_rowids;
+	optional_ptr<ReclusterDeleteSlot> slot;
+};
+
+struct DuckTransactionReclusterState {
+	mutex lock;
+	reference_map_t<DataTableInfo, shared_ptr<HeldTableGate>> table_write_locks;
+	reference_map_t<DataTableInfo, shared_ptr<HeldDDLCoordination>> ddl_coordination_locks;
+	ReclusterDeleteTransactionState delete_state = ReclusterDeleteTransactionState::RECORDING;
+	unordered_map<recluster_task_id_t, PendingTaskDeletes> pending_deletes;
+	bool is_maintenance_transaction = false;
+	bool has_recluster_undo = false;
+};
 
 TransactionData::TransactionData(DuckTransaction &transaction_p) // NOLINT
     : transaction(&transaction_p), transaction_id(transaction_p.transaction_id), start_time(transaction_p.start_time) {
@@ -42,6 +87,8 @@ DuckTransaction::DuckTransaction(DuckTransactionManager &manager, ClientContext 
 }
 
 DuckTransaction::~DuckTransaction() {
+	ResolveReclusterDeletes(false);
+	ReleaseReclusterWriteLocks();
 }
 
 DuckTransaction &DuckTransaction::Get(ClientContext &context, AttachedDatabase &db) {
@@ -62,6 +109,19 @@ DuckTransactionManager &DuckTransaction::GetTransactionManager() {
 
 LocalStorage &DuckTransaction::GetLocalStorage() {
 	return *storage;
+}
+
+DuckTransactionReclusterState &DuckTransaction::GetOrCreateReclusterState() {
+	lock_guard<mutex> guard(active_locks_lock);
+	if (!recluster_state) {
+		recluster_state = make_uniq<DuckTransactionReclusterState>();
+	}
+	return *recluster_state;
+}
+
+optional_ptr<DuckTransactionReclusterState> DuckTransaction::GetReclusterState() {
+	lock_guard<mutex> guard(active_locks_lock);
+	return recluster_state.get();
 }
 
 void DuckTransaction::PushCatalogEntry(CatalogEntry &entry, data_ptr_t extra_data, idx_t extra_data_size) {
@@ -125,6 +185,182 @@ void DuckTransaction::PushDelete(DuckTableEntry &table_entry, RowVersionManager 
 	}
 }
 
+static void CancelTaskForDeleteJournalFailure(const shared_ptr<RangeTask> &task) noexcept {
+	if (!task) {
+		return;
+	}
+	task->RequestCancel();
+}
+
+void DuckTransaction::RecordReclusterDeletes(DataTableInfo &info, row_t vector_base, const row_t rows[],
+                                             idx_t count) noexcept {
+	if (count == 0 || !info.HasSortStorage()) {
+		return;
+	}
+	auto state = info.GetReclusterState();
+	if (!state) {
+		return;
+	}
+
+	auto first_row_id = vector_base + rows[0];
+	auto task = state->GetTaskForRow(first_row_id);
+	if (!task || task->IsAbortRequested() || task->IsFinished()) {
+		return;
+	}
+	for (idx_t row_index = 0; row_index < count; row_index++) {
+		if (rows[row_index] < 0 || !task->GetRange().Contains(vector_base + rows[row_index])) {
+			CancelTaskForDeleteJournalFailure(task);
+			return;
+		}
+	}
+
+	bool cancel_task = false;
+	auto &recluster = GetOrCreateReclusterState();
+	{
+		lock_guard<mutex> guard(recluster.lock);
+		if (recluster.is_maintenance_transaction) {
+			return;
+		}
+		if (recluster.delete_state != ReclusterDeleteTransactionState::RECORDING) {
+			cancel_task = true;
+		} else {
+			try {
+				auto entry = recluster.pending_deletes.find(task->GetTaskId());
+				if (entry == recluster.pending_deletes.end()) {
+					PendingTaskDeletes pending;
+					pending.task = task;
+					pending.old_rowids.reserve(count);
+					for (idx_t row_index = 0; row_index < count; row_index++) {
+						pending.old_rowids.push_back(vector_base + rows[row_index]);
+					}
+					recluster.pending_deletes.emplace(task->GetTaskId(), std::move(pending));
+				} else if (entry->second.task.get() != task.get() || entry->second.slot ||
+				           count > entry->second.old_rowids.max_size() - entry->second.old_rowids.size()) {
+					cancel_task = true;
+					recluster.pending_deletes.erase(entry);
+				} else {
+					auto &old_rowids = entry->second.old_rowids;
+					old_rowids.reserve(old_rowids.size() + count);
+					for (idx_t row_index = 0; row_index < count; row_index++) {
+						old_rowids.push_back(vector_base + rows[row_index]);
+					}
+				}
+			} catch (...) {
+				recluster.pending_deletes.erase(task->GetTaskId());
+				cancel_task = true;
+			}
+		}
+	}
+	if (cancel_task) {
+		CancelTaskForDeleteJournalFailure(task);
+	}
+}
+
+ErrorData DuckTransaction::PrepareReclusterCommit() noexcept {
+	try {
+		if (storage->HasReclusterTableStorage()) {
+			for (auto &local_table : storage->GetTableStorages()) {
+				if (local_table->is_dropped ||
+				    local_table->GetCollection().GetTotalRows() <= local_table->deleted_rows) {
+					continue;
+				}
+				local_table->table_ref.get().PrepareReclusterCommit(*this);
+			}
+		}
+	} catch (std::exception &ex) {
+		return ErrorData(ex);
+	}
+
+	auto recluster = GetReclusterState();
+	if (!recluster) {
+		return ErrorData();
+	}
+
+	vector<reference<PendingTaskDeletes>> ordered_deletes;
+	{
+		lock_guard<mutex> guard(recluster->lock);
+		if (recluster->delete_state != ReclusterDeleteTransactionState::RECORDING) {
+			return ErrorData();
+		}
+		recluster->delete_state = ReclusterDeleteTransactionState::PREPARING;
+		try {
+			ordered_deletes.reserve(recluster->pending_deletes.size());
+			for (auto &entry : recluster->pending_deletes) {
+				ordered_deletes.emplace_back(entry.second);
+			}
+			std::sort(ordered_deletes.begin(), ordered_deletes.end(),
+			          [](const reference<PendingTaskDeletes> &left, const reference<PendingTaskDeletes> &right) {
+				          return left.get().task->GetTaskId() < right.get().task->GetTaskId();
+			          });
+		} catch (...) {
+			for (auto &entry : recluster->pending_deletes) {
+				CancelTaskForDeleteJournalFailure(entry.second.task);
+			}
+			recluster->delete_state = ReclusterDeleteTransactionState::PREPARED;
+			return ErrorData();
+		}
+	}
+
+	for (auto &pending_ref : ordered_deletes) {
+		auto &pending = pending_ref.get();
+		if (pending.task->IsAbortRequested() || pending.task->IsFinished()) {
+			continue;
+		}
+		auto slot = pending.task->TryReserveDeleteSlot(std::move(pending.old_rowids));
+		if (!slot) {
+			CancelTaskForDeleteJournalFailure(pending.task);
+			continue;
+		}
+		pending.slot = slot;
+	}
+
+	lock_guard<mutex> guard(recluster->lock);
+	D_ASSERT(recluster->delete_state == ReclusterDeleteTransactionState::PREPARING);
+	recluster->delete_state = ReclusterDeleteTransactionState::PREPARED;
+	return ErrorData();
+}
+
+void DuckTransaction::ResolveReclusterDeletes(bool committed) noexcept {
+	auto recluster = GetReclusterState();
+	if (!recluster) {
+		return;
+	}
+	lock_guard<mutex> guard(recluster->lock);
+	auto target = committed ? DeleteSlotState::COMMITTED : DeleteSlotState::ABORTED;
+	for (auto &entry : recluster->pending_deletes) {
+		auto &pending = entry.second;
+		if (pending.slot && !pending.task->ResolveDeleteSlot(*pending.slot, target)) {
+			CancelTaskForDeleteJournalFailure(pending.task);
+		}
+	}
+	recluster->pending_deletes.clear();
+	recluster->delete_state = ReclusterDeleteTransactionState::RESOLVED;
+}
+
+void DuckTransaction::SetIsReclusterMaintenanceTransaction() {
+	auto &recluster = GetOrCreateReclusterState();
+	lock_guard<mutex> guard(recluster.lock);
+	D_ASSERT(recluster.delete_state == ReclusterDeleteTransactionState::RECORDING);
+	D_ASSERT(recluster.pending_deletes.empty());
+	recluster.is_maintenance_transaction = true;
+}
+
+void DuckTransaction::PushRecluster(unique_ptr<ReclusterCommitInfo> info) {
+	if (!info) {
+		throw InternalException("Cannot push a null recluster commit");
+	}
+	auto &recluster_state = GetOrCreateReclusterState();
+	lock_guard<mutex> guard(recluster_state.lock);
+	if (!recluster_state.is_maintenance_transaction || recluster_state.has_recluster_undo ||
+	    undo_buffer.ChangesMade() || storage->ChangesMade()) {
+		throw InternalException("A recluster maintenance transaction must contain exactly one recluster change");
+	}
+	auto undo_entry = undo_buffer.CreateEntry(UndoFlags::RECLUSTER, sizeof(ReclusterUndoData));
+	auto recluster = reinterpret_cast<ReclusterUndoData *>(undo_entry.GetDataMutable());
+	recluster->info = info.release();
+	recluster_state.has_recluster_undo = true;
+}
+
 void DuckTransaction::PushAppend(DuckTableEntry &table_entry, idx_t start_row, idx_t row_count) {
 	auto undo_entry = undo_buffer.CreateEntry(UndoFlags::INSERT_TUPLE, sizeof(AppendInfo));
 	auto append_info = reinterpret_cast<AppendInfo *>(undo_entry.GetDataMutable());
@@ -171,7 +407,7 @@ UndoBufferProperties DuckTransaction::GetUndoProperties() {
 }
 
 bool DuckTransaction::AutomaticCheckpoint(AttachedDatabase &db, const UndoBufferProperties &properties) {
-	if (is_checkpoint_transaction) {
+	if (is_checkpoint_transaction || properties.has_recluster) {
 		return false;
 	}
 	if (!ChangesMade()) {
@@ -268,6 +504,7 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
 	try {
 		storage->Commit(commit_state.get());
 		undo_buffer.Commit(iterator_state, commit_info);
+		drop_state.PrepareFinalize();
 		if (!db.IsSystem() && !db.IsTemporary() && Settings::Get<DebugForceCommitFailureSetting>(db.GetDatabase())) {
 			throw InvalidInputException("Forced commit failure (debug_force_commit_failure)");
 		}
@@ -283,6 +520,15 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
 		// escape this noexcept function and trigger std::terminate.
 		error_data = ErrorData(ex);
 	}
+	if (drop_state.IrreversibleFinalizationStarted()) {
+		commit_finalization_irreversible = true;
+		ValidChecker::Invalidate(db.GetDatabase(),
+		                         "Failed while finalizing a durable transaction commit. The database must be reopened. "
+		                         "Commit finalization error: " +
+		                             error_data.RawMessage());
+		return error_data;
+	}
+	drop_state.RevertPrepared();
 
 	try {
 		undo_buffer.RevertCommit(iterator_state, this->transaction_id);
@@ -379,6 +625,199 @@ shared_ptr<CheckpointLock> DuckTransaction::SharedLockTable(DataTableInfo &info)
 	// store it for future reference
 	active_table_lock.checkpoint_lock = checkpoint_lock;
 	return checkpoint_lock;
+}
+
+void DuckTransaction::HoldSharedReclusterWriteLock(DataTableInfo &info) {
+	HoldReclusterWriteLock(info, false);
+}
+
+void DuckTransaction::HoldExclusiveReclusterWriteLock(DataTableInfo &info) {
+	HoldReclusterWriteLock(info, true);
+}
+
+void DuckTransaction::HoldReclusterDDLCoordinationLock(DataTableInfo &info) {
+	auto &recluster = GetOrCreateReclusterState();
+	shared_ptr<HeldDDLCoordination> coordination;
+	bool try_only = false;
+	{
+		unique_lock<mutex> guard(recluster.lock);
+		auto entry = recluster.ddl_coordination_locks.find(info);
+		if (entry != recluster.ddl_coordination_locks.end()) {
+			coordination = entry->second;
+			while (coordination->state == HeldDDLCoordinationState::ACQUIRING) {
+				coordination->ready.wait(guard);
+			}
+			if (coordination->state == HeldDDLCoordinationState::FAILED) {
+				std::rethrow_exception(coordination->failure);
+			}
+			return;
+		}
+		for (auto &held_entry : recluster.ddl_coordination_locks) {
+			if (held_entry.second->state != HeldDDLCoordinationState::HELD) {
+				throw TransactionException(
+				    "Transaction conflict: cannot concurrently coordinate sorted-table DDL for multiple tables");
+			}
+			try_only = true;
+		}
+		coordination = make_shared_ptr<HeldDDLCoordination>();
+		coordination->state = HeldDDLCoordinationState::ACQUIRING;
+		recluster.ddl_coordination_locks.emplace(std::ref(info), coordination);
+	}
+
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+	try {
+		handle = try_only ? info.TryGetReclusterDDLCoordinationLock() : info.GetReclusterDDLCoordinationLock();
+		if (!handle) {
+			throw TransactionException(
+			    "Transaction conflict: cannot immediately coordinate sorted-table DDL for another table");
+		}
+	} catch (...) {
+		failure = std::current_exception();
+	}
+	{
+		lock_guard<mutex> guard(recluster.lock);
+		if (failure) {
+			coordination->failure = failure;
+			coordination->state = HeldDDLCoordinationState::FAILED;
+		} else {
+			coordination->handle = std::move(handle);
+			coordination->state = HeldDDLCoordinationState::HELD;
+		}
+	}
+	coordination->ready.notify_all();
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+}
+
+void DuckTransaction::HoldReclusterWriteLock(DataTableInfo &info, bool exclusive) {
+	auto &recluster = GetOrCreateReclusterState();
+	shared_ptr<HeldTableGate> gate;
+	bool try_only = false;
+	{
+		unique_lock<mutex> guard(recluster.lock);
+		auto entry = recluster.table_write_locks.find(info);
+		if (entry != recluster.table_write_locks.end()) {
+			gate = entry->second;
+			while (gate->mode == HeldTableGateMode::ACQUIRING_SHARED ||
+			       gate->mode == HeldTableGateMode::ACQUIRING_EXCLUSIVE) {
+				gate->ready.wait(guard);
+			}
+			if (gate->mode == HeldTableGateMode::FAILED) {
+				std::rethrow_exception(gate->failure);
+			}
+			if (exclusive && gate->mode == HeldTableGateMode::SHARED) {
+				throw TransactionException("Transaction conflict: cannot acquire an exclusive sorted-table write gate "
+				                           "after writing to the table");
+			}
+			return;
+		}
+
+		for (auto &held_entry : recluster.table_write_locks) {
+			auto mode = held_entry.second->mode;
+			if (exclusive && mode == HeldTableGateMode::EXCLUSIVE) {
+				try_only = true;
+				continue;
+			}
+			if (exclusive || mode == HeldTableGateMode::ACQUIRING_EXCLUSIVE || mode == HeldTableGateMode::EXCLUSIVE) {
+				throw TransactionException("Transaction conflict: cannot acquire sorted-table write gates for multiple "
+				                           "tables around exclusive DDL");
+			}
+		}
+
+		gate = make_shared_ptr<HeldTableGate>();
+		gate->mode = exclusive ? HeldTableGateMode::ACQUIRING_EXCLUSIVE : HeldTableGateMode::ACQUIRING_SHARED;
+		recluster.table_write_locks.emplace(std::ref(info), gate);
+	}
+
+	unique_ptr<StorageLockKey> handle;
+	std::exception_ptr failure;
+	try {
+		if (exclusive) {
+			handle = try_only ? info.TryGetExclusiveReclusterWriteLock() : info.GetExclusiveReclusterWriteLock();
+			if (!handle) {
+				throw TransactionException("Transaction conflict: cannot immediately acquire an exclusive sorted-table "
+				                           "write gate for another table");
+			}
+		} else {
+			handle = info.GetSharedReclusterWriteLock();
+		}
+	} catch (...) {
+		failure = std::current_exception();
+	}
+
+	{
+		lock_guard<mutex> guard(recluster.lock);
+		if (failure) {
+			gate->failure = failure;
+			gate->mode = HeldTableGateMode::FAILED;
+		} else {
+			gate->handle = std::move(handle);
+			gate->mode = exclusive ? HeldTableGateMode::EXCLUSIVE : HeldTableGateMode::SHARED;
+		}
+	}
+	gate->ready.notify_all();
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+}
+
+bool DuckTransaction::HoldsReclusterWriteLock(DataTableInfo &info) {
+	auto recluster = GetReclusterState();
+	if (!recluster) {
+		return false;
+	}
+	lock_guard<mutex> guard(recluster->lock);
+	auto entry = recluster->table_write_locks.find(info);
+	if (entry == recluster->table_write_locks.end()) {
+		return false;
+	}
+	return entry->second->mode == HeldTableGateMode::SHARED || entry->second->mode == HeldTableGateMode::EXCLUSIVE;
+}
+
+vector<QualifiedName> DuckTransaction::GetModifiedReclusterTables(bool include_without_checkpoint) noexcept {
+	vector<QualifiedName> result;
+	try {
+		auto recluster = GetReclusterState();
+		if (!recluster) {
+			return result;
+		}
+		lock_guard<mutex> guard(recluster->lock);
+		for (auto &entry : recluster->table_write_locks) {
+			auto mode = entry.second->mode;
+			if ((mode != HeldTableGateMode::SHARED && mode != HeldTableGateMode::EXCLUSIVE) ||
+			    !entry.first.get().HasSortStorage()) {
+				continue;
+			}
+			auto &info = entry.first.get();
+			if (!include_without_checkpoint) {
+				auto state = info.GetReclusterState();
+				if (!state) {
+					continue;
+				}
+				if (!state->HasUsableCheckpoint()) {
+					continue;
+				}
+			}
+			auto schema_path = info.GetSchemaPath();
+			schema_path.insert(schema_path.begin(), info.GetDB().GetName());
+			result.emplace_back(std::move(schema_path), info.GetTableName());
+		}
+	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
+		result.clear();
+	}
+	return result;
+}
+
+void DuckTransaction::ReleaseReclusterWriteLocks() noexcept {
+	auto recluster = GetReclusterState();
+	if (!recluster) {
+		return;
+	}
+	lock_guard<mutex> guard(recluster->lock);
+	recluster->table_write_locks.clear();
+	recluster->ddl_coordination_locks.clear();
 }
 
 } // namespace duckdb

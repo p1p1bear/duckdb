@@ -1,0 +1,330 @@
+#include "duckdb/storage/recluster/recluster_commit.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/vector_size.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/block_manager.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/metadata/metadata_manager.hpp"
+#include "duckdb/storage/recluster/range_task.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
+#include "duckdb/storage/recluster/recluster_output_writer.hpp"
+#include "duckdb/storage/recluster/recluster_task_context.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/wal_entry.hpp"
+#include "duckdb/storage/write_ahead_log.hpp"
+#include "duckdb/transaction/commit_state.hpp"
+
+#include <exception>
+
+namespace duckdb {
+
+struct PreparedReclusterWAL {
+	WALReclusterEntry header;
+	vector<WALReclusterDeleteEntry> deletes;
+};
+
+PreparedReclusterCommitResources ReclusterCommitInfo::Prepare(const shared_ptr<RangeTask> &task,
+                                                              const shared_ptr<DataTable> &storage,
+                                                              const shared_ptr<const RowGroupLayout> &old_layout) {
+	if (!task || !storage || !old_layout || !task->HasTaskContext() || !task->GetTaskContext().HasOutput() ||
+	    task->GetTaskContext().GetStorage().get() != storage.get()) {
+		throw InternalException("Invalid recluster commit resource preparation");
+	}
+	PreparedReclusterCommitResources result;
+	result.retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
+	    storage->GetRowGroupCollection(), old_layout, task->GetRange());
+	auto &output = task->GetTaskContext().GetOutput();
+	auto &attached = storage->GetAttached();
+	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL()) {
+		result.wal_retention = attached.GetReclusterManager().GetWALBlockRetention().Reserve(
+		    output.manifest_owner->GetBlockIds(), output.GetManifest().all_referenced_blocks);
+		result.wal_checkpoint_iteration =
+		    attached.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+	}
+	return result;
+}
+
+ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<RangeTask> task_p, shared_ptr<TableReclusterState> table_state_p,
+                                         shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
+                                         shared_ptr<RowGroupLayout> pending_layout_p,
+                                         vector<row_t> final_deleted_new_rowids_p,
+                                         delete_sequence_t journal_resolved_through_p,
+                                         PreparedReclusterCommitResources resources)
+    : task(std::move(task_p)), table_state(std::move(table_state_p)), storage(std::move(storage_p)),
+      old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
+      retirement(std::move(resources.retirement)), wal_retention(std::move(resources.wal_retention)),
+      wal_checkpoint_iteration(resources.wal_checkpoint_iteration) {
+	if (!task || !table_state || !storage || !old_layout || !pending_layout || !task->HasTaskContext() ||
+	    !task->GetTaskContext().HasOutput() || task->GetTaskContext().GetStorage().get() != storage.get() ||
+	    !retirement.IsActive() || pending_layout->visible_from != 0 ||
+	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
+	    pending_layout->layout_version != old_layout->layout_version + 1 ||
+	    pending_layout->base_tree.get() != old_layout->base_tree.get() ||
+	    journal_resolved_through_p <
+	        task->GetTaskContext().GetOutput().GetManifest().header.last_applied_delete_sequence) {
+		throw InternalException("Invalid recluster commit state");
+	}
+	for (idx_t row_index = 0; row_index < final_deleted_new_rowids_p.size(); row_index++) {
+		auto row_id = final_deleted_new_rowids_p[row_index];
+		if (!task->GetRange().Contains(row_id) ||
+		    (row_index > 0 && final_deleted_new_rowids_p[row_index - 1] >= row_id)) {
+			throw InternalException("Invalid final recluster DELETE row IDs");
+		}
+	}
+	auto &output = task->GetTaskContext().GetOutput();
+	auto &attached = storage->GetAttached();
+	if (attached.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && attached.GetStorageManager().HasWAL() &&
+	    (!wal_retention.IsActive() || wal_checkpoint_iteration == 0)) {
+		throw InternalException("Invalid recluster WAL retention preparation");
+	}
+	if (wal_retention.IsActive()) {
+		prepared_wal = make_uniq<PreparedReclusterWAL>();
+		auto &manifest = output.GetManifest();
+		auto delete_chunk_count = final_deleted_new_rowids_p.size() / STANDARD_VECTOR_SIZE +
+		                          (final_deleted_new_rowids_p.size() % STANDARD_VECTOR_SIZE != 0);
+		prepared_wal->header.table_id = manifest.header.table_id;
+		prepared_wal->header.task_id = manifest.header.task_id;
+		prepared_wal->header.expected_layout_version = old_layout->layout_version;
+		prepared_wal->header.target_layout_version = pending_layout->layout_version;
+		prepared_wal->header.range_start = manifest.header.input_range.start;
+		prepared_wal->header.range_end = manifest.header.input_range.end;
+		prepared_wal->header.manifest_pointer = output.GetManifestPointer();
+		prepared_wal->header.manifest_size = manifest.payload_size;
+		prepared_wal->header.manifest_checksum = manifest.checksum;
+		prepared_wal->header.journal_resolved_through = journal_resolved_through_p;
+		prepared_wal->header.final_delete_row_count = final_deleted_new_rowids_p.size();
+		prepared_wal->header.delete_chunk_count = NumericCast<uint32_t>(delete_chunk_count);
+		prepared_wal->deletes.reserve(delete_chunk_count);
+		for (idx_t chunk_index = 0; chunk_index < delete_chunk_count; chunk_index++) {
+			auto begin = chunk_index * STANDARD_VECTOR_SIZE;
+			auto end = MinValue<idx_t>(begin + STANDARD_VECTOR_SIZE, final_deleted_new_rowids_p.size());
+			WALReclusterDeleteEntry entry;
+			entry.table_id = manifest.header.table_id;
+			entry.task_id = manifest.header.task_id;
+			entry.chunk_index = NumericCast<uint32_t>(chunk_index);
+			entry.new_rowids.assign(final_deleted_new_rowids_p.begin() + NumericCast<int64_t>(begin),
+			                        final_deleted_new_rowids_p.begin() + NumericCast<int64_t>(end));
+			entry.Validate();
+			prepared_wal->deletes.push_back(std::move(entry));
+		}
+		prepared_wal->header.Validate();
+	}
+	output.ApplyFinalDeletes(final_deleted_new_rowids_p);
+}
+
+ReclusterCommitInfo::ReclusterCommitInfo(shared_ptr<DataTable> storage_p, shared_ptr<const RowGroupLayout> old_layout_p,
+                                         shared_ptr<RowGroupLayout> pending_layout_p, sort_run_id_t recovered_run_id_p,
+                                         vector<block_id_t> recovered_blocks_p, RowGroupRange retired_range)
+    : storage(std::move(storage_p)), old_layout(std::move(old_layout_p)), pending_layout(std::move(pending_layout_p)),
+      recovered_run_id(recovered_run_id_p), recovered_blocks(std::move(recovered_blocks_p)) {
+	if (!storage || !old_layout || !pending_layout || pending_layout->visible_from != 0 ||
+	    old_layout->layout_version == NumericLimits<layout_version_t>::Maximum() ||
+	    pending_layout->layout_version != old_layout->layout_version + 1 ||
+	    pending_layout->base_tree.get() != old_layout->base_tree.get() || recovered_run_id == INVALID_SORT_RUN_ID ||
+	    recovered_run_id == NumericLimits<sort_run_id_t>::Maximum()) {
+		throw InternalException("Invalid recovered recluster commit state");
+	}
+	for (idx_t block_index = 0; block_index < recovered_blocks.size(); block_index++) {
+		if (recovered_blocks[block_index] < 0 ||
+		    (block_index > 0 && recovered_blocks[block_index - 1] >= recovered_blocks[block_index])) {
+			throw InternalException("Invalid recovered recluster block ownership");
+		}
+	}
+	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
+	try {
+		for (auto block_id : recovered_blocks) {
+			block_manager.MarkBlockAsUsed(block_id);
+			recovered_owned_block_count++;
+		}
+		retirement = storage->GetAttached().GetReclusterManager().GetRetirementRegistry().PrepareLayoutRetirement(
+		    storage->GetRowGroupCollection(), old_layout, retired_range);
+	} catch (...) {
+		ReleaseRecoveredBlocksNoThrow();
+		throw;
+	}
+}
+
+ReclusterCommitInfo::~ReclusterCommitInfo() {
+	ReleaseRecoveredBlocksNoThrow();
+}
+
+void ReclusterCommitInfo::ReleaseRecoveredBlocks() {
+	if (!storage) {
+		return;
+	}
+	auto &block_manager = storage->GetAttached().GetStorageManager().GetBlockManager();
+	while (recovered_owned_block_count > 0) {
+		auto block_index = recovered_owned_block_count - 1;
+		block_manager.MarkBlockAsModified(recovered_blocks[block_index]);
+		recovered_owned_block_count = block_index;
+	}
+	recovered_blocks.clear();
+}
+
+void ReclusterCommitInfo::ReleaseRecoveredBlocksNoThrow() noexcept {
+	try {
+		ReleaseRecoveredBlocks();
+	} catch (...) { // NOLINT: destructors cannot report allocator cleanup failures
+	}
+}
+
+void ReclusterCommitInfo::WriteToWAL(WriteAheadLog &wal) {
+	if (!task || state != ReclusterCommitLifecycle::PREPARED || !wal_retention.IsActive() || !prepared_wal) {
+		throw InternalException("Cannot write an applied recluster commit to the WAL");
+	}
+	wal.WriteRecluster(prepared_wal->header);
+	for (auto &entry : prepared_wal->deletes) {
+		wal.WriteReclusterDelete(entry);
+	}
+	prepared_wal.reset();
+}
+
+void ReclusterCommitInfo::CommitRuntimeWALRetention() {
+	if (!task || !wal_retention.IsActive() || wal_checkpoint_iteration == 0) {
+		throw InternalException("Invalid recluster WAL retention commit state");
+	}
+	auto &attached = storage->GetAttached();
+	auto transaction_end = ReclusterWALPosition {wal_checkpoint_iteration, attached.GetStorageManager().GetWALSize()};
+	if (transaction_end.file_offset == 0) {
+		throw InternalException("Invalid recluster WAL retention commit position");
+	}
+	attached.GetReclusterManager().GetWALBlockRetention().Commit(std::move(wal_retention), transaction_end);
+}
+
+void ReclusterCommitInfo::Commit(transaction_t commit_id, CommitDropState &drop_state) {
+	if (state != ReclusterCommitLifecycle::PREPARED || layout_published ||
+	    (task && task->GetState() != RangeTaskState::COMMITTING)) {
+		throw InternalException("Invalid recluster commit transition");
+	}
+	drop_state.AddRecluster(*this);
+
+	try {
+		pending_layout->visible_from = commit_id;
+		storage->GetRowGroupCollection()->PublishLayout(pending_layout);
+		layout_published = true;
+
+		auto sort_storage = storage->GetDataTableInfo()->GetSortStorage();
+		auto &layout_version = sort_storage->current_layout_version;
+		auto expected_version = old_layout->layout_version;
+		if (!layout_version.compare_exchange_strong(expected_version, pending_layout->layout_version)) {
+			throw InternalException("Recluster storage layout version changed during commit");
+		}
+		layout_version_advanced = true;
+		state = ReclusterCommitLifecycle::APPLIED;
+	} catch (...) {
+		auto commit_error = std::current_exception();
+		string commit_error_message = "unknown exception";
+		try {
+			std::rethrow_exception(commit_error);
+		} catch (std::exception &ex) {
+			commit_error_message = ex.what();
+		} catch (...) {
+		}
+		try {
+			if (layout_published) {
+				RevertLayout();
+			}
+		} catch (std::exception &ex) {
+			throw FatalException("Failed to revert a recluster layout after commit error: %s. Revert error: %s",
+			                     commit_error_message, ex.what());
+		} catch (...) {
+			throw FatalException("Failed to revert a recluster layout after commit error: %s. Revert error is unknown",
+			                     commit_error_message);
+		}
+		pending_layout->visible_from = 0;
+		state = ReclusterCommitLifecycle::PREPARED;
+		std::rethrow_exception(commit_error);
+	}
+}
+
+void ReclusterCommitInfo::RevertLayout() {
+	if (!layout_published) {
+		return;
+	}
+	storage->GetRowGroupCollection()->RevertPublishedLayout(pending_layout, old_layout);
+	if (layout_version_advanced) {
+		auto sort_storage = storage->GetDataTableInfo()->GetSortStorage();
+		auto &layout_version = sort_storage->current_layout_version;
+		auto expected_version = pending_layout->layout_version;
+		if (!layout_version.compare_exchange_strong(expected_version, old_layout->layout_version)) {
+			throw InternalException("Recluster storage layout version changed during revert");
+		}
+		layout_version_advanced = false;
+	}
+	layout_published = false;
+}
+
+void ReclusterCommitInfo::RevertCommit() {
+	if (state != ReclusterCommitLifecycle::APPLIED) {
+		throw InternalException("Cannot revert an unapplied recluster commit");
+	}
+	RevertLayout();
+	pending_layout->visible_from = 0;
+	state = ReclusterCommitLifecycle::PREPARED;
+}
+
+void ReclusterCommitInfo::FinalizeCommit() {
+	if (state != ReclusterCommitLifecycle::APPLIED || !layout_published) {
+		throw InternalException("Cannot finalize an unapplied recluster commit");
+	}
+	if (!task) {
+		storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Commit(std::move(retirement));
+		storage->GetDataTableInfo()->GetSortStorage()->AdvancePastRunId(recovered_run_id);
+		recovered_owned_block_count = 0;
+		recovered_blocks.clear();
+		state = ReclusterCommitLifecycle::FINALIZED;
+		return;
+	}
+	if (wal_retention.IsActive()) {
+		CommitRuntimeWALRetention();
+	}
+	task->GetTaskContext().GetOutput().MarkPublished();
+	storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Commit(std::move(retirement));
+	auto finished = task->TryFinishCommit(true);
+	D_ASSERT(finished);
+	(void)finished;
+	table_state->RemoveTask(task->GetTaskId());
+	state = ReclusterCommitLifecycle::FINALIZED;
+}
+
+void ReclusterCommitInfo::Rollback() {
+	if (state == ReclusterCommitLifecycle::FINALIZED || state == ReclusterCommitLifecycle::ROLLED_BACK) {
+		throw InternalException("Invalid recluster rollback transition");
+	}
+	if (layout_published) {
+		RevertLayout();
+	}
+	if (!task) {
+		ReleaseRecoveredBlocks();
+		retirement = PreparedReclusterRetirement();
+		state = ReclusterCommitLifecycle::ROLLED_BACK;
+		return;
+	}
+	task->GetTaskContext().GetOutput().Abort();
+	if (task->GetState() == RangeTaskState::COMMITTING) {
+		auto finished = task->TryFinishCommit(false);
+		D_ASSERT(finished);
+		(void)finished;
+	} else {
+		task->TryFail();
+	}
+	table_state->RemoveTask(task->GetTaskId());
+	retirement = PreparedReclusterRetirement();
+	state = ReclusterCommitLifecycle::ROLLED_BACK;
+}
+
+void ReclusterCommitInfo::Cleanup(transaction_t lowest_active_transaction) {
+	if (state != ReclusterCommitLifecycle::FINALIZED) {
+		throw InternalException("Cannot clean up an unfinished recluster commit");
+	}
+	storage->GetRowGroupCollection()->CleanupLayoutHistory(lowest_active_transaction);
+	storage->GetAttached().GetReclusterManager().GetRetirementRegistry().Cleanup();
+}
+
+} // namespace duckdb

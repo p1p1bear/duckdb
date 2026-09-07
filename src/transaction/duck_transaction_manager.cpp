@@ -19,6 +19,7 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/checkpoint/checkpoint_options.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -31,6 +32,24 @@ static ErrorData BuildAutocheckpointError(AttachedDatabase &db, const std::excep
 	                                recovery, original.RawMessage());
 	return ErrorData(original.Type(), msg);
 }
+
+class ReclusterCommitPreparationGuard {
+public:
+	explicit ReclusterCommitPreparationGuard(DuckTransaction &transaction_p) : transaction(transaction_p) {
+	}
+	~ReclusterCommitPreparationGuard() {
+		if (active) {
+			transaction.ResolveReclusterDeletes(false);
+		}
+	}
+	void Dismiss() noexcept {
+		active = false;
+	}
+
+private:
+	DuckTransaction &transaction;
+	bool active = true;
+};
 
 void DuckCleanupInfo::Cleanup() {
 	for (auto &transaction : transactions) {
@@ -297,6 +316,8 @@ void DuckTransactionManager::CleanupTransactions() {
 
 ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction_p) {
 	auto &transaction = transaction_p.Cast<DuckTransaction>();
+	ReclusterCommitPreparationGuard recluster_preparation_guard(transaction);
+	auto error = transaction.PrepareReclusterCommit();
 	unique_lock<mutex> t_lock(transaction_lock);
 	if (!db.IsSystem() && !db.IsTemporary()) {
 		if (transaction.ChangesMade()) {
@@ -310,12 +331,19 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// check if we can checkpoint
 	unique_ptr<StorageLockKey> lock;
 	auto undo_properties = transaction.GetUndoProperties();
-	auto checkpoint_decision = CanCheckpoint(transaction, lock, undo_properties);
-	ErrorData error;
+	auto trigger_auto_recluster = transaction.ChangesMade() && Settings::Get<AutoReclusterSetting>(db.GetDatabase());
+	bool include_recluster_tables_without_checkpoint = false;
+	if (trigger_auto_recluster) {
+		include_recluster_tables_without_checkpoint =
+		    Settings::Get<ReclusterTriggerCheckpointSetting>(db.GetDatabase());
+	}
+	auto checkpoint_decision =
+	    error.HasError() ? CheckpointDecision(error.Message()) : CanCheckpoint(transaction, lock, undo_properties);
 	unique_lock<mutex> held_wal_lock;
 	unique_ptr<StorageCommitState> commit_state;
 	bool skip_wal_write_due_to_checkpoint = false;
 	bool wal_written = false;
+	bool checkpoint_failed = false;
 	if (checkpoint_decision.can_checkpoint) {
 		// we can perform an automatic checkpoint
 		// we have two options:
@@ -329,7 +357,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 			skip_wal_write_due_to_checkpoint = true;
 		}
 	}
-	bool should_write_to_wal = transaction.ShouldWriteToWAL(db);
+	bool should_write_to_wal = !error.HasError() && transaction.ShouldWriteToWAL(db);
 	if (should_write_to_wal) {
 		auto &storage_manager = db.GetStorageManager().Cast<SingleFileStorageManager>();
 		// if we are committing changes and we are not doing a "checkpoint instead of WAL write"
@@ -369,7 +397,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		}
 	}
 	// in-memory databases don't have a WAL - we estimate how large their changeset is based on the undo properties
-	if (!db.IsSystem()) {
+	if (!error.HasError() && !db.IsSystem()) {
 		auto &storage_manager = db.GetStorageManager();
 		if (storage_manager.InMemory() || db.GetRecoveryMode() == RecoveryMode::NO_WAL_WRITES) {
 			storage_manager.AddWALSize(undo_properties.estimated_size);
@@ -389,7 +417,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		error = transaction.Commit(db, info, std::move(commit_state));
 	}
 
-	if (error.HasError()) {
+	if (error.HasError() && !transaction.CommitFinalizationIrreversible()) {
 		DUCKDB_LOG(context, TransactionLogType, db, "Rollback (after failed commit)", info.commit_id);
 
 		// COMMIT not successful: ROLLBACK.
@@ -397,13 +425,22 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		transaction.commit_id = 0;
 
 		auto rollback_error = transaction.Rollback();
+		transaction.ResolveReclusterDeletes(false);
+		recluster_preparation_guard.Dismiss();
 		if (rollback_error.HasError()) {
 			throw FatalException(
 			    "Failed to rollback transaction. Cannot continue operation.\nOriginal Error: %s\nRollback Error: %s",
 			    error.Message(), rollback_error.Message());
 		}
 	} else {
-		DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
+		if (error.HasError()) {
+			checkpoint_decision = CheckpointDecision(error.Message());
+			DUCKDB_LOG(context, TransactionLogType, db, "Commit finalization failed", info.commit_id);
+		} else {
+			DUCKDB_LOG(context, TransactionLogType, db, "Commit", info.commit_id);
+		}
+		transaction.ResolveReclusterDeletes(true);
+		recluster_preparation_guard.Dismiss();
 		last_commit = info.commit_id;
 
 		// check if catalog changes were made
@@ -422,7 +459,12 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 	// commit successful: remove the transaction id from the list of active transactions
 	// potentially resulting in garbage collection
 	bool store_transaction = undo_properties.has_updates || undo_properties.has_index_deletes ||
-	                         undo_properties.has_catalog_changes || error.HasError();
+	                         undo_properties.has_catalog_changes || undo_properties.has_recluster || error.HasError();
+	vector<QualifiedName> modified_recluster_tables;
+	if (!error.HasError() && trigger_auto_recluster) {
+		modified_recluster_tables = transaction.GetModifiedReclusterTables(include_recluster_tables_without_checkpoint);
+	}
+	transaction.ReleaseReclusterWriteLocks();
 
 	// Remove the transaction from the list of active transactions and gather cleanup information.
 	auto cleanup_info = RemoveTransaction(transaction, store_transaction);
@@ -458,12 +500,17 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		try {
 			storage_manager.CreateCheckpoint(context, options);
 		} catch (std::exception &ex) {
+			checkpoint_failed = true;
 			if (wal_written) {
 				context.transaction.SetAutocheckpointError(BuildAutocheckpointError(db, ex));
 			} else {
 				error.Merge(ErrorData(ex));
 			}
 		}
+	}
+	if (!error.HasError() && !checkpoint_failed && trigger_auto_recluster && db.HasReclusterManager() &&
+	    db.GetStorageManager().IsLoaded()) {
+		db.GetReclusterManager().RequestAutoRecluster(modified_recluster_tables);
 	}
 
 	return error;
@@ -479,6 +526,8 @@ void DuckTransactionManager::RollbackTransaction(Transaction &transaction_p) {
 		// Obtain the transaction lock and roll back.
 		lock_guard<mutex> t_lock(transaction_lock);
 		error = transaction.Rollback();
+		transaction.ResolveReclusterDeletes(false);
+		transaction.ReleaseReclusterWriteLocks();
 
 		// Remove the transaction from the list of active transactions and gather cleanup information.
 		auto cleanup_info = RemoveTransaction(transaction);

@@ -92,6 +92,14 @@ void WriteAheadLog::Truncate(idx_t size) {
 	storage_manager.SetWALSize(writer->GetFileSize());
 }
 
+void WriteAheadLog::TruncateAndSync(idx_t size) {
+	Truncate(size);
+	if (writer) {
+		writer->Sync();
+		storage_manager.SetWALSize(writer->GetFileSize());
+	}
+}
+
 bool WriteAheadLog::Initialized() const {
 	return init_state == WALInitState::INITIALIZED;
 }
@@ -291,6 +299,20 @@ void WriteAheadLog::WriteHeader() {
 void WriteAheadLog::WriteCheckpoint(MetaBlockPointer meta_block) {
 	WriteAheadLogSerializer serializer(*this, WALType::CHECKPOINT);
 	serializer.WriteEntry(WALCheckpoint {meta_block});
+	serializer.End();
+}
+
+void WriteAheadLog::WriteRecluster(const WALReclusterEntry &entry) {
+	entry.Validate();
+	WriteAheadLogSerializer serializer(*this, WALType::RECLUSTER);
+	serializer.WriteEntry(entry);
+	serializer.End();
+}
+
+void WriteAheadLog::WriteReclusterDelete(const WALReclusterDeleteEntry &entry) {
+	entry.Validate();
+	WriteAheadLogSerializer serializer(*this, WALType::RECLUSTER_DELETE);
+	serializer.WriteEntry(entry);
 	serializer.End();
 }
 

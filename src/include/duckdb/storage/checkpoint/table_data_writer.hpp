@@ -16,6 +16,7 @@ class DuckTableEntry;
 class TableStatistics;
 class SingleFileCheckpointWriter;
 class RowGroupCollection;
+class StorageLockKey;
 struct RowGroupPointer;
 
 //! The table data writer is responsible for writing the data of a table to storage.
@@ -30,12 +31,12 @@ public:
 	virtual ~TableDataWriter();
 
 public:
-	void WriteTableData(Serializer &metadata_serializer);
+	void WriteTableData(Serializer &metadata_serializer, const StorageLockKey &checkpoint_lock);
 
 	virtual void WriteUnchangedTable(MetaBlockPointer pointer, const vector<MetaBlockPointer> &metadata_pointers,
 	                                 idx_t total_rows, idx_t next_row_id) = 0;
 	virtual void FinalizeTable(const TableStatistics &global_stats, DataTableInfo &info, RowGroupCollection &collection,
-	                           Serializer &serializer) = 0;
+	                           Serializer &serializer, const StorageLockKey &checkpoint_lock) = 0;
 	virtual unique_ptr<RowGroupWriter> GetRowGroupWriter(RowGroup &row_group) = 0;
 
 	virtual void AddRowGroup(RowGroupPointer &&row_group_pointer, unique_ptr<RowGroupWriter> writer);
@@ -94,7 +95,7 @@ public:
 	void WriteUnchangedTable(MetaBlockPointer pointer, const vector<MetaBlockPointer> &metadata_pointers,
 	                         idx_t total_rows, idx_t next_row_id) override;
 	void FinalizeTable(const TableStatistics &global_stats, DataTableInfo &info, RowGroupCollection &collection,
-	                   Serializer &serializer) override;
+	                   Serializer &serializer, const StorageLockKey &checkpoint_lock) override;
 	unique_ptr<RowGroupWriter> GetRowGroupWriter(RowGroup &row_group) override;
 	CheckpointOptions GetCheckpointOptions() const override;
 	void FlushPartialBlocks() override;

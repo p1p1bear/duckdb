@@ -30,6 +30,7 @@
 #include "duckdb/storage/checkpoint/table_data_reader.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
+#include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -199,6 +200,10 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		// don't checkpoint invalidated databases
 		return;
 	}
+	auto &recluster_manager = db.GetReclusterManager();
+	auto layout_publish_lock = recluster_manager.GetExclusiveLayoutPublishLock();
+	recluster_checkpoint_number = recluster_manager.BeginCheckpoint();
+	pending_recluster_states.clear();
 	// assert that the checkpoint manager hasn't been used before
 	D_ASSERT(!metadata_writer);
 
@@ -285,12 +290,26 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		throw IOException("Checkpoint aborted before header write (non-fatal) because of PRAGMA checkpoint_abort flag");
 	}
 
+	unique_lock<mutex> owned_wal_lock;
+	optional_ptr<unique_lock<mutex>> wal_lock;
+	if (has_wal) {
+		if (!options.wal_lock) {
+			owned_wal_lock = storage_manager.GetWALLock();
+			wal_lock = owned_wal_lock;
+		} else {
+			wal_lock = options.wal_lock;
+		}
+	}
+	auto retirement_checkpoint = recluster_manager.GetRetirementRegistry().PrepareCheckpoint();
+	retirement_checkpoint.Apply();
+
 	// finally write the updated header
 	DatabaseHeader header;
 	header.meta_block = meta_block.block_pointer;
 	header.block_alloc_size = block_manager.GetBlockAllocSize();
 	header.vector_size = STANDARD_VECTOR_SIZE;
 	block_manager.WriteHeader(context, header);
+	retirement_checkpoint.HeaderSucceeded();
 
 	auto debug_verify_blocks = Settings::Get<DebugVerifyBlocksSetting>(db.GetDatabase());
 	if (debug_verify_blocks) {
@@ -335,16 +354,6 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 
 	// truncate the WAL
 	if (has_wal) {
-		unique_lock<mutex> owned_wal_lock;
-		optional_ptr<unique_lock<mutex>> wal_lock;
-		if (!options.wal_lock) {
-			// not holding the WAL lock yet - grab it
-			owned_wal_lock = storage_manager.GetWALLock();
-			wal_lock = owned_wal_lock;
-		} else {
-			// we already have the WAL lock - just refer to it
-			wal_lock = options.wal_lock;
-		}
 		storage_manager.WALFinishCheckpoint(*wal_lock);
 	}
 
@@ -367,6 +376,7 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		index_list.MergeCheckpointDeltas(options.transaction_id);
 	}
 	active_checkpoint.Commit();
+	recluster_manager.OnCheckpointSuccess(std::move(pending_recluster_states));
 }
 
 void CheckpointReader::LoadCheckpoint(CatalogTransaction transaction, MetadataReader &reader) {
@@ -404,6 +414,9 @@ void SingleFileCheckpointReader::LoadFromStorage() {
 	MetadataReader reader(metadata_manager, meta_block);
 	auto transaction = CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
 	LoadCheckpoint(transaction, reader);
+	if (storage.GetAttached().HasReclusterManager()) {
+		storage.GetAttached().GetReclusterManager().InitializeCheckpointTables();
+	}
 }
 
 void CheckpointWriter::WriteEntry(CatalogEntry &entry, Serializer &serializer) {
@@ -702,7 +715,14 @@ void SingleFileCheckpointWriter::WriteTable(TableCatalogEntry &table, Serializer
 	auto table_lock = table.GetStorage().GetCheckpointLock();
 	auto writer = GetTableDataWriter(table);
 	if (writer) {
-		writer->WriteTableData(serializer);
+		writer->WriteTableData(serializer, *table_lock);
+	}
+	if (table.IsDuckTable()) {
+		auto pending =
+		    db.GetReclusterManager().PrepareCheckpoint(table.Cast<DuckTableEntry>(), recluster_checkpoint_number);
+		if (pending) {
+			pending_recluster_states.push_back(std::move(*pending));
+		}
 	}
 }
 
@@ -736,6 +756,10 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	// Read next_row_id as total_rows for backwards compatibility. Older storage versions do not allow for gaps in
 	// row_id numbering, in which case next_row_id = total_rows.
 	auto next_row_id = deserializer.ReadPropertyWithExplicitDefault<idx_t>(105, "next_row_id", total_rows);
+	auto next_run_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_run_id_t>(106, "next_run_id", INVALID_SORT_RUN_ID);
+	auto layout_version =
+	    deserializer.ReadPropertyWithExplicitDefault<layout_version_t>(107, "layout_version", INITIAL_LAYOUT_VERSION);
 	D_ASSERT(next_row_id >= total_rows);
 
 	if (!index_storage_infos.empty()) {
@@ -763,6 +787,16 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	bound_info.data->total_rows = total_rows;
 	bound_info.data->next_row_id = next_row_id;
 	bound_info.data->read_metadata_pointers = read_pointers;
+	if (bound_info.Base().sort_metadata) {
+		if (next_run_id == INVALID_SORT_RUN_ID) {
+			throw SerializationException("Table \"%s\" has SORTED BY catalog metadata but no storage state",
+			                             bound_info.Base().GetTableName());
+		}
+		bound_info.data->sort_storage_metadata = {next_run_id, layout_version};
+	} else if (next_run_id != INVALID_SORT_RUN_ID || layout_version != INITIAL_LAYOUT_VERSION) {
+		throw SerializationException("Table \"%s\" has SORTED BY storage state but no catalog metadata",
+		                             bound_info.Base().GetTableName());
+	}
 }
 
 } // namespace duckdb
