@@ -1,0 +1,551 @@
+#include "duckdb/storage/recluster/recluster_manager.hpp"
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/thread.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/time_point.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/main/valid_checker.hpp"
+#include "duckdb/parallel/task.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+
+namespace duckdb {
+
+static constexpr idx_t AUTO_RECLUSTER_MAX_BYTES = 1ULL << 30;
+static constexpr idx_t AUTO_RECLUSTER_MAX_THREADS = 2;
+static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS = 60 * 1000;
+static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_RETRY_DELAY_MS = 1000;
+
+struct ReclusterAutoSchedulerState {
+	explicit ReclusterAutoSchedulerState(ReclusterManager &manager_p) : manager(manager_p) {
+	}
+
+	mutex lock;
+	std::condition_variable cv;
+	ReclusterManager &manager;
+	bool closing = false;
+	bool active = false;
+	bool rerun_requested = false;
+	bool checkpoint_requested = false;
+	bool discover_tables = false;
+	bool auto_checkpoint_completed = false;
+	int64_t last_auto_checkpoint_ms = 0;
+	int64_t auto_checkpoint_interval_ms = AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS;
+	int64_t checkpoint_retry_at_ms = 0;
+#ifndef DUCKDB_NO_THREADS
+	unique_ptr<thread> checkpoint_timer;
+	bool checkpoint_timer_running = false;
+#endif
+	vector<QualifiedName> pending_tables;
+};
+
+class ReclusterAutoTask final : public Task {
+public:
+	explicit ReclusterAutoTask(shared_ptr<ReclusterAutoSchedulerState> state_p) : state(std::move(state_p)) {
+	}
+
+	TaskExecutionResult Execute(TaskExecutionMode mode) override {
+		(void)mode;
+		state->manager.RunAutoReclusterPass();
+		state->manager.FinishAutoReclusterTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "ReclusterAutoTask";
+	}
+
+private:
+	shared_ptr<ReclusterAutoSchedulerState> state;
+};
+
+static void LogAutoReclusterError(AttachedDatabase &db, const string &message) noexcept {
+	try {
+		DUCKDB_LOG_ERROR(db.GetDatabase(), "Automatic recluster: " + message);
+	} catch (...) { // NOLINT: background maintenance cannot report a logging failure
+	}
+}
+
+static void InvalidateAfterAutoReclusterError(AttachedDatabase &db, const std::exception &ex) noexcept {
+	try {
+		ErrorData error(ex);
+		ValidChecker::Invalidate(db, "Automatic recluster failed with an internal error: " + error.Message());
+	} catch (...) { // NOLINT: invalidation is already the terminal error path
+	}
+}
+
+ReclusterManager::~ReclusterManager() {
+	StopAutoRecluster();
+	auto_scheduler_producer.reset();
+	auto_scheduler_state.reset();
+}
+
+void ReclusterManager::StopAutoRecluster() noexcept {
+	auto_scheduler_closing.store(true);
+#ifndef DUCKDB_NO_THREADS
+	unique_ptr<thread> checkpoint_timer;
+#endif
+	{
+		lock_guard<mutex> initialization_guard(queue_lock);
+		if (!auto_scheduler_initialized.load()) {
+			return;
+		}
+	}
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->closing = true;
+		auto_scheduler_state->rerun_requested = false;
+		auto_scheduler_state->checkpoint_requested = false;
+		auto_scheduler_state->discover_tables = false;
+		auto_scheduler_state->pending_tables.clear();
+#ifndef DUCKDB_NO_THREADS
+		checkpoint_timer = std::move(auto_scheduler_state->checkpoint_timer);
+#endif
+		auto_scheduler_state->cv.notify_all();
+	}
+#ifndef DUCKDB_NO_THREADS
+	if (checkpoint_timer && checkpoint_timer->joinable()) {
+		checkpoint_timer->join();
+	}
+#endif
+	try {
+		WaitForAutoRecluster();
+	} catch (...) { // NOLINT: database close cannot report a background drain failure
+	}
+}
+
+void ReclusterManager::SetAutoCheckpointIntervalForTesting(idx_t interval_ms) {
+	if (interval_ms == 0 || interval_ms > NumericLimits<int64_t>::Maximum()) {
+		throw InvalidInputException("Automatic recluster checkpoint interval must be greater than zero");
+	}
+	if (!InitializeAutoScheduler()) {
+		throw InternalException("Cannot initialize automatic recluster scheduling while the database is closing");
+	}
+	lock_guard<mutex> guard(auto_scheduler_state->lock);
+	auto_scheduler_state->auto_checkpoint_interval_ms = NumericCast<int64_t>(interval_ms);
+}
+
+bool ReclusterManager::InitializeAutoScheduler() {
+	if (auto_scheduler_closing.load()) {
+		return false;
+	}
+	if (auto_scheduler_initialized.load()) {
+		return true;
+	}
+	lock_guard<mutex> guard(queue_lock);
+	if (auto_scheduler_initialized.load()) {
+		return true;
+	}
+	auto state = make_shared_ptr<ReclusterAutoSchedulerState>(*this);
+	auto producer = TaskScheduler::GetScheduler(db.GetDatabase()).CreateProducer();
+	auto_scheduler_state = std::move(state);
+	auto_scheduler_producer = std::move(producer);
+	auto_scheduler_initialized.store(true);
+	return true;
+}
+
+bool ReclusterManager::AutoReclusterEnabled() const noexcept {
+	try {
+		return !db.IsReadOnly() && !ValidChecker::IsInvalidated(db) &&
+		       Settings::Get<AutoReclusterSetting>(db.GetDatabase());
+	} catch (...) {
+		return false;
+	}
+}
+
+bool ReclusterManager::AutoCheckpointEnabled() const noexcept {
+	try {
+		return AutoReclusterEnabled() && Settings::Get<ReclusterTriggerCheckpointSetting>(db.GetDatabase());
+	} catch (...) {
+		return false;
+	}
+}
+
+void ReclusterManager::ClearAutoCheckpointRequest() noexcept {
+	if (!auto_scheduler_initialized.load()) {
+		return;
+	}
+	lock_guard<mutex> guard(auto_scheduler_state->lock);
+	auto_scheduler_state->checkpoint_requested = false;
+	auto_scheduler_state->cv.notify_all();
+}
+
+void ReclusterManager::RequestAutoCheckpoint() noexcept {
+	if (!AutoCheckpointEnabled()) {
+		return;
+	}
+	auto now_ms = TimePoint::GetTickMs();
+	optional<int64_t> retry_at_ms;
+	auto retry_delay_ms = AUTO_RECLUSTER_CHECKPOINT_RETRY_DELAY_MS;
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing) {
+			return;
+		}
+		auto_scheduler_state->checkpoint_requested = true;
+		retry_delay_ms = MinValue(retry_delay_ms, auto_scheduler_state->auto_checkpoint_interval_ms);
+		if (auto_scheduler_state->auto_checkpoint_completed) {
+			auto elapsed_ms = now_ms - auto_scheduler_state->last_auto_checkpoint_ms;
+			if (elapsed_ms < auto_scheduler_state->auto_checkpoint_interval_ms) {
+				retry_at_ms =
+				    auto_scheduler_state->last_auto_checkpoint_ms + auto_scheduler_state->auto_checkpoint_interval_ms;
+			}
+		}
+	}
+	if (retry_at_ms) {
+		ScheduleAutoCheckpointRetry(*retry_at_ms);
+		return;
+	}
+
+	try {
+		Connection connection(db.GetDatabase());
+		{
+			lock_guard<mutex> guard(auto_scheduler_state->lock);
+			if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested) {
+				return;
+			}
+		}
+		if (db.GetStorageManager().GetWALSize() == 0) {
+			return;
+		}
+		connection.context->RunFunctionInTransaction(
+		    [&]() { TransactionManager::Get(db).Checkpoint(*connection.context, false); });
+		now_ms = TimePoint::GetTickMs();
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_requested = false;
+		auto_scheduler_state->auto_checkpoint_completed = true;
+		auto_scheduler_state->last_auto_checkpoint_ms = now_ms;
+	} catch (TransactionException &) {
+		ScheduleAutoCheckpointRetry(TimePoint::GetTickMs() + retry_delay_ms);
+	} catch (FatalException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (DataCorruptionException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (SerializationException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (InternalException &ex) {
+		InvalidateAfterAutoReclusterError(db, ex);
+	} catch (std::exception &ex) {
+		LogAutoReclusterError(db, string("checkpoint request: ") + ex.what());
+	} catch (...) {
+		LogAutoReclusterError(db, "unknown checkpoint request error");
+	}
+}
+
+void ReclusterManager::ScheduleAutoCheckpointRetry(int64_t retry_at_ms) noexcept {
+#ifdef DUCKDB_NO_THREADS
+	(void)retry_at_ms;
+	return;
+#else
+	unique_ptr<thread> completed_timer;
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested) {
+			return;
+		}
+		if (auto_scheduler_state->checkpoint_timer_running) {
+			auto_scheduler_state->checkpoint_retry_at_ms =
+			    MinValue(auto_scheduler_state->checkpoint_retry_at_ms, retry_at_ms);
+			auto_scheduler_state->cv.notify_all();
+			return;
+		}
+		completed_timer = std::move(auto_scheduler_state->checkpoint_timer);
+	}
+	if (completed_timer && completed_timer->joinable()) {
+		completed_timer->join();
+	}
+
+	try {
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing || !auto_scheduler_state->checkpoint_requested ||
+		    auto_scheduler_state->checkpoint_timer_running) {
+			return;
+		}
+		auto_scheduler_state->checkpoint_retry_at_ms = retry_at_ms;
+		auto_scheduler_state->checkpoint_timer_running = true;
+		auto state = auto_scheduler_state;
+		auto_scheduler_state->checkpoint_timer = make_uniq<thread>([state]() {
+			bool schedule_task = false;
+			{
+				unique_lock<mutex> guard(state->lock);
+				while (!state->closing && state->checkpoint_requested) {
+					auto now_ms = TimePoint::GetTickMs();
+					if (now_ms >= state->checkpoint_retry_at_ms) {
+						break;
+					}
+					auto retry_at = state->checkpoint_retry_at_ms;
+					state->cv.wait_for(guard, std::chrono::milliseconds(retry_at - now_ms), [&]() {
+						return state->closing || !state->checkpoint_requested ||
+						       state->checkpoint_retry_at_ms != retry_at;
+					});
+				}
+				if (!state->closing && state->checkpoint_requested && state->manager.AutoReclusterEnabled()) {
+					if (state->active) {
+						state->rerun_requested = true;
+					} else {
+						state->active = true;
+						schedule_task = true;
+					}
+				}
+				state->checkpoint_timer_running = false;
+				state->checkpoint_retry_at_ms = 0;
+				state->cv.notify_all();
+			}
+			if (schedule_task) {
+				state->manager.ScheduleAutoReclusterTask();
+			}
+		});
+	} catch (std::exception &ex) {
+		LogAutoReclusterError(db, string("checkpoint retry timer: ") + ex.what());
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_timer_running = false;
+		auto_scheduler_state->checkpoint_retry_at_ms = 0;
+		auto_scheduler_state->cv.notify_all();
+	} catch (...) {
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->checkpoint_timer_running = false;
+		auto_scheduler_state->checkpoint_retry_at_ms = 0;
+		auto_scheduler_state->cv.notify_all();
+	}
+#endif
+}
+
+void ReclusterManager::ScheduleAutoReclusterTask() noexcept {
+	try {
+		auto task = make_shared_ptr<ReclusterAutoTask>(auto_scheduler_state);
+		TaskScheduler::GetScheduler(db.GetDatabase()).ScheduleTask(*auto_scheduler_producer, std::move(task));
+	} catch (std::exception &ex) {
+		LogAutoReclusterError(db, ex.what());
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->active = false;
+		auto_scheduler_state->rerun_requested = false;
+		auto_scheduler_state->cv.notify_all();
+	} catch (...) {
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		auto_scheduler_state->active = false;
+		auto_scheduler_state->rerun_requested = false;
+		auto_scheduler_state->cv.notify_all();
+	}
+}
+
+void ReclusterManager::RequestAutoRecluster() noexcept {
+	auto allow_catalog_discovery = AutoCheckpointEnabled();
+	{
+		lock_guard<mutex> guard(queue_lock);
+		if (enabled_tables.empty() && !allow_catalog_discovery) {
+			return;
+		}
+	}
+	QueueAutoRecluster({}, true);
+}
+
+void ReclusterManager::RequestAutoRecluster(const vector<QualifiedName> &table_names) noexcept {
+	if (table_names.empty() && !auto_scheduler_initialized.load()) {
+		return;
+	}
+	QueueAutoRecluster(table_names, false);
+}
+
+void ReclusterManager::QueueAutoRecluster(const vector<QualifiedName> &table_names, bool discover_tables) noexcept {
+	if (!AutoReclusterEnabled()) {
+		return;
+	}
+	try {
+		if (!InitializeAutoScheduler()) {
+			return;
+		}
+		{
+			lock_guard<mutex> guard(auto_scheduler_state->lock);
+			if (auto_scheduler_state->closing) {
+				return;
+			}
+			if (!discover_tables && table_names.empty() && auto_scheduler_state->pending_tables.empty() &&
+			    !auto_scheduler_state->checkpoint_requested) {
+				return;
+			}
+			auto_scheduler_state->discover_tables |= discover_tables;
+			for (auto &table_name : table_names) {
+				if (std::find(auto_scheduler_state->pending_tables.begin(), auto_scheduler_state->pending_tables.end(),
+				              table_name) == auto_scheduler_state->pending_tables.end()) {
+					auto_scheduler_state->pending_tables.push_back(table_name);
+				}
+			}
+			if (auto_scheduler_state->active) {
+				auto_scheduler_state->rerun_requested = true;
+				return;
+			}
+			auto_scheduler_state->active = true;
+		}
+	} catch (...) { // NOLINT: background scheduling cannot make a durable commit fail
+		return;
+	}
+	ScheduleAutoReclusterTask();
+}
+
+void ReclusterManager::FinishAutoReclusterTask() noexcept {
+	bool schedule_again = false;
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (!auto_scheduler_state->closing && auto_scheduler_state->rerun_requested && AutoReclusterEnabled()) {
+			auto_scheduler_state->rerun_requested = false;
+			schedule_again = true;
+		} else {
+			auto_scheduler_state->active = false;
+			auto_scheduler_state->rerun_requested = false;
+			auto_scheduler_state->cv.notify_all();
+		}
+	}
+	if (schedule_again) {
+		ScheduleAutoReclusterTask();
+	}
+}
+
+void ReclusterManager::WaitForAutoRecluster() {
+	if (!auto_scheduler_initialized.load()) {
+		return;
+	}
+	auto &scheduler = TaskScheduler::GetScheduler(db.GetDatabase());
+	while (true) {
+		shared_ptr<Task> task;
+		if (scheduler.GetTaskFromProducer(*auto_scheduler_producer, task)) {
+			task->Execute(TaskExecutionMode::PROCESS_ALL);
+			continue;
+		}
+		unique_lock<mutex> guard(auto_scheduler_state->lock);
+		if (!auto_scheduler_state->active
+#ifndef DUCKDB_NO_THREADS
+		    && !auto_scheduler_state->checkpoint_timer_running
+#endif
+		) {
+			return;
+		}
+		auto_scheduler_state->cv.wait_for(guard, std::chrono::milliseconds(10));
+	}
+}
+
+void ReclusterManager::RunAutoReclusterPass() noexcept {
+	vector<QualifiedName> table_names;
+	bool discover_tables;
+	bool retry_checkpoint;
+	{
+		lock_guard<mutex> guard(auto_scheduler_state->lock);
+		if (auto_scheduler_state->closing) {
+			return;
+		}
+		table_names.swap(auto_scheduler_state->pending_tables);
+		discover_tables = auto_scheduler_state->discover_tables;
+		auto_scheduler_state->discover_tables = false;
+		retry_checkpoint = auto_scheduler_state->checkpoint_requested;
+	}
+	if (!AutoReclusterEnabled()) {
+		return;
+	}
+
+	if (discover_tables) {
+		try {
+			auto discovered = DiscoverSortedTables();
+			for (auto &table_name : discovered) {
+				if (std::find(table_names.begin(), table_names.end(), table_name) == table_names.end()) {
+					table_names.push_back(std::move(table_name));
+				}
+			}
+		} catch (std::exception &ex) {
+			LogAutoReclusterError(db, ex.what());
+			return;
+		} catch (...) {
+			LogAutoReclusterError(db, "unknown error while scanning sorted tables");
+			return;
+		}
+	}
+
+	bool checkpoint_needed = false;
+	vector<QualifiedName> retry_tables;
+	for (auto &table_name : table_names) {
+		if (!AutoReclusterEnabled()) {
+			return;
+		}
+		try {
+			Connection connection(db.GetDatabase());
+			ReclusterExplicitResult result;
+			shared_ptr<TableReclusterState> table_state;
+			connection.context->RunFunctionInTransaction([&]() {
+				auto table_entry =
+				    Catalog::GetEntry<DuckTableEntry>(*connection.context, table_name, OnEntryNotFound::RETURN_NULL);
+				if (!table_entry) {
+					return;
+				}
+				auto &table = *table_entry;
+				if (!table.SortEnabled()) {
+					SynchronizeTable(table);
+					return;
+				}
+				auto state = table.GetStorage().GetDataTableInfo()->GetReclusterState();
+				if (!state) {
+					state = SynchronizeTable(table);
+				}
+				if (!state) {
+					return;
+				}
+				table_state = state;
+				if (!state->HasUsableCheckpoint()) {
+					checkpoint_needed =
+					    checkpoint_needed || (AutoCheckpointEnabled() && table.GetStorage().GetTotalRows() > 0);
+					return;
+				}
+				ReclusterExplicitOptions options;
+				options.max_bytes = AUTO_RECLUSTER_MAX_BYTES;
+				options.max_tasks = 1;
+				options.max_threads = AUTO_RECLUSTER_MAX_THREADS;
+				result = RunExplicit(*connection.context, table_name, options);
+			});
+			if (result.state == ReclusterExplicitState::FAILED) {
+				if (table_state) {
+					table_state->SetLastError(result.message);
+				}
+				LogAutoReclusterError(db, table_name.ToString() + ": " + result.message);
+			} else if (result.needs_checkpoint && result.remaining_recluster_bytes > 0) {
+				checkpoint_needed = true;
+			} else if (result.state == ReclusterExplicitState::BUDGET_EXHAUSTED && result.tasks_completed > 0 &&
+			           result.remaining_recluster_bytes > 0) {
+				retry_tables.push_back(table_name);
+			}
+		} catch (FatalException &ex) {
+			InvalidateAfterAutoReclusterError(db, ex);
+			return;
+		} catch (DataCorruptionException &ex) {
+			InvalidateAfterAutoReclusterError(db, ex);
+			return;
+		} catch (SerializationException &ex) {
+			InvalidateAfterAutoReclusterError(db, ex);
+			return;
+		} catch (InternalException &ex) {
+			InvalidateAfterAutoReclusterError(db, ex);
+			return;
+		} catch (std::exception &ex) {
+			LogAutoReclusterError(db, table_name.ToString() + ": " + ex.what());
+		} catch (...) {
+			LogAutoReclusterError(db, table_name.ToString() + ": unknown background error");
+		}
+	}
+	if (!retry_tables.empty()) {
+		RequestAutoRecluster(retry_tables);
+	}
+	if (checkpoint_needed || retry_checkpoint) {
+		RequestAutoCheckpoint();
+	}
+}
+
+} // namespace duckdb
