@@ -626,7 +626,6 @@ ExpressionList:
     - OverlayParameters
     - OverlayExpressionList
     - PartitionOptions
-    - SortedOptions
     - PivotUsing
     - WindowClause
     - SetAssignment
@@ -679,6 +678,7 @@ OrderByNodeList:
     - OrderByClause
     - OrderByExpressions
     - OrderByExpressionList
+    - SortedOptions
     - OrderByAll
     - WithinGroupClause
     - GenericCopyOptionParenthesizedExpressionList

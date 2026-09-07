@@ -349,6 +349,17 @@ struct AutoCheckpointSkipWalThresholdSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct AutoReclusterSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "auto_recluster";
+	static constexpr const char *Description =
+	    "Automatically schedule SORTED BY reclustering after successful commits and checkpoints";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct AutoinstallExtensionRepositorySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "autoinstall_extension_repository";
@@ -1086,6 +1097,17 @@ struct EnableProgressBarPrintSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct EnableSortedWriteSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_sorted_write";
+	static constexpr const char *Description = "Sort sufficiently large writes to SORTED BY tables before inserting; "
+	                                           "disable to leave new rows for reclustering";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableViewDependenciesSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_view_dependencies";
@@ -1813,6 +1835,17 @@ struct ReadAheadDepthSetting {
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ReclusterTriggerCheckpointSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "recluster_trigger_checkpoint";
+	static constexpr const char *Description =
+	    "Allow automatic SORTED BY maintenance to request rate-limited checkpoints";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
 struct RegexMatchOperatorSemanticsSetting {

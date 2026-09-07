@@ -10,6 +10,9 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/function/function_list.hpp"
 #include "duckdb/common/encryption_state.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
+#include "duckdb/storage/table/persistent_table_data.hpp"
 
 namespace duckdb {
 
@@ -47,6 +50,86 @@ void DuckCatalog::Initialize(bool load_builtin) {
 
 bool DuckCatalog::IsDuckCatalog() {
 	return true;
+}
+
+static ErrorData SortedCreateError(const string &message) {
+	return ErrorData(ExceptionType::BINDER, message);
+}
+
+static ErrorData ValidateSortedCreateCapabilities(DuckCatalog &catalog, BoundCreateTableInfo &info) {
+	auto &base = info.Base();
+	if (!base.partition_keys.empty()) {
+		return ErrorData(ExceptionType::CATALOG, "PARTITIONED BY is not supported for tables in a duckdb catalog");
+	}
+	if (!base.options.empty()) {
+		return ErrorData(ExceptionType::CATALOG, "WITH clause is not supported for tables in a duckdb catalog");
+	}
+	if (!base.HasAnySortDefinition()) {
+		return ErrorData();
+	}
+	if (base.temporary || catalog.GetAttached().IsTemporary() || catalog.InMemory()) {
+		return SortedCreateError("SORTED BY is only supported for persistent DuckDB tables");
+	}
+
+	auto &storage_manager = StorageManager::Get(catalog);
+	auto storage_version = storage_manager.GetStorageVersion();
+	if (storage_version < MIN_SORTED_BY_STORAGE_VERSION) {
+		return SortedCreateError(StringUtil::Format(
+		    "SORTED BY requires storage version %s or newer (database \"%s\" uses storage version %s)",
+		    GetStorageVersionName(MIN_SORTED_BY_STORAGE_VERSION, false), catalog.GetName().GetIdentifierName(),
+		    GetStorageVersionName(storage_version, false)));
+	}
+	const bool sort_enabled = base.sort_metadata ? base.sort_metadata->IsEnabled() : true;
+	if (!sort_enabled) {
+		return ErrorData();
+	}
+	for (auto &constraint : base.constraints) {
+		if (constraint->type == ConstraintType::UNIQUE || constraint->type == ConstraintType::FOREIGN_KEY) {
+			return SortedCreateError("SORTED BY tables cannot have PRIMARY KEY, UNIQUE, or FOREIGN KEY constraints");
+		}
+	}
+	if (!info.indexes.empty()) {
+		return SortedCreateError("SORTED BY tables cannot have indexes");
+	}
+	return ErrorData();
+}
+
+static void InitializeSortedCreate(BoundCreateTableInfo &info) {
+	auto &base = info.Base();
+	base.NormalizeSortKeys();
+	if (!base.sort_metadata) {
+		auto metadata = CreateTableSortIdentity(base.columns);
+		metadata.current_sort_order_id = 1;
+		metadata.next_sort_order_id = 2;
+		metadata.definitions.push_back(BindPersistentSortDefinition(base.sort_orders, base.columns, 1));
+		base.sort_metadata = std::move(metadata);
+		base.sort_keys.clear();
+		base.sort_orders.clear();
+	}
+	ValidateTableSortCatalogMetadata(*base.sort_metadata, base.columns);
+
+	if (!info.data) {
+		info.data = make_uniq<PersistentTableData>(base.columns.LogicalColumnCount());
+		info.data->sort_storage_metadata = PersistentTableSortStorageMetadata();
+	} else if (!info.data->sort_storage_metadata) {
+		throw SerializationException("SORTED BY table metadata has no persistent storage state");
+	}
+	if (info.data->sort_storage_metadata->next_run_id == INVALID_SORT_RUN_ID) {
+		throw SerializationException("SORTED BY table metadata has an invalid next run ID");
+	}
+}
+
+ErrorData DuckCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
+	auto error = ValidateSortedCreateCapabilities(*this, info);
+	if (error.HasError() || !info.Base().HasAnySortDefinition()) {
+		return error;
+	}
+	try {
+		InitializeSortedCreate(info);
+	} catch (std::exception &ex) {
+		return ErrorData(ex);
+	}
+	return ErrorData();
 }
 
 bool DuckCatalog::SupportsMultipleDMLCTEs() const {

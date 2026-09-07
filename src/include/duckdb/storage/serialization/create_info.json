@@ -207,13 +207,27 @@
         "id": 206,
         "name": "options",
         "type": "case_insensitive_map_t<ParsedExpression*>"
+      },
+      {
+        "id": 207,
+        "name": "sort_metadata",
+        "type": "optional<TableSortCatalogMetadata>",
+        "default": "optional<TableSortCatalogMetadata>()",
+        "version": "v2.0.0"
+      },
+      {
+        "id": 208,
+        "name": "sort_orders",
+        "type": "vector<OrderByNode>",
+        "version": "v2.0.0"
       }
     ],
     "methods": {
       "SetName": [
         "table"
       ]
-    }
+    },
+    "custom_implementation": true
   },
   {
     "class": "CreateSchemaInfo",

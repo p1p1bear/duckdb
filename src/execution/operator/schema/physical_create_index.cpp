@@ -11,6 +11,7 @@
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/execution/index/index_type.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 namespace duckdb {
 
@@ -138,26 +139,57 @@ SinkFinalizeType PhysicalCreateIndex::Finalize(Pipeline &pipeline, Event &event,
 		throw TransactionException(
 		    "Transaction conflict: cannot add an index to a table that has been altered or dropped");
 	}
+	auto qualified_name = table.schema.GetQualifiedName(table.name);
+	auto &current_table = Catalog::GetEntry<DuckTableEntry>(context, qualified_name);
+	if (!RefersToSameObject(current_table, table) || !RefersToSameObject(current_table.GetStorage(), storage)) {
+		throw TransactionException("Transaction conflict: table changed while its index was being built");
+	}
+	if (current_table.SortEnabled()) {
+		throw BinderException("Cannot create an index on table \"%s\" while SORTED BY is enabled; "
+		                      "run RESET SORTED BY first",
+		                      table.name);
+	}
 
-	auto &schema = table.schema;
+	auto &schema = current_table.schema;
 	info->column_ids = storage_ids;
-
+	optional_ptr<DuckIndexEntry> new_index;
 	if (!alter_table_info) {
-		// Ensure that the index does not yet exist in the catalog.
+		// Reserve the catalog name before waiting on the SORTED BY DDL gate. A concurrent same-name index must report
+		// its catalog write conflict instead of blocking the transaction that owns the name.
 		auto entry =
 		    schema.GetEntry(schema.GetCatalogTransaction(context), CatalogType::INDEX_ENTRY, info->GetIndexName());
 		if (entry) {
 			if (info->on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
 				throw CatalogException("Index with name \"%s\" already exists!", info->GetIndexName());
 			}
-			// IF NOT EXISTS on existing index. We are done.
 			return SinkFinalizeType::READY;
 		}
-
-		auto index_entry = schema.CreateIndex(schema.GetCatalogTransaction(context), *info, table).get();
+		auto index_entry = schema.CreateIndex(schema.GetCatalogTransaction(context), *info, current_table).get();
 		D_ASSERT(index_entry);
-		auto &index = index_entry->Cast<DuckIndexEntry>();
-		index.initial_index_size = bound_index->GetInMemorySize();
+		new_index = index_entry->Cast<DuckIndexEntry>();
+	}
+
+	auto &transaction = DuckTransaction::Get(context, storage.db);
+	auto &table_info = *storage.GetDataTableInfo();
+	transaction.HoldReclusterDDLCoordinationLock(table_info);
+	transaction.HoldExclusiveReclusterWriteLock(table_info);
+	if (!storage.IsMainTable()) {
+		throw TransactionException(
+		    "Transaction conflict: cannot add an index to a table that has been altered or dropped");
+	}
+	auto &rechecked_table = Catalog::GetEntry<DuckTableEntry>(context, qualified_name);
+	if (!RefersToSameObject(rechecked_table, table) || !RefersToSameObject(rechecked_table.GetStorage(), storage)) {
+		throw TransactionException("Transaction conflict: table changed while its index was being built");
+	}
+	if (rechecked_table.SortEnabled()) {
+		throw BinderException("Cannot create an index on table \"%s\" while SORTED BY is enabled; "
+		                      "run RESET SORTED BY first",
+		                      table.name);
+	}
+
+	if (!alter_table_info) {
+		D_ASSERT(new_index);
+		new_index->initial_index_size = bound_index->GetInMemorySize();
 
 	} else {
 		// Ensure that there are no other indexes with that name on this table.

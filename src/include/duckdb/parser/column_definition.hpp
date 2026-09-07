@@ -13,6 +13,7 @@
 #include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/common/enums/compression_type.hpp"
 #include "duckdb/catalog/catalog_entry/table_column_type.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 
 namespace duckdb {
 
@@ -66,6 +67,10 @@ public:
 	const column_t &Oid() const;
 	void SetOid(column_t oid);
 
+	//! Stable identifier of a physical column in a table with SORTED BY history
+	persistent_column_id_t PersistentColumnId() const;
+	void SetPersistentColumnId(persistent_column_id_t column_id);
+
 	//! category
 	const TableColumnType &Category() const;
 	//! Whether this column is a Generated Column
@@ -102,6 +107,8 @@ private:
 	storage_t storage_oid = DConstants::INVALID_INDEX;
 	//! The index of the column in the table
 	idx_t oid = DConstants::INVALID_INDEX;
+	//! Stable physical column identifier used by persistent sort definitions
+	persistent_column_id_t persistent_column_id = 0;
 	//! The category of the column
 	TableColumnType category = TableColumnType::STANDARD;
 	//! The default value of the column (for non-generated columns)

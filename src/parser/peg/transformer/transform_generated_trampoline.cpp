@@ -9046,9 +9046,9 @@ unique_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizePartitionOptSortedOptionsTrampoline(PEGTransformer &transformer, TransformStack &stack,
                                                                    TransformStackFrame &frame) {
 	auto partition_options = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(0);
-	optional<vector<unique_ptr<ParsedExpression>>> sorted_options {};
+	optional<vector<OrderByNode>> sorted_options {};
 	if (frame.child_results[1]) {
-		sorted_options = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(1);
+		sorted_options = frame.TakeResult<vector<OrderByNode>>(1);
 	}
 	auto result =
 	    TransformPartitionOptSortedOptions(transformer, std::move(partition_options), std::move(sorted_options));
@@ -9071,7 +9071,7 @@ void PEGTransformerFactory::InitializeSortedOptPartitionOptionsTrampoline(PEGTra
 unique_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizeSortedOptPartitionOptionsTrampoline(PEGTransformer &transformer, TransformStack &stack,
                                                                    TransformStackFrame &frame) {
-	auto sorted_options = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(0);
+	auto sorted_options = frame.TakeResult<vector<OrderByNode>>(0);
 	optional<vector<unique_ptr<ParsedExpression>>> partition_options {};
 	if (frame.child_results[1]) {
 		partition_options = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(1);
@@ -9111,28 +9111,17 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizePartitionOptions
 void PEGTransformerFactory::InitializeSortedOptionsTrampoline(PEGTransformer &transformer, TransformStack &stack,
                                                               TransformStackFrame &frame) {
 	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
-	auto list_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
-	auto dynamic_child_count = list_items.size();
-	frame.ReserveChildSlots(1 + dynamic_child_count - 1);
-	for (idx_t i = list_items.size(); i > 0; i--) {
-		auto child_idx = i - 1;
-		stack.PushFrame(list_items[child_idx].get(), EXPRESSION_OPS,
-		                TransformFrameResultTarget(frame.frame_index, 0 + child_idx));
-	}
+	frame.ReserveChildSlots(1);
+	stack.PushFrame(ExtractResultFromParens(list_pr.GetChild(2)), ORDER_BY_EXPRESSION_LIST_OPS,
+	                TransformFrameResultTarget(frame.frame_index, 0));
 }
 
 unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeSortedOptionsTrampoline(PEGTransformer &transformer,
                                                                                         TransformStack &stack,
                                                                                         TransformStackFrame &frame) {
-	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
-	auto dynamic_list_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
-	auto dynamic_child_count = dynamic_list_items.size();
-	vector<unique_ptr<ParsedExpression>> expression;
-	for (idx_t i = 0; i < 0 + dynamic_child_count; i++) {
-		expression.push_back(frame.TakeResult<unique_ptr<ParsedExpression>>(i));
-	}
-	auto result = TransformSortedOptions(transformer, std::move(expression));
-	return make_uniq<TypedTransformResult<vector<unique_ptr<ParsedExpression>>>>(std::move(result));
+	auto order_by_expression_list = frame.TakeResult<vector<OrderByNode>>(0);
+	auto result = TransformSortedOptions(transformer, std::move(order_by_expression_list));
+	return make_uniq<TypedTransformResult<vector<OrderByNode>>>(std::move(result));
 }
 
 void PEGTransformerFactory::InitializeWithDataTrampoline(PEGTransformer &transformer, TransformStack &stack,

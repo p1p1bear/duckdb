@@ -20,6 +20,7 @@ ColumnDefinition ColumnDefinition::Copy() const {
 	ColumnDefinition copy(name, type);
 	copy.oid = oid;
 	copy.storage_oid = storage_oid;
+	copy.persistent_column_id = persistent_column_id;
 	copy.expression = expression ? expression->Copy() : nullptr;
 	copy.compression_type = compression_type;
 	copy.category = category;
@@ -117,6 +118,14 @@ const column_t &ColumnDefinition::Oid() const {
 
 void ColumnDefinition::SetOid(column_t oid) {
 	this->oid = oid;
+}
+
+persistent_column_id_t ColumnDefinition::PersistentColumnId() const {
+	return persistent_column_id;
+}
+
+void ColumnDefinition::SetPersistentColumnId(persistent_column_id_t column_id) {
+	persistent_column_id = column_id;
 }
 
 const TableColumnType &ColumnDefinition::Category() const {

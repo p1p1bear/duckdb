@@ -5730,11 +5730,11 @@ public:
 	static PartitionSortedOptions
 	TransformPartitionOptSortedOptions(PEGTransformer &transformer,
 	                                   vector<unique_ptr<ParsedExpression>> partition_options,
-	                                   optional<vector<unique_ptr<ParsedExpression>>> sorted_options);
+	                                   optional<vector<OrderByNode>> sorted_options);
 	static unique_ptr<TransformResultValue> TransformSortedOptPartitionOptionsInternal(PEGTransformer &transformer,
 	                                                                                   ParseResult &parse_result);
 	static PartitionSortedOptions
-	TransformSortedOptPartitionOptions(PEGTransformer &transformer, vector<unique_ptr<ParsedExpression>> sorted_options,
+	TransformSortedOptPartitionOptions(PEGTransformer &transformer, vector<OrderByNode> sorted_options,
 	                                   optional<vector<unique_ptr<ParsedExpression>>> partition_options);
 	static unique_ptr<TransformResultValue> TransformPartitionOptionsInternal(PEGTransformer &transformer,
 	                                                                          ParseResult &parse_result);
@@ -5742,8 +5742,8 @@ public:
 	TransformPartitionOptions(PEGTransformer &transformer, vector<unique_ptr<ParsedExpression>> expression);
 	static unique_ptr<TransformResultValue> TransformSortedOptionsInternal(PEGTransformer &transformer,
 	                                                                       ParseResult &parse_result);
-	static vector<unique_ptr<ParsedExpression>> TransformSortedOptions(PEGTransformer &transformer,
-	                                                                   vector<unique_ptr<ParsedExpression>> expression);
+	static vector<OrderByNode> TransformSortedOptions(PEGTransformer &transformer,
+	                                                  vector<OrderByNode> order_by_expression_list);
 	static unique_ptr<TransformResultValue> TransformWithDataInternal(PEGTransformer &transformer,
 	                                                                  ParseResult &parse_result);
 	static unique_ptr<TransformResultValue> TransformWithDataOnlyInternal(PEGTransformer &transformer,

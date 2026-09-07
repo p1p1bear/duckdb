@@ -8,10 +8,12 @@
 
 #pragma once
 
+#include "duckdb/common/optional.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 #include "duckdb/common/identifier.hpp"
 namespace duckdb {
@@ -96,6 +98,8 @@ struct AlterTableInfo : public AlterInfo {
 	~AlterTableInfo() override;
 
 	AlterTableType alter_table_type;
+	//! Complete persistent sort metadata after this ALTER succeeds
+	optional<TableSortCatalogPostImage> sort_post_image;
 
 public:
 	CatalogType GetCatalogType() const override;
@@ -105,6 +109,7 @@ public:
 
 protected:
 	explicit AlterTableInfo(AlterTableType type);
+	unique_ptr<AlterInfo> CopyWithSortPostImage(unique_ptr<AlterInfo> result) const;
 };
 
 //===--------------------------------------------------------------------===//

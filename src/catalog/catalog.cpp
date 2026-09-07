@@ -1456,7 +1456,7 @@ ErrorData Catalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 		    ExceptionType::CATALOG,
 		    StringUtil::Format("PARTITIONED BY is not supported for tables in a %s catalog", GetCatalogType()));
 	}
-	if (!base.sort_keys.empty()) {
+	if (base.HasAnySortDefinition()) {
 		return ErrorData(ExceptionType::CATALOG,
 		                 StringUtil::Format("SORTED BY is not supported for tables in a %s catalog", GetCatalogType()));
 	}

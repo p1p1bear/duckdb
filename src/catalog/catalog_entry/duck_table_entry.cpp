@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/transaction/commit_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
@@ -27,6 +28,8 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/catalog/catalog_entry/trigger_catalog_entry.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/recluster/row_group_layout.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -138,6 +141,111 @@ static void SetAlterDependencies(BoundCreateTableInfo &info, AlterInfo &alter_in
 	alter_info.new_dependencies = make_uniq<LogicalDependencyList>(info.Base().dependencies);
 }
 
+static void FinalizeTableSortAlterPostImage(AlterTableInfo &alter_info, ColumnList &columns,
+                                            optional<TableSortCatalogMetadata> &sort_metadata,
+                                            optional_idx replacement_column = optional_idx()) {
+	if (alter_info.bind_mode == AlterBindMode::SKIP_BINDING) {
+		if (!sort_metadata) {
+			if (alter_info.sort_post_image) {
+				throw SerializationException("SORTED BY ALTER post-image targets a table without sort history");
+			}
+			return;
+		}
+		if (!alter_info.sort_post_image) {
+			throw SerializationException("ALTER WAL record for a table with SORTED BY history has no post-image");
+		}
+		ApplyTableSortPostImage(*alter_info.sort_post_image, columns, sort_metadata);
+		return;
+	}
+
+	if (!sort_metadata) {
+		alter_info.sort_post_image.reset();
+		return;
+	}
+	if (replacement_column.IsValid()) {
+		auto &column = columns.GetColumnMutable(LogicalIndex(replacement_column.GetIndex()));
+		if (column.Generated()) {
+			column.SetPersistentColumnId(0);
+		} else {
+			auto &metadata = *sort_metadata;
+			if (metadata.next_column_id == NumericLimits<persistent_column_id_t>::Maximum()) {
+				throw InvalidInputException("SORTED BY persistent column ID space is exhausted");
+			}
+			column.SetPersistentColumnId(metadata.next_column_id++);
+		}
+	}
+	ValidateTableSortCatalogMetadata(*sort_metadata, columns);
+	alter_info.sort_post_image = BuildTableSortPostImage(*sort_metadata, columns);
+}
+
+static void FinalizeTableSortAlterPostImage(AlterTableInfo &alter_info, CreateTableInfo &create_info,
+                                            optional_idx replacement_column = optional_idx()) {
+	FinalizeTableSortAlterPostImage(alter_info, create_info.columns, create_info.sort_metadata, replacement_column);
+}
+
+static void VerifyCurrentSortKeyAlter(const DuckTableEntry &table, const LogicalIndex column_index,
+                                      AlterTableInfo &alter_info, const char *action) {
+	if (alter_info.bind_mode == AlterBindMode::SKIP_BINDING || !table.SortEnabled()) {
+		return;
+	}
+	auto &column = table.GetColumns().GetColumn(column_index);
+	if (column.Generated()) {
+		return;
+	}
+	auto current = table.GetSortMetadata()->GetCurrent();
+	D_ASSERT(current);
+	for (auto &sort_column : current->columns) {
+		if (sort_column.column_id == column.PersistentColumnId()) {
+			throw BinderException("Cannot %s column \"%s\" while it is part of the current SORTED BY rule; "
+			                      "RESET SORTED BY first",
+			                      action, column.Name());
+		}
+	}
+}
+
+static void VerifyTableSortColumnIdentities(const optional<TableSortCatalogMetadata> &metadata,
+                                            const ColumnList &columns, const DataTable &storage) {
+	if (!metadata) {
+		return;
+	}
+	ValidateTableSortCatalogMetadata(*metadata, columns);
+	auto &storage_columns = storage.Columns();
+	if (storage_columns.size() != columns.PhysicalColumnCount()) {
+		throw SerializationException("SORTED BY catalog and storage have different physical column counts");
+	}
+	for (idx_t column_idx = 0; column_idx < storage_columns.size(); column_idx++) {
+		auto &catalog_column = columns.GetColumn(PhysicalIndex(column_idx));
+		auto &storage_column = storage_columns[column_idx];
+		if (catalog_column.Type() != storage_column.Type() ||
+		    catalog_column.PersistentColumnId() != storage_column.PersistentColumnId()) {
+			throw SerializationException("SORTED BY catalog and storage column identities differ at column %llu",
+			                             column_idx);
+		}
+	}
+}
+
+static void VerifySortedAlterCapabilities(DuckTableEntry &table) {
+	auto &catalog = table.ParentCatalog();
+	if (table.temporary || catalog.GetAttached().IsTemporary() || catalog.InMemory()) {
+		throw BinderException("SORTED BY is only supported for persistent DuckDB tables");
+	}
+	auto storage_version = StorageManager::Get(catalog).GetStorageVersion();
+	if (storage_version < MIN_SORTED_BY_STORAGE_VERSION) {
+		throw BinderException(
+		    "SORTED BY requires storage version %s or newer (database \"%s\" uses storage version %s)",
+		    GetStorageVersionName(MIN_SORTED_BY_STORAGE_VERSION, false), catalog.GetName().GetIdentifierName(),
+		    GetStorageVersionName(storage_version, false));
+	}
+	for (auto &constraint : table.GetConstraints()) {
+		if (constraint->type == ConstraintType::UNIQUE || constraint->type == ConstraintType::FOREIGN_KEY) {
+			throw BinderException("SORTED BY tables cannot have PRIMARY KEY, UNIQUE, or FOREIGN KEY constraints");
+		}
+	}
+	if (table.GetStorage().HasIndexes()) {
+		throw BinderException("SORTED BY tables cannot have indexes");
+	}
+}
+
 virtual_column_map_t DuckTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t virtual_columns;
 	virtual_columns.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::ROW_TYPE)));
@@ -148,7 +256,8 @@ virtual_column_map_t DuckTableEntry::GetVirtualColumns() const {
 DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, BoundCreateTableInfo &info,
                                shared_ptr<DataTable> inherited_storage, shared_ptr<CatalogSet> inherited_triggers)
     : TableCatalogEntry(catalog, schema, info.Base()), storage(std::move(inherited_storage)),
-      triggers(std::move(inherited_triggers)), column_dependency_manager(std::move(info.column_dependency_manager)) {
+      triggers(std::move(inherited_triggers)), column_dependency_manager(std::move(info.column_dependency_manager)),
+      sort_metadata(std::move(info.Base().sort_metadata)) {
 	if (!triggers) {
 		triggers = make_shared_ptr<CatalogSet>(catalog);
 	}
@@ -156,6 +265,7 @@ DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Bou
 		if (!info.indexes.empty()) {
 			storage->SetIndexStorageInfo(std::move(info.indexes));
 		}
+		VerifyTableSortColumnIdentities(sort_metadata, columns, *storage);
 		return;
 	}
 
@@ -238,6 +348,7 @@ DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Bou
 	if (!remaining_indexes.empty()) {
 		storage->SetIndexStorageInfo(std::move(remaining_indexes));
 	}
+	VerifyTableSortColumnIdentities(sort_metadata, columns, *storage);
 }
 
 unique_ptr<BaseStatistics> DuckTableEntry::GetStatistics(ClientContext &context, const StorageIndex &column_id) {
@@ -259,6 +370,27 @@ unique_ptr<BaseStatistics> DuckTableEntry::GetStatistics(ClientContext &context,
 
 unique_ptr<BlockingSample> DuckTableEntry::GetSample() {
 	return storage->GetSample();
+}
+
+void DuckTableEntry::VerifyUpdateAllowed() const {
+	if (!SortEnabled()) {
+		return;
+	}
+	throw NotImplementedException(
+	    "UPDATE is not supported on table \"%s\" because it uses SORTED BY. Use DELETE followed by INSERT, or RESET "
+	    "SORTED BY.",
+	    name);
+}
+
+void DuckTableEntry::HoldReclusterDDLWriteGate(DuckTransaction &transaction, const char *operation) {
+	if (!storage->IsMainTable()) {
+		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);
+	}
+	transaction.HoldReclusterDDLCoordinationLock(*storage->GetDataTableInfo());
+	transaction.HoldExclusiveReclusterWriteLock(*storage->GetDataTableInfo());
+	if (!storage->IsMainTable()) {
+		throw TransactionException("Catalog write-write conflict on %s with \"%s\"", operation, name);
+	}
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
@@ -296,6 +428,13 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 		throw CatalogException("Can only modify table with ALTER TABLE statement");
 	}
 	auto &table_info = info.Cast<AlterTableInfo>();
+	if (SortEnabled() && table_info.alter_table_type == AlterTableType::ADD_CONSTRAINT) {
+		throw BinderException("Cannot add an index constraint while SORTED BY is enabled");
+	}
+	if (HasSortHistory() && table_info.alter_table_type != AlterTableType::SET_SORTED_BY) {
+		auto &transaction = DuckTransaction::Get(context, storage->db);
+		HoldReclusterDDLWriteGate(transaction, "alter");
+	}
 	switch (table_info.alter_table_type) {
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename_info = table_info.Cast<RenameColumnInfo>();
@@ -308,7 +447,9 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename_info = table_info.Cast<RenameTableInfo>();
 		auto copied_table = Copy(context);
-		copied_table->name = rename_info.new_table_name;
+		auto &copied_duck_table = copied_table->Cast<DuckTableEntry>();
+		FinalizeTableSortAlterPostImage(rename_info, copied_duck_table.columns, copied_duck_table.sort_metadata);
+		copied_duck_table.name = rename_info.new_table_name;
 		storage->SetTableName(rename_info.new_table_name);
 		return copied_table;
 	}
@@ -334,7 +475,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &change_type_info = table_info.Cast<ChangeColumnTypeInfo>();
-		return ChangeColumnType(context, change_type_info, AlterTableType::ALTER_COLUMN_TYPE);
+		return ChangeColumnType(context, change_type_info, AlterTableType::ALTER_COLUMN_TYPE, change_type_info);
 	}
 	case AlterTableType::FOREIGN_KEY_CONSTRAINT: {
 		auto &foreign_key_constraint_info = table_info.Cast<AlterForeignKeyInfo>();
@@ -359,7 +500,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	case AlterTableType::SET_PARTITIONED_BY:
 		throw NotImplementedException("SET PARTITIONED BY is not supported for DuckDB tables");
 	case AlterTableType::SET_SORTED_BY:
-		throw NotImplementedException("SET SORTED BY is not supported for DuckDB tables");
+		return SetSortedBy(context, table_info.Cast<SetSortedByInfo>());
 	case AlterTableType::SET_TABLE_OPTIONS:
 		throw NotImplementedException("SET (<options>) is not supported for DuckDB tables");
 	case AlterTableType::RESET_TABLE_OPTIONS: {
@@ -367,6 +508,88 @@ unique_ptr<CatalogEntry> DuckTableEntry::AlterEntry(ClientContext &context, Alte
 	}
 	default:
 		throw InternalException("Unrecognized alter table type!");
+	}
+}
+
+unique_ptr<CatalogEntry> DuckTableEntry::SetSortedBy(ClientContext &context, SetSortedByInfo &info) {
+	auto create_info = GetInfo();
+	auto &table_info = create_info->Cast<CreateTableInfo>();
+	auto hold_write_gate = [&]() {
+		auto &transaction = DuckTransaction::Get(context, storage->db);
+		HoldReclusterDDLWriteGate(transaction, "alter");
+		auto current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+		if (current_layout && transaction.start_time < current_layout->visible_from) {
+			throw TransactionException(
+			    "Transaction conflict: cannot alter table \"%s\" from before its current storage layout was published",
+			    name);
+		}
+	};
+
+	if (info.bind_mode == AlterBindMode::SKIP_BINDING) {
+		if (!info.sort_post_image) {
+			throw SerializationException("SORTED BY ALTER WAL record has no catalog post-image");
+		}
+		ApplyTableSortPostImage(*info.sort_post_image, table_info.columns, table_info.sort_metadata);
+	} else if (info.orders.empty()) {
+		if (!table_info.sort_metadata || !table_info.sort_metadata->IsEnabled()) {
+			return nullptr;
+		}
+		hold_write_gate();
+		table_info.sort_metadata->current_sort_order_id = INVALID_SORT_ORDER_ID;
+		table_info.sort_metadata->definitions.clear();
+		info.sort_post_image = BuildTableSortPostImage(*table_info.sort_metadata, table_info.columns);
+	} else {
+		VerifySortedAlterCapabilities(*this);
+		if (!table_info.sort_metadata) {
+			table_info.sort_metadata = CreateTableSortIdentity(table_info.columns);
+		}
+		auto &metadata = *table_info.sort_metadata;
+		auto definition = BindPersistentSortDefinition(info.orders, table_info.columns, metadata.next_sort_order_id);
+		auto current = metadata.GetCurrent();
+		if (current && current->columns == definition.columns) {
+			return nullptr;
+		}
+		if (metadata.next_sort_order_id == NumericLimits<sort_order_id_t>::Maximum()) {
+			throw InvalidInputException("SORTED BY sort order ID space is exhausted");
+		}
+		hold_write_gate();
+		VerifySortedAlterCapabilities(*this);
+		metadata.current_sort_order_id = metadata.next_sort_order_id++;
+		metadata.definitions.clear();
+		metadata.definitions.push_back(std::move(definition));
+		ValidateTableSortCatalogMetadata(metadata, table_info.columns);
+		info.sort_post_image = BuildTableSortPostImage(metadata, table_info.columns);
+	}
+
+	table_info.sort_keys.clear();
+	table_info.sort_orders.clear();
+	auto binder = Binder::CreateBinder(context);
+	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	SetAlterDependencies(*bound_create_info, info);
+	auto new_storage =
+	    make_shared_ptr<DataTable>(context, *storage, bound_create_info->Base().columns, SortMetadataOnlyAlterTag());
+	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage, triggers);
+}
+
+void DuckTableEntry::PublishAlter(ClientContext &context, CatalogEntry &previous_entry) {
+	if (previous_entry.type != CatalogType::TABLE_ENTRY) {
+		return;
+	}
+	auto &previous_table = previous_entry.Cast<DuckTableEntry>();
+	if (!RefersToSameObject(*storage, previous_table.GetStorage())) {
+		storage->PublishAlter(*this);
+	}
+	auto &storage_info = *storage->GetDataTableInfo();
+	if (HasSortHistory() && !storage_info.HasSortStorage()) {
+		storage_info.InitializeSortStorage(PersistentTableSortStorageMetadata());
+	}
+	if (HasSortHistory() && !storage->GetRowGroupCollection()->HasLayoutHistory()) {
+		storage->GetRowGroupCollection()->InitializeLayoutHistory(
+		    storage_info.GetSortStorage()->current_layout_version.load());
+	}
+	auto local_storage = LocalStorage::Get(context, storage->db).GetStorage(*storage);
+	if (local_storage) {
+		local_storage->table_entry = this;
 	}
 }
 
@@ -424,6 +647,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 	for (auto &col : columns.Logical()) {
 		auto copy = col.Copy();
 		if (rename_idx == col.Logical()) {
@@ -483,6 +707,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 	}
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
 }
@@ -499,6 +724,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddColumn(ClientContext &context, AddCo
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 
 	for (auto &col : columns.Logical()) {
 		create_info->columns.AddColumn(col.Copy());
@@ -530,8 +756,11 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddColumn(ClientContext &context, AddCo
 		binder->BindDefaultValue(info.new_column, bound_defaults, catalog_name.GetIdentifierName(),
 		                         schema_name.GetIdentifierName());
 	}
+	const auto new_column_index = columns.LogicalColumnCount();
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base(), new_column_index);
 	SetAlterDependencies(*bound_create_info, info);
-	auto new_storage = make_shared_ptr<DataTable>(context, *storage, info.new_column, *bound_defaults.back());
+	auto &new_column = bound_create_info->Base().columns.GetColumnMutable(LogicalIndex(new_column_index));
+	auto new_storage = make_shared_ptr<DataTable>(context, *storage, new_column, *bound_defaults.back());
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage, triggers);
 }
 
@@ -698,7 +927,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddField(ClientContext &context, AddFie
 
 	ChangeColumnTypeInfo change_column_type(info.GetAlterEntryData(), info.column_path[0], std::move(res.new_type),
 	                                        std::move(function));
-	return ChangeColumnType(context, change_column_type, AlterTableType::ADD_FIELD);
+	change_column_type.bind_mode = info.bind_mode;
+	return ChangeColumnType(context, change_column_type, AlterTableType::ADD_FIELD, info);
 }
 
 void DuckTableEntry::UpdateConstraintsOnColumnDrop(const LogicalIndex &removed_index,
@@ -815,6 +1045,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveColumn(ClientContext &context, Re
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
+	VerifyCurrentSortKeyAlter(*this, removed_index, info, "drop");
 
 	logical_index_set_t removed_columns;
 	if (column_dependency_manager.HasDependents(removed_index)) {
@@ -845,6 +1077,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveColumn(ClientContext &context, Re
 	                              dropped_column_is_generated);
 
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 	if (columns.GetColumn(LogicalIndex(removed_index)).Generated()) {
 		return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
@@ -954,7 +1187,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveField(ClientContext &context, Rem
 
 	ChangeColumnTypeInfo change_column_type(info.GetAlterEntryData(), info.column_path[0], std::move(res.new_type),
 	                                        std::move(function));
-	return ChangeColumnType(context, change_column_type, AlterTableType::REMOVE_FIELD);
+	change_column_type.bind_mode = info.bind_mode;
+	return ChangeColumnType(context, change_column_type, AlterTableType::REMOVE_FIELD, info);
 }
 
 DroppedFieldMapping RenameFieldFromStruct(const LogicalType &type, const vector<Identifier> &column_path,
@@ -1048,7 +1282,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameField(ClientContext &context, Ren
 	auto function = make_uniq<FunctionExpression>("remap_struct", std::move(children));
 	ChangeColumnTypeInfo change_column_type(info.GetAlterEntryData(), info.column_path[0], std::move(res.new_type),
 	                                        std::move(function));
-	return ChangeColumnType(context, change_column_type, AlterTableType::RENAME_FIELD);
+	change_column_type.bind_mode = info.bind_mode;
+	return ChangeColumnType(context, change_column_type, AlterTableType::RENAME_FIELD, info);
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::SetDefault(ClientContext &context, SetDefaultInfo &info) {
@@ -1069,6 +1304,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetDefault(ClientContext &context, SetD
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
 }
@@ -1098,6 +1334,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetNotNull(ClientContext &context, SetN
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 
 	// Early return
@@ -1132,22 +1369,26 @@ unique_ptr<CatalogEntry> DuckTableEntry::DropNotNull(ClientContext &context, Dro
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
 }
 
 unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context, ChangeColumnTypeInfo &info,
-                                                          AlterTableType alter_table_type) {
+                                                          AlterTableType alter_table_type,
+                                                          AlterTableInfo &post_image_info) {
 	// Bind type
 	auto type_binder = Binder::CreateBinder(context);
 	type_binder->SetSearchPath(catalog, schema.name);
 	type_binder->BindLogicalType(info.target_type);
 
 	auto change_idx = GetColumnIndex(info.column_name);
+	VerifyCurrentSortKeyAlter(*this, change_idx, post_image_info, "change the type of");
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 
 	// Bind the USING expression.
 	auto binder = Binder::CreateBinder(context);
@@ -1229,7 +1470,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context
 	}
 
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
-	SetAlterDependencies(*bound_create_info, info);
+	FinalizeTableSortAlterPostImage(post_image_info, bound_create_info->Base(), change_idx.index);
+	SetAlterDependencies(*bound_create_info, post_image_info);
 
 	vector<StorageIndex> storage_oids;
 	for (idx_t i = 0; i < bound_columns.size(); i++) {
@@ -1239,9 +1481,10 @@ unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context
 		storage_oids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
 	}
 
+	auto &replacement_column = bound_create_info->Base().columns.GetColumn(LogicalIndex(change_idx));
 	auto new_storage =
 	    make_shared_ptr<DataTable>(context, *storage, columns.LogicalToPhysical(LogicalIndex(change_idx)).index,
-	                               info.target_type, std::move(storage_oids), *bound_expression);
+	                               replacement_column, std::move(storage_oids), *bound_expression);
 	auto result = make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage, triggers);
 	return std::move(result);
 }
@@ -1270,6 +1513,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKey
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 
 	create_info->columns = columns.Copy();
 	for (idx_t i = 0; i < constraints.size(); i++) {
@@ -1286,6 +1530,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKey
 
 	unique_ptr<BoundCreateTableInfo> bound_create_info;
 	bound_create_info = Binder::BindCreateTableCheckpoint(std::move(create_info), schema);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
 }
 
@@ -1295,6 +1540,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::DropForeignKeyConstraint(ClientContext 
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
+	create_info->sort_metadata = sort_metadata;
 
 	create_info->columns = columns.Copy();
 	for (idx_t i = 0; i < constraints.size(); i++) {
@@ -1310,6 +1556,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::DropForeignKeyConstraint(ClientContext 
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
 }
@@ -1327,6 +1574,10 @@ void DuckTableEntry::Rollback(CatalogEntry &prev_entry) {
 	auto &prev_table = prev_entry.Cast<DuckTableEntry>();
 	auto &prev_info = prev_table.GetStorage().GetDataTableInfo();
 	auto &prev_indexes = prev_info->GetIndexes();
+	if (table.HasSortHistory() && !prev_table.HasSortHistory()) {
+		prev_table.GetStorage().GetRowGroupCollection()->ResetLayoutHistory();
+		prev_info->ResetSortStorage();
+	}
 
 	// Find all index-based constraints that exist in rollback_table, but not in table.
 	// Then, remove them.
@@ -1386,6 +1637,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddConstraint(ClientContext &context, A
 	const auto bound_constraint =
 	    binder->BindConstraint(*info.constraint, table_info.GetTableName(), table_info.columns);
 	const auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, info.bind_mode);
+	FinalizeTableSortAlterPostImage(info, bound_create_info->Base());
 	SetAlterDependencies(*bound_create_info, info);
 
 	auto new_storage = make_shared_ptr<DataTable>(context, *storage, *bound_constraint);
@@ -1400,6 +1652,12 @@ unique_ptr<CatalogEntry> DuckTableEntry::Copy(ClientContext &context) const {
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableCheckpoint(std::move(create_info), schema);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage, triggers);
+}
+
+unique_ptr<CreateInfo> DuckTableEntry::GetInfo() const {
+	auto result = TableCatalogEntry::GetInfo();
+	result->Cast<CreateTableInfo>().sort_metadata = sort_metadata;
+	return result;
 }
 
 void DuckTableEntry::SetAsRoot() {

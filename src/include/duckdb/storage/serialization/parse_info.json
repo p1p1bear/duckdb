@@ -93,6 +93,13 @@
         "id": 300,
         "name": "alter_table_type",
         "type": "AlterTableType"
+      },
+      {
+        "id": 301,
+        "name": "sort_post_image",
+        "type": "optional<TableSortCatalogPostImage>",
+        "default": "optional<TableSortCatalogPostImage>()",
+        "version": "v2.0.0"
       }
     ]
   },

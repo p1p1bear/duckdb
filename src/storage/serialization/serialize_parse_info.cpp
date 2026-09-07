@@ -138,10 +138,14 @@ unique_ptr<ParseInfo> AlterInfo::Deserialize(Deserializer &deserializer) {
 void AlterTableInfo::Serialize(Serializer &serializer) const {
 	AlterInfo::Serialize(serializer);
 	serializer.WriteProperty<AlterTableType>(300, "alter_table_type", alter_table_type);
+	if (serializer.ShouldSerialize(StorageVersion::V2_0_0)) {
+		serializer.WritePropertyWithDefault<optional<TableSortCatalogPostImage>>(301, "sort_post_image", sort_post_image, optional<TableSortCatalogPostImage>());
+	}
 }
 
 unique_ptr<AlterInfo> AlterTableInfo::Deserialize(Deserializer &deserializer) {
 	auto alter_table_type = deserializer.ReadProperty<AlterTableType>(300, "alter_table_type");
+	auto sort_post_image = deserializer.ReadPropertyWithExplicitDefault<optional<TableSortCatalogPostImage>>(301, "sort_post_image", optional<TableSortCatalogPostImage>());
 	unique_ptr<AlterTableInfo> result;
 	switch (alter_table_type) {
 	case AlterTableType::ADD_COLUMN:
@@ -198,6 +202,7 @@ unique_ptr<AlterInfo> AlterTableInfo::Deserialize(Deserializer &deserializer) {
 	default:
 		throw SerializationException("Unsupported type for deserialization of AlterTableInfo!");
 	}
+	result->sort_post_image = std::move(sort_post_image);
 	return std::move(result);
 }
 

@@ -12,13 +12,16 @@
 #include "duckdb/catalog/catalog_set.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/constraints/bound_unique_constraint.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 namespace duckdb {
 
 class CommitDropState;
+class DuckTransaction;
 
 struct AddConstraintInfo;
 struct CreateTriggerInfo;
+struct SetSortedByInfo;
 
 //! A table catalog entry
 class DuckTableEntry : public TableCatalogEntry {
@@ -31,6 +34,7 @@ public:
 public:
 	unique_ptr<CatalogEntry> AlterEntry(ClientContext &context, AlterInfo &info) override;
 	unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction, AlterInfo &info) override;
+	void PublishAlter(ClientContext &context, CatalogEntry &previous_entry) override;
 	void UndoAlter(ClientContext &context, AlterInfo &info) override;
 	void Rollback(CatalogEntry &prev_entry) override;
 	void OnDrop() override;
@@ -45,11 +49,24 @@ public:
 	unique_ptr<BlockingSample> GetSample() override;
 
 	unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
+	unique_ptr<CreateInfo> GetInfo() const override;
+
+	const optional<TableSortCatalogMetadata> &GetSortMetadata() const {
+		return sort_metadata;
+	}
+	bool HasSortHistory() const {
+		return sort_metadata.has_value();
+	}
+	bool SortEnabled() const {
+		return sort_metadata && sort_metadata->IsEnabled();
+	}
+	void VerifyUpdateAllowed() const;
 
 	void SetAsRoot() override;
 
 	void CommitAlter(string &column_name, CommitDropState &drop_state);
 	void CommitDrop(CommitDropState &drop_state);
+	void HoldReclusterDDLWriteGate(DuckTransaction &transaction, const char *operation);
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 
@@ -86,13 +103,14 @@ private:
 	unique_ptr<CatalogEntry> RemoveField(ClientContext &context, RemoveFieldInfo &info);
 	unique_ptr<CatalogEntry> SetDefault(ClientContext &context, SetDefaultInfo &info);
 	unique_ptr<CatalogEntry> ChangeColumnType(ClientContext &context, ChangeColumnTypeInfo &info,
-	                                          AlterTableType alter_table_type);
+	                                          AlterTableType alter_table_type, AlterTableInfo &post_image_info);
 	unique_ptr<CatalogEntry> SetNotNull(ClientContext &context, SetNotNullInfo &info);
 	unique_ptr<CatalogEntry> DropNotNull(ClientContext &context, DropNotNullInfo &info);
 	unique_ptr<CatalogEntry> AddForeignKeyConstraint(AlterForeignKeyInfo &info);
 	unique_ptr<CatalogEntry> DropForeignKeyConstraint(ClientContext &context, AlterForeignKeyInfo &info);
 	unique_ptr<CatalogEntry> SetColumnComment(ClientContext &context, SetColumnCommentInfo &info);
 	unique_ptr<CatalogEntry> AddConstraint(ClientContext &context, AddConstraintInfo &info);
+	unique_ptr<CatalogEntry> SetSortedBy(ClientContext &context, SetSortedByInfo &info);
 
 	void UpdateConstraintsOnColumnDrop(const LogicalIndex &removed_index, const vector<LogicalIndex> &adjusted_indices,
 	                                   const RemoveColumnInfo &info, CreateTableInfo &create_info,
@@ -105,5 +123,7 @@ private:
 	shared_ptr<CatalogSet> triggers;
 	//! Manages dependencies of the individual columns of the table
 	ColumnDependencyManager column_dependency_manager;
+	//! Persistent sort metadata belonging to this catalog version
+	optional<TableSortCatalogMetadata> sort_metadata;
 };
 } // namespace duckdb

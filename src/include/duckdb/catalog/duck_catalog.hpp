@@ -62,6 +62,7 @@ public:
 	                                                         unique_ptr<LogicalOperator> plan,
 	                                                         unique_ptr<CreateIndexInfo> create_info,
 	                                                         unique_ptr<AlterTableInfo> alter_info) override;
+	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
 
 	CatalogSet &GetSchemaCatalogSet();
 

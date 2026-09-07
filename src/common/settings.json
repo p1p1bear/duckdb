@@ -172,6 +172,13 @@
         "default_value": "100000"
     },
     {
+        "name": "auto_recluster",
+        "description": "Automatically schedule SORTED BY reclustering after successful commits and checkpoints",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "true"
+    },
+    {
         "name": "autoinstall_extension_repository",
         "description": "Overrides the custom endpoint for extension installation on autoloading",
         "type": "VARCHAR",
@@ -705,6 +712,13 @@
         "custom_implementation": true
     },
     {
+        "name": "enable_sorted_write",
+        "description": "Sort sufficiently large writes to SORTED BY tables before inserting; disable to leave new rows for reclustering",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "true"
+    },
+    {
         "name": "enable_view_dependencies",
         "description": "Enable created VIEWs to create dependencies on the referenced objects (such as tables)",
         "type": "BOOLEAN",
@@ -1230,6 +1244,13 @@
         "on_callbacks": [
             "set"
         ]
+    },
+    {
+        "name": "recluster_trigger_checkpoint",
+        "description": "Allow automatic SORTED BY maintenance to request rate-limited checkpoints",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "false"
     },
     {
         "name": "regex_match_operator_semantics",
