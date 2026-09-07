@@ -1,6 +1,7 @@
 add_library_unity(
   duckdb_operator_persistent
   OBJECT
+  adaptive_sorted_write.cpp
   csv_rejects_table.cpp
   physical_batch_copy_to_file.cpp
   physical_batch_insert.cpp

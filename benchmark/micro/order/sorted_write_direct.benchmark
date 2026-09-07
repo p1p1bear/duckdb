@@ -1,0 +1,29 @@
+# name: benchmark/micro/order/sorted_write_direct.benchmark
+# description: Bulk insert into a persistent SORTED BY table
+# group: [order]
+
+name SORTED BY Direct Write
+group micro
+subgroup order
+storage persistent v2.0.0
+require_reinit
+
+load
+CREATE TABLE source AS
+SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
+       ((i * 97) % 10000)::INTEGER AS tenant_id,
+       TIMESTAMP '2020-01-01' + ((i * 32452843) % 31536000) * INTERVAL 1 SECOND AS event_time,
+       i::BIGINT AS payload_id,
+       ((i * 48271) % 1000000)::DOUBLE / 100.0 AS amount,
+       (i % 8)::TINYINT AS status,
+       ((i * 31) % 1024)::SMALLINT AS region,
+       lpad(to_hex(i), 16, '0') || repeat('x', 48) AS payload
+FROM range(10000000) t(i);
+CREATE TABLE events SORTED BY (tenant_id, event_time, event_id) AS FROM source LIMIT 0;
+
+run
+INSERT INTO events SELECT * FROM source
+
+cleanup
+DROP TABLE events;
+CREATE TABLE events SORTED BY (tenant_id, event_time, event_id) AS FROM source LIMIT 0;
