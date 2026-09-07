@@ -13,6 +13,8 @@
 
 namespace duckdb {
 
+static constexpr idx_t RECLUSTER_SOURCE_BUFFER_ROUNDS = 8;
+
 struct ReclusterRunMerger::RunState {
 	RunState(ReclusterTaskContext &task_context, RowGroupRange range_p, idx_t slot_offset_p,
 	         const vector<LogicalType> &key_types)
@@ -104,6 +106,9 @@ void ReclusterRunMerger::Prepare() {
 	}
 	CheckTask();
 	output_types = ReclusterRangeScanner::GetOutputTypes(task_context);
+	for (auto &type : output_types) {
+		has_variable_payload |= !TypeIsConstantSize(type.InternalType());
+	}
 	for (auto physical_index : task_context.GetPhysicalSortIndexes()) {
 		if (physical_index >= output_types.size() - 1) {
 			throw InternalException("Recluster run merger sort column is outside its scan schema");
@@ -144,17 +149,13 @@ bool ReclusterRunMerger::FillRun(RunState &run) {
 		throw InternalException("Recluster run merger scanner returned an invalid chunk size");
 	}
 
-	for (idx_t column_index = 0; column_index < output_types.size(); column_index++) {
-		VectorOperations::Copy(run.input.data[column_index], source_rows.data[column_index], run.input.size(), 0,
-		                       run.slot_offset);
-	}
-
 	run.key_input.ReferenceColumns(run.input, sort_columns);
 	run.sort_keys.ResetFromCache(run.sort_key_cache);
 	CreateSortKeyHelpers::CreateSortKey(run.key_input, sort_modifiers, run.sort_keys);
 	run.key_data = FlatVector::GetData<string_t>(run.sort_keys);
 	run.position = 0;
 	run.count = run.input.size();
+	CopyRunRows(run);
 
 	if (run.has_last_input_key) {
 		auto previous = string_t(run.last_input_key.data(), NumericCast<uint32_t>(run.last_input_key.size()));
@@ -171,6 +172,17 @@ bool ReclusterRunMerger::FillRun(RunState &run) {
 	run.last_input_key.assign(last_key.GetData(), last_key.GetSize());
 	run.has_last_input_key = true;
 	return true;
+}
+
+void ReclusterRunMerger::CopyRunRows(const RunState &run) {
+	if (run.position == run.count) {
+		return;
+	}
+	for (idx_t column_index = 0; column_index < output_types.size(); column_index++) {
+		VectorOperations::Copy(run.input.data[column_index], source_rows.data[column_index], run.count, run.position,
+		                       run.slot_offset + run.position);
+	}
+	source_rows_copied += run.count - run.position;
 }
 
 string_t ReclusterRunMerger::GetCurrentKey(idx_t run_index) const {
@@ -190,6 +202,16 @@ bool ReclusterRunMerger::HeapAfter(idx_t left_run, idx_t right_run) const {
 }
 
 bool ReclusterRunMerger::RebuildHeap() {
+	if (has_variable_payload && source_rows_copied >= source_rows.size() * RECLUSTER_SOURCE_BUFFER_ROUNDS) {
+		// Reclaim consumed variable-length payload while retaining each run's unread rows.
+		auto capacity = source_rows.size();
+		source_rows.Reset();
+		source_rows.SetChildCardinality(capacity);
+		source_rows_copied = 0;
+		for (auto &run : runs) {
+			CopyRunRows(*run);
+		}
+	}
 	heap.clear();
 	for (idx_t run_index = 0; run_index < runs.size(); run_index++) {
 		auto &run = *runs[run_index];

@@ -32,6 +32,7 @@ private:
 	void CheckTask() const;
 	void BuildRunStates();
 	bool FillRun(RunState &run);
+	void CopyRunRows(const RunState &run);
 	bool RebuildHeap();
 	bool HeapAfter(idx_t left_run, idx_t right_run) const;
 	string_t GetCurrentKey(idx_t run_index) const;
@@ -45,7 +46,9 @@ private:
 	vector<unique_ptr<RunState>> runs;
 	vector<idx_t> heap;
 	DataChunk source_rows;
+	idx_t source_rows_copied = 0;
 	string last_output_key;
+	bool has_variable_payload = false;
 	bool has_last_output_key = false;
 	bool prepared = false;
 	bool needs_rebuild = true;

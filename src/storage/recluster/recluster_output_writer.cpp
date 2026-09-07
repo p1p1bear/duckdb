@@ -540,6 +540,8 @@ void WriteReclusterOutput(RangeTask &task) {
 			TableAppendState append_state;
 			DataChunk sorted_chunk;
 			sorter.InitializeChunk(sorted_chunk);
+			DataChunk table_chunk;
+			table_chunk.InitializeEmpty(types);
 			auto physical_columns = ReclusterPhysicalColumns(types.size());
 			vector<int64_t> pending_row_groups;
 			auto &scheduler = TaskScheduler::GetScheduler(storage.GetAttached().GetDatabase());
@@ -565,8 +567,6 @@ void WriteReclusterOutput(RangeTask &task) {
 			};
 			while (sorter.Scan(sorted_chunk)) {
 				CheckOutputTask(task);
-				DataChunk table_chunk;
-				table_chunk.InitializeEmpty(types);
 				table_chunk.ReferenceColumns(sorted_chunk, physical_columns);
 				if (!append_state.start_row_group) {
 					collection->InitializeAppend(TransactionData(0, 0), append_state, organization);

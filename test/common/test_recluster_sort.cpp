@@ -3,6 +3,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
@@ -33,7 +35,8 @@ static ReclusterTaskStartResult StartSortTask(Connection &con, const string &tab
 	return result;
 }
 
-static ReclusterTaskStartResult StartRunMergeTask(Connection &con, const string &table_name) {
+static ReclusterTaskStartResult StartRunMergeTask(Connection &con, const string &table_name,
+                                                  const ReclusterCandidateLimits &limits = {32768, 16, 4, 0.25}) {
 	ReclusterTaskStartResult result;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier(table_name)));
@@ -41,7 +44,7 @@ static ReclusterTaskStartResult StartRunMergeTask(Connection &con, const string 
 		REQUIRE(state);
 		ReclusterLayoutAnalysis analysis(*entry.GetStorage().GetRowGroupCollection(), entry.GetStorage().Columns(),
 		                                 *state);
-		auto selection = analysis.SelectCandidate({32768, 16, 4, 0.25});
+		auto selection = analysis.SelectCandidate(limits);
 		REQUIRE(selection.status == ReclusterCandidateSelectionStatus::SELECTED);
 		REQUIRE(selection.candidate);
 		REQUIRE(selection.candidate->type == ReclusterCandidateType::RUN_MERGE);
@@ -210,6 +213,57 @@ TEST_CASE("Recluster sorter streams existing sorted runs", "[storage][recluster_
 	REQUIRE(sorter.GetSortedRowCount() == expected.RowCount());
 	REQUIRE(sorter.IsFinished());
 
+	RemoveSortTask(con, start);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Recluster merge bounds variable-length source buffers across refills", "[storage][recluster_sort]") {
+	bool interleaved = true;
+	SECTION("Interleaved runs") {
+	}
+	SECTION("One run remains unread across repeated refills") {
+		interleaved = false;
+	}
+	auto path = TestCreatePath("recluster_merge_buffers.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET auto_recluster=false; SET memory_limit='64MB'"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS buffers (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE buffers"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(k BIGINT, payload VARCHAR, items BIGINT[]) SORTED BY(k)"));
+	for (idx_t run = 0; run < 2; run++) {
+		auto key = interleaved ? "i*2+" + std::to_string(run) : "i+" + std::to_string(run * 65536);
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT k, CASE WHEN k%31=0 THEN NULL ELSE repeat('x',128)||k END, "
+		                          "CASE WHEN k%47=0 THEN NULL ELSE [k,-k] END FROM "
+		                          "(SELECT " +
+		                          key + " AS k FROM range(65536) t(i))"));
+	}
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT buffers"));
+	auto start = StartRunMergeTask(con, "tbl", {131072, 64, 4, 0.25});
+	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
+	ReclusterSorter sorter(*start.task);
+	sorter.Prepare();
+	DataChunk chunk;
+	sorter.InitializeChunk(chunk);
+	idx_t output_rows = 0;
+	while (sorter.Scan(chunk)) {
+		chunk.Verify();
+		auto &strings = DictionaryVector::Child(chunk.data[1]);
+		auto &items = DictionaryVector::Child(chunk.data[2]);
+		REQUIRE(strings.GetAllocationSize() < 16 * 1024 * 1024);
+		REQUIRE(ListVector::GetListSize(items) <= 128 * 1024);
+		for (idx_t row = 0; row < chunk.size(); row++, output_rows++) {
+			auto key = static_cast<int64_t>(output_rows);
+			REQUIRE(chunk.GetValue(0, row) == Value::BIGINT(key));
+			auto payload = key % 31 == 0 ? Value(LogicalType::VARCHAR) : Value(string(128, 'x') + std::to_string(key));
+			REQUIRE(Value::NotDistinctFrom(chunk.GetValue(1, row), payload));
+			auto list = key % 47 == 0 ? Value(LogicalType::LIST(LogicalType::BIGINT))
+			                          : Value::LIST(LogicalType::BIGINT, {Value::BIGINT(key), Value::BIGINT(-key)});
+			REQUIRE(Value::NotDistinctFrom(chunk.GetValue(2, row), list));
+		}
+	}
+	REQUIRE(output_rows == 131072);
 	RemoveSortTask(con, start);
 	DeleteDatabase(path);
 }
