@@ -69,9 +69,8 @@ struct tpch_append_information {
 		optimistic_writer = make_uniq<OptimisticDataWriter>(context, table.GetStorage());
 		auto collection =
 		    optimistic_writer->CreateCollection(table.GetStorage(), table.GetTypes(), partial_manager_type);
-		auto &row_collection = *collection->collection;
-		row_collection.InitializeEmpty();
-		row_collection.InitializeAppend(append_state);
+		collection->collection->InitializeEmpty();
+		collection->InitializeAppend(append_state);
 		optimistic_collection_index = table.GetStorage().CreateOptimisticCollection(context, std::move(collection));
 		optimistic_collection = table.GetStorage().GetOptimisticCollection(context, optimistic_collection_index);
 		chunk.Initialize(context, table.GetTypes());
@@ -95,8 +94,7 @@ struct tpch_append_information {
 			appender->AppendDataChunk(chunk);
 		} else {
 			D_ASSERT(optimistic_collection);
-			auto &row_collection = *optimistic_collection->collection;
-			auto flushed_row_group_idx = row_collection.Append(chunk, append_state);
+			auto flushed_row_group_idx = optimistic_collection->Append(chunk, append_state);
 			if (flushed_row_group_idx.IsValid()) {
 				optimistic_writer->WriteNewRowGroup(*optimistic_collection, flushed_row_group_idx.GetIndex());
 			}
@@ -162,8 +160,7 @@ struct tpch_append_information {
 		}
 		FlushChunk();
 		TransactionData transaction_data(0, 0);
-		auto &row_collection = *optimistic_collection->collection;
-		row_collection.FinalizeAppend(transaction_data, append_state);
+		optimistic_collection->FinalizeAppend(transaction_data, append_state);
 		finalized = true;
 	}
 

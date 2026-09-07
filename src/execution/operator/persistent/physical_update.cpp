@@ -280,6 +280,7 @@ SinkResultType PhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
 }
 
 unique_ptr<GlobalSinkState> PhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
+	tableref.VerifyUpdateAllowed();
 	return make_uniq<UpdateGlobalState>(context, GetTypes(), row_id_handling);
 }
 

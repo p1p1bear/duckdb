@@ -63,7 +63,7 @@ unique_ptr<MergeIntoOperator> PlanMergeIntoAction(ClientContext &context, Logica
 		    std::move(return_types), op.table.Cast<DuckTableEntry>(), std::move(bound_constraints),
 		    std::move(set_expressions), std::move(set_columns), std::move(set_types), cardinality, op.return_chunk,
 		    !op.return_chunk, OnConflictAction::THROW, nullptr, nullptr, std::move(on_conflict_filter),
-		    std::move(columns_to_fetch), false);
+		    std::move(columns_to_fetch), false, false);
 
 		// transform expressions if required
 		if (!action.column_index_map.empty()) {

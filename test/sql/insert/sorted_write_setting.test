@@ -1,0 +1,199 @@
+# name: test/sql/insert/sorted_write_setting.test
+# description: Disable direct SORTED BY writes without changing the table's sort definition
+# group: [insert]
+
+query I
+SELECT current_setting('enable_sorted_write')::INTEGER
+----
+1
+
+statement ok
+SET auto_recluster=false
+
+statement ok
+SET debug_skip_checkpoint_on_commit=true
+
+statement ok
+ATTACH '{TEST_DIR}/sorted_write_setting.db' AS r (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE r
+
+statement ok
+SET threads=1
+
+statement ok
+SET enable_sorted_write=false
+
+statement ok
+CREATE TABLE disabled(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO disabled SELECT 4095-i FROM range(4096) t(i)
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM disabled) WHERE k<previous
+----
+4095
+
+query IT
+SELECT run_count, sort_state FROM duckdb_recluster_status() WHERE table_name='disabled'
+----
+0	ENABLED
+
+statement error
+UPDATE disabled SET k=k+1
+----
+<REGEX>:.*SORTED BY.*
+
+# The switch is read at execution, including reuse of a prepared statement.
+statement ok
+SET enable_sorted_write=true
+
+statement ok
+CREATE TABLE prepared(k BIGINT) SORTED BY(k)
+
+statement ok
+PREPARE insert_rows AS INSERT INTO prepared SELECT 4095-i FROM range(4096) t(i)
+
+statement ok
+SET enable_sorted_write=false
+
+statement ok
+EXECUTE insert_rows
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='prepared'
+----
+0
+
+statement ok
+SET enable_sorted_write=true
+
+statement ok
+EXECUTE insert_rows
+
+statement ok
+SET enable_sorted_write=false
+
+statement ok
+EXECUTE insert_rows
+
+query II
+SELECT run_count, unsorted_row_groups FROM duckdb_recluster_status() WHERE table_name='prepared'
+----
+1	4
+
+query II
+SELECT count(*), sum(k) FROM prepared
+----
+12288	25159680
+
+# Batch and parallel streaming INSERT share the same execution-time setting.
+statement ok
+SET threads=4
+
+statement ok
+CREATE TABLE source AS SELECT 4095-i AS k FROM range(4096) t(i)
+
+foreach preserve true false
+
+statement ok
+SET preserve_insertion_order={preserve}
+
+statement ok
+CREATE TABLE parallel_{preserve}(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO parallel_{preserve} SELECT k FROM source
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='parallel_{preserve}'
+----
+0
+
+query II
+SELECT count(*), sum(k) FROM parallel_{preserve}
+----
+4096	8386560
+
+endloop
+
+statement ok
+SET preserve_insertion_order=true
+
+statement ok
+CREATE TABLE ctas SORTED BY(k) AS SELECT k FROM source
+
+statement ok
+COPY source TO '{TEST_DIR}/sorted_write_setting.csv' (FORMAT CSV, HEADER true)
+
+statement ok
+CREATE TABLE copied(k BIGINT) SORTED BY(k)
+
+statement ok
+COPY copied FROM '{TEST_DIR}/sorted_write_setting.csv' (FORMAT CSV, HEADER true)
+
+query TI rowsort
+SELECT table_name, run_count FROM duckdb_recluster_status() WHERE table_name IN ('ctas','copied')
+----
+copied	0
+ctas	0
+
+query II
+SELECT (SELECT sum(k) FROM ctas), (SELECT sum(k) FROM copied)
+----
+8386560	8386560
+
+# Explicit ORDER BY still executes, but does not create a declared sorted run.
+statement ok
+SET threads=1
+
+statement ok
+CREATE TABLE ordered(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO ordered SELECT k FROM source ORDER BY k
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM ordered) WHERE k<previous
+----
+0
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='ordered'
+----
+0
+
+# The maintenance sorter remains available while direct writes are disabled.
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.disabled')
+----
+1	COMPLETE
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM disabled) WHERE k<previous
+----
+0
+
+statement ok
+RESET enable_sorted_write
+
+query I
+SELECT current_setting('enable_sorted_write')::INTEGER
+----
+1
+
+statement ok
+CREATE TABLE restored(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO restored SELECT k FROM source
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='restored'
+----
+1

@@ -9,6 +9,7 @@
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -32,13 +33,15 @@ PhysicalInsert::PhysicalInsert(PhysicalPlan &physical_plan, vector<LogicalType> 
                                bool parallel, OnConflictAction action_type,
                                unique_ptr<Expression> on_conflict_condition_p,
                                unique_ptr<Expression> do_update_condition_p, unordered_set<column_t> conflict_target_p,
-                               vector<column_t> columns_to_fetch_p, bool update_is_del_and_insert)
+                               vector<column_t> columns_to_fetch_p, bool update_is_del_and_insert,
+                               bool allow_direct_sort_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::INSERT, std::move(types_p), estimated_cardinality),
       insert_table(&table), insert_types(table.GetTypes()), bound_constraints(std::move(bound_constraints_p)),
       return_chunk(return_chunk), parallel(parallel), action_type(action_type),
       set_expressions(std::move(set_expressions)), set_columns(std::move(set_columns)), set_types(std::move(set_types)),
       on_conflict_condition(std::move(on_conflict_condition_p)), do_update_condition(std::move(do_update_condition_p)),
-      conflict_target(std::move(conflict_target_p)), update_is_del_and_insert(update_is_del_and_insert) {
+      conflict_target(std::move(conflict_target_p)), update_is_del_and_insert(update_is_del_and_insert),
+      allow_direct_sort(allow_direct_sort_p) {
 	if (action_type == OnConflictAction::THROW) {
 		return;
 	}
@@ -60,7 +63,7 @@ PhysicalInsert::PhysicalInsert(PhysicalPlan &physical_plan, LogicalOperator &op,
                                unique_ptr<BoundCreateTableInfo> info_p, idx_t estimated_cardinality, bool parallel)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::CREATE_TABLE_AS, op.types, estimated_cardinality),
       insert_table(nullptr), return_chunk(false), schema(&schema), info(std::move(info_p)), parallel(parallel),
-      action_type(OnConflictAction::THROW), update_is_del_and_insert(false) {
+      action_type(OnConflictAction::THROW), update_is_del_and_insert(false), allow_direct_sort(true) {
 	GetInsertInfo(*info, insert_types);
 }
 
@@ -122,6 +125,12 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 		table = insert_table.get_mutable();
 	}
 	auto result = make_uniq<InsertGlobalState>(context, GetTypes(), *table);
+	if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
+		table->VerifyUpdateAllowed();
+	}
+	if (table->SortEnabled() && allow_direct_sort && Settings::Get<EnableSortedWriteSetting>(context)) {
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
+	}
 	return std::move(result);
 }
 
@@ -615,6 +624,17 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 	auto &table = gstate.table;
 	auto &storage = table.GetStorage();
 	insert_chunk.Flatten();
+	if (gstate.adaptive_sort) {
+		auto updated_tuples = OnConflictHandling(table, context, gstate, lstate, insert_chunk);
+		if (updated_tuples != 0) {
+			throw InternalException("Adaptive sorted write unexpectedly updated existing tuples");
+		}
+		if (return_chunk) {
+			gstate.return_collection.Append(insert_chunk);
+		}
+		return gstate.adaptive_sort->Sink(context, insert_chunk, lstate.adaptive_sort, InsertOrderToken::ArrivalOrder(),
+		                                  input.interrupt_state);
+	}
 
 	if (!parallel) {
 		idx_t updated_tuples = OnConflictHandling(table, context, gstate, lstate, insert_chunk);
@@ -644,9 +664,8 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 		lstate.optimistic_writer = make_uniq<OptimisticDataWriter>(context.client, data_table);
 		// Create the local row group collection.
 		auto optimistic_collection = lstate.optimistic_writer->CreateCollection(storage, insert_types);
-		auto &collection = *optimistic_collection->collection;
-		collection.InitializeEmpty();
-		collection.InitializeAppend(lstate.local_append_state);
+		optimistic_collection->collection->InitializeEmpty();
+		optimistic_collection->InitializeAppend(lstate.local_append_state);
 
 		lstate.collection_index =
 		    data_table.CreateOptimisticCollection(context.client, std::move(optimistic_collection));
@@ -656,8 +675,7 @@ SinkResultType PhysicalInsert::Sink(ExecutionContext &context, DataChunk &insert
 	D_ASSERT(action_type != OnConflictAction::UPDATE);
 
 	auto &optimistic_collection = data_table.GetOptimisticCollection(context.client, lstate.collection_index);
-	auto &collection = *optimistic_collection.collection;
-	auto flushed_row_group_idx = collection.Append(insert_chunk, lstate.local_append_state);
+	auto flushed_row_group_idx = optimistic_collection.Append(insert_chunk, lstate.local_append_state);
 	if (flushed_row_group_idx.IsValid()) {
 		lstate.optimistic_writer->WriteNewRowGroup(optimistic_collection, flushed_row_group_idx.GetIndex());
 	}
@@ -670,6 +688,9 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	auto &client_profiler = QueryProfiler::Get(context.client);
 	context.thread.profiler.Flush(*this);
 	client_profiler.Flush(context.thread.profiler);
+	if (gstate.adaptive_sort) {
+		return gstate.adaptive_sort->Combine(context, lstate.adaptive_sort, input.interrupt_state);
+	}
 
 	if (!parallel || !lstate.collection_index.IsValid()) {
 		return SinkCombineResultType::FINISHED;
@@ -684,7 +705,7 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 	auto &data_table = gstate.table.GetStorage();
 	auto &optimistic_collection = data_table.GetOptimisticCollection(context.client, lstate.collection_index);
 	auto &collection = *optimistic_collection.collection;
-	collection.FinalizeAppend(tdata, lstate.local_append_state);
+	optimistic_collection.FinalizeAppend(tdata, lstate.local_append_state);
 
 	auto append_count = collection.GetTotalRows();
 
@@ -711,6 +732,11 @@ SinkCombineResultType PhysicalInsert::Combine(ExecutionContext &context, Operato
 
 SinkFinalizeType PhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                           OperatorSinkFinalizeInput &input) const {
+	auto &gstate = input.global_state.Cast<InsertGlobalState>();
+	if (gstate.adaptive_sort) {
+		gstate.insert_count = gstate.adaptive_sort->TotalCount();
+		return gstate.adaptive_sort->Finalize(pipeline, event, *this, context, input.interrupt_state);
+	}
 	return SinkFinalizeType::READY;
 }
 

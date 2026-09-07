@@ -9,7 +9,116 @@
 
 namespace duckdb {
 
+AppendOrganizationSpanCursor::AppendOrganizationSpanCursor(const vector<AppendOrganizationSpan> &spans_p)
+    : spans(spans_p) {
+}
+
+const AppendOrganization &AppendOrganizationSpanCursor::GetOrganization() const {
+	if (span_index >= spans.size()) {
+		throw InternalException("Append organization span cursor is exhausted");
+	}
+	return spans[span_index].organization;
+}
+
+idx_t AppendOrganizationSpanCursor::Remaining() const {
+	if (span_index >= spans.size()) {
+		throw InternalException("Append organization span cursor is exhausted");
+	}
+	return spans[span_index].physical_count - span_offset;
+}
+
+bool AppendOrganizationSpanCursor::AtSpanStart() const {
+	return span_offset == 0;
+}
+
+bool AppendOrganizationSpanCursor::Advance(idx_t count) {
+	if (count == 0 || count > Remaining()) {
+		throw InternalException("Invalid append organization span advance");
+	}
+	span_offset += count;
+	if (span_offset < spans[span_index].physical_count) {
+		return false;
+	}
+	span_index++;
+	span_offset = 0;
+	return true;
+}
+
+void AppendOrganizationSpanCursor::VerifyFinished() const {
+	if (span_index != spans.size() || span_offset != 0) {
+		throw InternalException("Append organization spans do not cover the scanned rows");
+	}
+}
+
 OptimisticWriteCollection::~OptimisticWriteCollection() {
+}
+
+void OptimisticWriteCollection::InitializeAppend(TransactionData transaction, TableAppendState &state,
+                                                 const AppendOrganization &organization) {
+	collection->InitializeAppend(transaction, state, organization);
+}
+
+void OptimisticWriteCollection::InitializeAppend(TableAppendState &state, const AppendOrganization &organization) {
+	InitializeAppend(TransactionData(0, 0), state, organization);
+}
+
+optional_idx OptimisticWriteCollection::Append(DataChunk &chunk, TableAppendState &state) {
+	return collection->Append(chunk, state);
+}
+
+void OptimisticWriteCollection::FinalizeAppend(TransactionData transaction, TableAppendState &state) {
+	auto physical_count = state.total_append_count;
+	auto organization = state.organization;
+	if (!organization.IsValid()) {
+		throw InternalException("Invalid append organization span");
+	}
+	if (physical_count > 0 && (append_spans.empty() || append_spans.back().organization != organization)) {
+		append_spans.reserve(append_spans.size() + 1);
+	}
+	collection->FinalizeAppend(transaction, state);
+	AddAppendSpan(physical_count, organization);
+}
+
+void OptimisticWriteCollection::AddAppendSpan(idx_t physical_count, const AppendOrganization &organization) {
+	if (physical_count == 0) {
+		return;
+	}
+	if (!organization.IsValid()) {
+		throw InternalException("Invalid append organization span");
+	}
+	if (!append_spans.empty() && append_spans.back().organization == organization) {
+		append_spans.back().physical_count += physical_count;
+		return;
+	}
+	append_spans.push_back({physical_count, organization});
+}
+
+void OptimisticWriteCollection::VerifyAppendSpans(idx_t expected_count) const {
+	idx_t offset = 0;
+	for (auto &span : append_spans) {
+		if (span.physical_count == 0 || !span.organization.IsValid()) {
+			throw InternalException("Invalid append organization span sequence");
+		}
+		offset += span.physical_count;
+	}
+	if (offset != expected_count) {
+		throw InternalException("Append organization spans cover %llu rows, expected %llu", offset, expected_count);
+	}
+}
+
+void OptimisticWriteCollection::ForceUnsorted(idx_t output_count) {
+	if (output_count > 0) {
+		append_spans.reserve(1);
+	}
+	for (idx_t row_group_idx = 0; row_group_idx < collection->GetRowGroupCount(); row_group_idx++) {
+		auto row_group = collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+		if (!row_group) {
+			throw InternalException("Missing row group while clearing append organization");
+		}
+		row_group->SetSortMetadata({}, false);
+	}
+	append_spans.clear();
+	AddAppendSpan(output_count, AppendOrganization::Unsorted());
 }
 
 OptimisticDataWriter::OptimisticDataWriter(ClientContext &context, DataTable &table) : context(context), table(table) {
@@ -156,10 +265,13 @@ void OptimisticDataWriter::WriteUnflushedRowGroups(OptimisticWriteCollection &ro
 
 void OptimisticWriteCollection::MergeStorage(OptimisticWriteCollection &merge_collection) {
 	auto &merge_row_groups = *merge_collection.collection;
-	if (merge_row_groups.GetTotalRows() == 0) {
+	auto source_count = merge_row_groups.GetTotalRows();
+	merge_collection.VerifyAppendSpans(source_count);
+	if (source_count == 0) {
 		// no rows to merge - done
 		return;
 	}
+	append_spans.reserve(append_spans.size() + merge_collection.append_spans.size());
 	idx_t current_row_group_count = collection->GetRowGroupCount();
 	// now we merge the target collection into this one - take over any unflushed row groups but adjust their index
 	for (auto &unflushed_idx : merge_collection.unflushed_row_groups) {
@@ -171,6 +283,10 @@ void OptimisticWriteCollection::MergeStorage(OptimisticWriteCollection &merge_co
 	unflushed_data_size += merge_collection.unflushed_data_size;
 	// finally perform the actual merge
 	collection->MergeStorage(merge_row_groups, nullptr, nullptr);
+	for (auto &span : merge_collection.append_spans) {
+		AddAppendSpan(span.physical_count, span.organization);
+	}
+	merge_collection.append_spans.clear();
 }
 
 void OptimisticDataWriter::FlushToDisk(OptimisticWriteCollection &collection,

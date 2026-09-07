@@ -31,6 +31,7 @@ unique_ptr<CommonTableExpressionInfo> CommonTableExpressionInfo::Copy() {
 	}
 	result->materialized = materialized;
 	result->is_trigger_generated = is_trigger_generated;
+	result->allow_direct_sort = allow_direct_sort;
 	return result;
 }
 

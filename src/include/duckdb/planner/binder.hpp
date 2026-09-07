@@ -375,6 +375,8 @@ public:
 
 	void SetCanContainNulls(bool can_contain_nulls);
 	bool CanContainNulls() const;
+	void SetAllowDirectSort(bool allow);
+	bool AllowDirectSort() const;
 	void SetAlwaysRequireRebind();
 	void SetInsideSubquery();
 	bool IsInsideSubquery() const;
@@ -408,6 +410,8 @@ private:
 	bool legacy_can_contain_nulls = false;
 	//! Whether this binder is inside a subquery boundary
 	bool inside_subquery = false;
+	//! Whether INSERT operators created in this binder may use direct sorting
+	bool allow_direct_sort = true;
 	//! The set of bound views
 	reference_set_t<ViewCatalogEntry> bound_views;
 	//! Used to retrieve CatalogEntry's

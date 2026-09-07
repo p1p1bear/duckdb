@@ -624,6 +624,7 @@ BoundStatement Binder::BindNode(InsertQueryNode &node) {
 	}
 
 	auto insert = make_uniq<LogicalInsert>(table, GenerateTableIndex());
+	insert->allow_direct_sort = AllowDirectSort();
 
 	auto values_list = node.GetValuesList();
 

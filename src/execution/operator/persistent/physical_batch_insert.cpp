@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/operator/persistent/batch_memory_manager.hpp"
 #include "duckdb/execution/operator/persistent/batch_task_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/append_state.hpp"
@@ -18,16 +19,17 @@ namespace duckdb {
 
 PhysicalBatchInsert::PhysicalBatchInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                                          DuckTableEntry &table, vector<unique_ptr<BoundConstraint>> bound_constraints_p,
-                                         idx_t estimated_cardinality)
+                                         idx_t estimated_cardinality, bool allow_direct_sort_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::BATCH_INSERT, std::move(types_p), estimated_cardinality),
       insert_table(&table), insert_types(table.GetTypes()), bound_constraints(std::move(bound_constraints_p)),
-      preferred_batch_size(table.GetStorage().GetRowGroupSize()) {
+      preferred_batch_size(table.GetStorage().GetRowGroupSize()), allow_direct_sort(allow_direct_sort_p) {
 }
 
 PhysicalBatchInsert::PhysicalBatchInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
                                          unique_ptr<BoundCreateTableInfo> info_p, idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::BATCH_CREATE_TABLE_AS, op.types, estimated_cardinality),
-      insert_table(nullptr), schema(&schema), info(std::move(info_p)), preferred_batch_size(DEFAULT_ROW_GROUP_SIZE) {
+      insert_table(nullptr), schema(&schema), info(std::move(info_p)), preferred_batch_size(DEFAULT_ROW_GROUP_SIZE),
+      allow_direct_sort(true) {
 	PhysicalInsert::GetInsertInfo(*info, insert_types);
 }
 
@@ -83,7 +85,6 @@ public:
 			// Merge all collections into one result collection.
 			auto &types = result_collection.GetTypes();
 			TableAppendState append_state;
-			result_collection.InitializeAppend(append_state);
 
 			DataChunk scan_chunk;
 			scan_chunk.Initialize(context, types);
@@ -93,10 +94,12 @@ public:
 				column_ids.emplace_back(i);
 			}
 			for (idx_t i = 1; i < collection_indexes.size(); i++) {
-				auto &collection = data_table.GetOptimisticCollection(context, collection_indexes[i]);
+				auto &source = data_table.GetOptimisticCollection(context, collection_indexes[i]);
+				source.VerifyAppendSpans(source.collection->GetTotalRows());
+				AppendOrganizationSpanCursor span_cursor(source.append_spans);
 				TableScanState scan_state;
 				scan_state.Initialize(column_ids);
-				collection.collection->InitializeScan(context, scan_state.local_state, column_ids, nullptr);
+				source.collection->InitializeScan(context, scan_state.local_state, column_ids, nullptr);
 
 				while (true) {
 					scan_chunk.Reset();
@@ -104,14 +107,28 @@ public:
 					if (scan_chunk.size() == 0) {
 						break;
 					}
-					auto flushed_row_group_idx = result_collection.Append(scan_chunk, append_state);
-					if (flushed_row_group_idx.IsValid()) {
-						writer.WriteNewRowGroup(optimistic_collection, flushed_row_group_idx.GetIndex());
+					idx_t chunk_offset = 0;
+					while (chunk_offset < scan_chunk.size()) {
+						if (span_cursor.AtSpanStart()) {
+							optimistic_collection.InitializeAppend(append_state, span_cursor.GetOrganization());
+						}
+						auto append_count = MinValue<idx_t>(span_cursor.Remaining(), scan_chunk.size() - chunk_offset);
+						DataChunk append_chunk;
+						append_chunk.InitializeEmpty(types);
+						append_chunk.Slice(scan_chunk, chunk_offset, chunk_offset + append_count);
+						auto flushed_row_group_idx = optimistic_collection.Append(append_chunk, append_state);
+						if (flushed_row_group_idx.IsValid()) {
+							writer.WriteNewRowGroup(optimistic_collection, flushed_row_group_idx.GetIndex());
+						}
+						chunk_offset += append_count;
+						if (span_cursor.Advance(append_count)) {
+							optimistic_collection.FinalizeAppend(TransactionData(0, 0), append_state);
+						}
 					}
 				}
+				span_cursor.VerifyFinished();
 				data_table.ResetOptimisticCollection(context, collection_indexes[i]);
 			}
-			result_collection.FinalizeAppend(TransactionData(0, 0), append_state);
 			writer.WriteUnflushedRowGroups(optimistic_collection);
 		} else if (batch_type == RowGroupBatchType::NOT_FLUSHED) {
 			writer.WriteUnflushedRowGroups(optimistic_collection);
@@ -170,6 +187,7 @@ public:
 	idx_t next_start = 0;
 	atomic<bool> optimistically_written;
 	idx_t minimum_memory_per_thread;
+	unique_ptr<AdaptiveSortedWrite> adaptive_sort;
 
 	bool ReadyToMerge(const idx_t count) const;
 	void ScheduleMergeTasks(ClientContext &context, const idx_t min_batch_index);
@@ -179,6 +197,9 @@ public:
 	                   const PhysicalIndex collection_index, optional_ptr<OptimisticDataWriter> writer = nullptr);
 
 	idx_t MaxThreads(const idx_t source_max_threads) override {
+		if (adaptive_sort) {
+			return source_max_threads;
+		}
 		// try to request 4MB per column per thread
 		memory_manager.SetMemorySize(source_max_threads * minimum_memory_per_thread);
 		// cap the concurrent threads working on this task based on the amount of available memory
@@ -197,6 +218,9 @@ public:
 	PhysicalIndex collection_index;
 	unique_ptr<OptimisticDataWriter> optimistic_writer;
 	unique_ptr<ConstraintState> constraint_state;
+	AdaptiveSortedWriteLocalState adaptive_sort;
+	idx_t adaptive_chunk_index = 0;
+	bool adaptive_batch_initialized = false;
 
 	void CreateNewCollection(ClientContext &context, DuckTableEntry &table_entry,
 	                         const vector<LogicalType> &insert_types) {
@@ -204,9 +228,8 @@ public:
 			optimistic_writer = make_uniq<OptimisticDataWriter>(context, table_entry.GetStorage());
 		}
 		auto collection = optimistic_writer->CreateCollection(table_entry.GetStorage(), insert_types);
-		auto &row_collection = *collection->collection;
-		row_collection.InitializeEmpty();
-		row_collection.InitializeAppend(current_append_state);
+		collection->collection->InitializeEmpty();
+		collection->InitializeAppend(current_append_state);
 
 		auto &data_table = table_entry.GetStorage();
 		collection_index = data_table.CreateOptimisticCollection(context, std::move(collection));
@@ -431,6 +454,9 @@ unique_ptr<GlobalSinkState> PhysicalBatchInsert::GetGlobalSinkState(ClientContex
 	static constexpr const idx_t MINIMUM_MEMORY_PER_COLUMN = 4ULL * 1024ULL * 1024ULL;
 	auto minimum_memory_per_thread = table->GetColumns().PhysicalColumnCount() * MINIMUM_MEMORY_PER_COLUMN;
 	auto result = make_uniq<BatchInsertGlobalState>(context, *table, minimum_memory_per_thread);
+	if (table->SortEnabled() && allow_direct_sort && Settings::Get<EnableSortedWriteSetting>(context)) {
+		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
+	}
 	return std::move(result);
 }
 
@@ -467,6 +493,12 @@ SinkNextBatchType PhysicalBatchInsert::NextBatch(ExecutionContext &context, Oper
 	auto &memory_manager = gstate.memory_manager;
 
 	auto batch_index = lstate.partition_info.batch_index.GetIndex();
+	if (gstate.adaptive_sort) {
+		lstate.current_index = batch_index;
+		lstate.adaptive_chunk_index = 0;
+		lstate.adaptive_batch_initialized = true;
+		return SinkNextBatchType::READY;
+	}
 	if (lstate.collection_index.IsValid()) {
 		if (lstate.current_index == batch_index) {
 			throw InternalException("NextBatch called with the same batch index?");
@@ -475,8 +507,7 @@ SinkNextBatchType PhysicalBatchInsert::NextBatch(ExecutionContext &context, Oper
 		TransactionData tdata(0, 0);
 		auto &optimistic_collection =
 		    gstate.table.GetStorage().GetOptimisticCollection(context.client, lstate.collection_index);
-		auto &collection = *optimistic_collection.collection;
-		collection.FinalizeAppend(tdata, lstate.current_append_state);
+		optimistic_collection.FinalizeAppend(tdata, lstate.current_append_state);
 		gstate.AddCollection(context.client, lstate.current_index, lstate.partition_info.min_batch_index.GetIndex(),
 		                     lstate.collection_index, lstate.optimistic_writer);
 
@@ -502,6 +533,9 @@ SinkNextBatchType PhysicalBatchInsert::NextBatch(ExecutionContext &context, Oper
 SinkNextBatchType PhysicalBatchInsert::UpdateMinBatchIndex(ExecutionContext &,
                                                            OperatorSinkNextBatchInput &input) const {
 	auto &gstate = input.global_state.Cast<BatchInsertGlobalState>();
+	if (gstate.adaptive_sort) {
+		return SinkNextBatchType::READY;
+	}
 	gstate.memory_manager.UpdateMinBatchIndex(input.local_state.partition_info.min_batch_index.GetIndex());
 	return SinkNextBatchType::READY;
 }
@@ -519,6 +553,21 @@ SinkResultType PhysicalBatchInsert::Sink(ExecutionContext &context, DataChunk &i
 	insert_chunk.Flatten();
 
 	auto batch_index = lstate.partition_info.batch_index.GetIndex();
+	if (gstate.adaptive_sort) {
+		if (!lstate.adaptive_batch_initialized || lstate.current_index != batch_index) {
+			throw InternalException("PhysicalBatchInsert sink called before initializing its batch");
+		}
+		if (!lstate.constraint_state) {
+			lstate.constraint_state = table.GetStorage().InitializeConstraintState(table, bound_constraints);
+		}
+		auto &storage = table.GetStorage();
+		auto &local_storage = LocalStorage::Get(context.client, storage.db);
+		auto local_table_storage = local_storage.GetStorage(storage);
+		storage.VerifyAppendConstraints(*lstate.constraint_state, context.client, insert_chunk, local_table_storage,
+		                                nullptr);
+		auto token = InsertOrderToken::BatchOrder(batch_index, lstate.adaptive_chunk_index++);
+		return gstate.adaptive_sort->Sink(context, insert_chunk, lstate.adaptive_sort, token, input.interrupt_state);
+	}
 	// check if we should process this batch
 	if (!memory_manager.IsMinimumBatchIndex(batch_index)) {
 		memory_manager.UpdateMinBatchIndex(lstate.partition_info.min_batch_index.GetIndex());
@@ -559,8 +608,7 @@ SinkResultType PhysicalBatchInsert::Sink(ExecutionContext &context, DataChunk &i
 	                                nullptr);
 
 	auto &optimistic_collection = table.GetStorage().GetOptimisticCollection(context.client, lstate.collection_index);
-	auto &collection = *optimistic_collection.collection;
-	auto flushed_row_group_idx = collection.Append(insert_chunk, lstate.current_append_state);
+	auto flushed_row_group_idx = optimistic_collection.Append(insert_chunk, lstate.current_append_state);
 	if (flushed_row_group_idx.IsValid()) {
 		// we have already written to disk - flush the next row group as well
 		lstate.optimistic_writer->WriteNewRowGroup(optimistic_collection, flushed_row_group_idx.GetIndex());
@@ -578,6 +626,9 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 	auto &client_profiler = QueryProfiler::Get(context.client);
 	context.thread.profiler.Flush(*this);
 	client_profiler.Flush(context.thread.profiler);
+	if (gstate.adaptive_sort) {
+		return gstate.adaptive_sort->Combine(context, lstate.adaptive_sort, input.interrupt_state);
+	}
 
 	memory_manager.UpdateMinBatchIndex(lstate.partition_info.min_batch_index.GetIndex());
 
@@ -586,7 +637,7 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 		auto &optimistic_collection =
 		    gstate.table.GetStorage().GetOptimisticCollection(context.client, lstate.collection_index);
 		auto &collection = *optimistic_collection.collection;
-		collection.FinalizeAppend(tdata, lstate.current_append_state);
+		optimistic_collection.FinalizeAppend(tdata, lstate.current_append_state);
 		if (collection.GetTotalRows() > 0) {
 			auto batch_index = lstate.partition_info.min_batch_index.GetIndex();
 			gstate.AddCollection(context.client, lstate.current_index, batch_index, lstate.collection_index);
@@ -612,6 +663,10 @@ SinkCombineResultType PhysicalBatchInsert::Combine(ExecutionContext &context, Op
 SinkFinalizeType PhysicalBatchInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                OperatorSinkFinalizeInput &input) const {
 	auto &g_state = input.global_state.Cast<BatchInsertGlobalState>();
+	if (g_state.adaptive_sort) {
+		g_state.insert_count = g_state.adaptive_sort->TotalCount();
+		return g_state.adaptive_sort->Finalize(pipeline, event, *this, context, input.interrupt_state);
+	}
 	auto &table = g_state.table;
 	auto &data_table = g_state.table.GetStorage();
 	auto &memory_manager = g_state.memory_manager;

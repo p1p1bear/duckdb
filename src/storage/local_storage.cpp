@@ -14,6 +14,17 @@
 
 namespace duckdb {
 
+struct LocalStorageAlterCleanup {
+	explicit LocalStorageAlterCleanup(RowGroupCollection &collection, shared_ptr<LocalStorageAlterCleanup> previous_p)
+	    : drop_state(&collection.GetBlockManager()), previous(std::move(previous_p)) {
+	}
+
+	CommitDropState drop_state;
+	shared_ptr<LocalStorageAlterCleanup> previous;
+	bool published = false;
+	bool finalized = false;
+};
+
 LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &table)
     : context(context), table_ref(table), allocator(Allocator::Get(table.db)), deleted_rows(0),
       optimistic_writer(context, table) {
@@ -50,47 +61,75 @@ LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_data
                                      const vector<StorageIndex> &bound_columns, Expression &cast_expr,
                                      TransactionData transaction)
     : context(context), table_ref(new_data_table), allocator(Allocator::Get(new_data_table.db)),
-      deleted_rows(parent.deleted_rows), optimistic_collections(std::move(parent.optimistic_collections)),
-      optimistic_writer(new_data_table, parent.optimistic_writer) {
+      deleted_rows(parent.deleted_rows), optimistic_writer(context, new_data_table),
+      alter_cleanup(parent.alter_cleanup), has_unpublished_alter_cleanup(true) {
 	// Alter the column type.
 	auto &parent_collection = *parent.row_groups->collection;
 	auto new_collection =
 	    parent_collection.AlterType(context, alter_column_index, target_type, bound_columns, cast_expr, transaction);
-	parent_collection.CommitDropColumn(alter_column_index);
-	row_groups = std::move(parent.row_groups);
+	row_groups = make_uniq<OptimisticWriteCollection>();
 	row_groups->collection = std::move(new_collection);
 
-	append_indexes.Move(parent.append_indexes);
+	auto cleanup = make_shared_ptr<LocalStorageAlterCleanup>(parent_collection, alter_cleanup);
+	parent_collection.CommitDropColumn(alter_column_index, cleanup->drop_state);
+	alter_cleanup = std::move(cleanup);
 }
 
-LocalTableStorage::LocalTableStorage(DataTable &new_data_table, LocalTableStorage &parent,
+LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_data_table, LocalTableStorage &parent,
                                      const idx_t drop_column_index)
-    : table_ref(new_data_table), allocator(Allocator::Get(new_data_table.db)), deleted_rows(parent.deleted_rows),
-      optimistic_collections(std::move(parent.optimistic_collections)),
-      optimistic_writer(new_data_table, parent.optimistic_writer) {
+    : context(context), table_ref(new_data_table), allocator(Allocator::Get(new_data_table.db)),
+      deleted_rows(parent.deleted_rows), optimistic_writer(context, new_data_table),
+      alter_cleanup(parent.alter_cleanup), has_unpublished_alter_cleanup(true) {
 	// Remove the column from the previous table storage.
 	auto &parent_collection = *parent.row_groups->collection;
 	auto new_collection = parent_collection.RemoveColumn(drop_column_index);
-	parent_collection.CommitDropColumn(drop_column_index);
-	row_groups = std::move(parent.row_groups);
+	row_groups = make_uniq<OptimisticWriteCollection>();
 	row_groups->collection = std::move(new_collection);
 
-	append_indexes.Move(parent.append_indexes);
+	auto cleanup = make_shared_ptr<LocalStorageAlterCleanup>(parent_collection, alter_cleanup);
+	parent_collection.CommitDropColumn(drop_column_index, cleanup->drop_state);
+	alter_cleanup = std::move(cleanup);
 }
 
 LocalTableStorage::LocalTableStorage(ClientContext &context, DataTable &new_dt, LocalTableStorage &parent,
                                      ColumnDefinition &new_column, ExpressionExecutor &default_executor)
-    : table_ref(new_dt), allocator(Allocator::Get(new_dt.db)), deleted_rows(parent.deleted_rows),
-      optimistic_collections(std::move(parent.optimistic_collections)),
-      optimistic_writer(new_dt, parent.optimistic_writer) {
+    : context(context), table_ref(new_dt), allocator(Allocator::Get(new_dt.db)), deleted_rows(parent.deleted_rows),
+      optimistic_writer(context, new_dt), alter_cleanup(parent.alter_cleanup) {
 	auto &parent_collection = *parent.row_groups->collection;
 	auto new_collection = parent_collection.AddColumn(context, new_column, default_executor);
-	row_groups = std::move(parent.row_groups);
+	row_groups = make_uniq<OptimisticWriteCollection>();
 	row_groups->collection = std::move(new_collection);
-	append_indexes.Move(parent.append_indexes);
 }
 
 LocalTableStorage::~LocalTableStorage() {
+}
+
+void LocalTableStorage::PublishAlter(LocalTableStorage &parent, DuckTableEntry &new_entry) noexcept {
+	auto prepared_collection = std::move(row_groups->collection);
+	row_groups = std::move(parent.row_groups);
+	row_groups->collection = std::move(prepared_collection);
+	optimistic_collections = std::move(parent.optimistic_collections);
+	append_indexes.Move(parent.append_indexes);
+	delete_indexes.Move(parent.delete_indexes);
+	index_append_mode = parent.index_append_mode;
+	is_dropped = parent.is_dropped;
+	force_unsorted_on_commit = parent.force_unsorted_on_commit;
+	table_entry = new_entry;
+	if (has_unpublished_alter_cleanup) {
+		D_ASSERT(alter_cleanup);
+		alter_cleanup->published = true;
+		has_unpublished_alter_cleanup = false;
+	}
+}
+
+void LocalTableStorage::FinalizeAlterCleanup() {
+	for (auto cleanup = alter_cleanup; cleanup; cleanup = cleanup->previous) {
+		if (!cleanup->published || cleanup->finalized) {
+			continue;
+		}
+		cleanup->drop_state.FinalizeCommit();
+		cleanup->finalized = true;
+	}
 }
 
 void LocalTableStorage::InitializeScan(CollectionScanState &state, optional_ptr<TableFilterSet> table_filters) {
@@ -147,6 +186,44 @@ void LocalTableStorage::WriteNewRowGroup(idx_t flushed_row_group_idx) {
 	optimistic_writer.WriteNewRowGroup(*row_groups, flushed_row_group_idx);
 }
 
+void LocalTableStorage::ForceUnsortedOnCommit() {
+	force_unsorted_on_commit = true;
+	auto live_rows = GetCollection().GetTotalRows() - deleted_rows;
+	row_groups->ForceUnsorted(live_rows);
+
+	lock_guard<mutex> guard(collections_lock);
+	for (auto &collection : optimistic_collections) {
+		if (collection) {
+			collection->ForceUnsorted(collection->collection->GetTotalRows());
+		}
+	}
+}
+
+void LocalTableStorage::VerifyUnsortedOnCommit() {
+	auto verify_collection = [](OptimisticWriteCollection &collection, idx_t expected_count) {
+		collection.VerifyAppendSpans(expected_count);
+		for (auto &span : collection.append_spans) {
+			if (span.organization != AppendOrganization::Unsorted()) {
+				throw InternalException("Sorted append span remains after forcing transaction-local storage unsorted");
+			}
+		}
+		for (idx_t row_group_idx = 0; row_group_idx < collection.collection->GetRowGroupCount(); row_group_idx++) {
+			auto row_group = collection.collection->GetRowGroup(NumericCast<int64_t>(row_group_idx));
+			if (!row_group || row_group->GetSortMetadata().IsSorted() || row_group->IsSealed()) {
+				throw InternalException("Sorted row group remains after forcing transaction-local storage unsorted");
+			}
+		}
+	};
+
+	verify_collection(*row_groups, GetCollection().GetTotalRows() - deleted_rows);
+	lock_guard<mutex> guard(collections_lock);
+	for (auto &collection : optimistic_collections) {
+		if (collection) {
+			verify_collection(*collection, collection->collection->GetTotalRows());
+		}
+	}
+}
+
 void LocalTableStorage::FlushBlocks() {
 	auto &collection = *row_groups->collection;
 	const idx_t row_group_size = collection.GetRowGroupSize();
@@ -199,13 +276,36 @@ ErrorData LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, RowGr
 
 void LocalTableStorage::AppendToTable(DuckTransaction &transaction, TableAppendState &append_state) {
 	auto &table = table_ref.get();
-	table.InitializeAppend(transaction, append_state);
-	auto &collection = *row_groups->collection;
+	auto &source = *row_groups;
+	auto &collection = *source.collection;
+	source.VerifyAppendSpans(collection.GetTotalRows() - deleted_rows);
+	AppendOrganizationSpanCursor span_cursor(source.append_spans);
+	bool append_initialized = false;
 	for (auto &table_chunk : collection.Chunks(transaction)) {
-		// Append to the base table.
-		table.Append(table_chunk, append_state);
+		idx_t chunk_offset = 0;
+		while (chunk_offset < table_chunk.size()) {
+			if (span_cursor.AtSpanStart()) {
+				table.InitializeAppend(transaction, append_state, span_cursor.GetOrganization());
+				append_initialized = true;
+			}
+
+			auto append_count = MinValue<idx_t>(span_cursor.Remaining(), table_chunk.size() - chunk_offset);
+			DataChunk append_chunk;
+			append_chunk.InitializeEmpty(table_chunk.GetTypes());
+			append_chunk.Slice(table_chunk, chunk_offset, chunk_offset + append_count);
+			table.Append(append_chunk, append_state);
+			chunk_offset += append_count;
+
+			if (span_cursor.Advance(append_count)) {
+				table.FinalizeAppend(transaction, append_state);
+				append_initialized = false;
+			}
+		}
 	}
-	table.FinalizeAppend(transaction, append_state);
+	span_cursor.VerifyFinished();
+	if (append_initialized) {
+		throw InternalException("Transaction-local append ended inside an organization span");
+	}
 }
 
 void LocalTableStorage::AppendToIndexes(DuckTransaction &transaction, TableAppendState &append_state) {
@@ -270,6 +370,7 @@ OptimisticDataWriter &LocalTableStorage::GetOptimisticWriter() {
 }
 
 void LocalTableStorage::Rollback() {
+	FinalizeAlterCleanup();
 	optimistic_writer.Rollback();
 
 	CommitDropState drop_state(&row_groups->collection->GetBlockManager());
@@ -293,8 +394,15 @@ optional_ptr<LocalTableStorage> LocalTableManager::GetStorage(DataTable &table) 
 	return entry == table_storage.end() ? nullptr : entry->second.get();
 }
 
+shared_ptr<LocalTableStorage> LocalTableManager::GetStorageShared(DataTable &table) const {
+	lock_guard<mutex> l(table_storage_lock);
+	auto entry = table_storage.find(table);
+	return entry == table_storage.end() ? nullptr : entry->second;
+}
+
 LocalTableStorage &LocalTableManager::GetOrCreateStorage(ClientContext &context, DataTable &table) {
 	lock_guard<mutex> l(table_storage_lock);
+	has_recluster_storage = has_recluster_storage || table.GetDataTableInfo()->HasSortStorage();
 	auto entry = table_storage.find(table);
 	if (entry == table_storage.end()) {
 		auto new_storage = make_shared_ptr<LocalTableStorage>(context, table);
@@ -327,10 +435,30 @@ reference_map_t<DataTable, shared_ptr<LocalTableStorage>> LocalTableManager::Mov
 	return std::move(table_storage);
 }
 
+vector<shared_ptr<LocalTableStorage>> LocalTableManager::GetStorages() const {
+	lock_guard<mutex> l(table_storage_lock);
+	vector<shared_ptr<LocalTableStorage>> result;
+	result.reserve(table_storage.size());
+	for (auto &entry : table_storage) {
+		if (entry.second) {
+			result.push_back(entry.second);
+		}
+	}
+	return result;
+}
+
+bool LocalTableManager::HasReclusterStorage() const {
+	lock_guard<mutex> l(table_storage_lock);
+	return has_recluster_storage;
+}
+
 idx_t LocalTableManager::EstimatedSize() const {
 	lock_guard<mutex> l(table_storage_lock);
 	idx_t estimated_size = 0;
 	for (auto &storage : table_storage) {
+		if (!storage.second) {
+			continue;
+		}
 		estimated_size += storage.second->EstimatedSize();
 	}
 	return estimated_size;
@@ -339,7 +467,74 @@ idx_t LocalTableManager::EstimatedSize() const {
 void LocalTableManager::InsertEntry(DataTable &table, shared_ptr<LocalTableStorage> entry) {
 	lock_guard<mutex> l(table_storage_lock);
 	D_ASSERT(table_storage.find(table) == table_storage.end());
+	has_recluster_storage = has_recluster_storage || table.GetDataTableInfo()->HasSortStorage();
 	table_storage[table] = std::move(entry);
+}
+
+void LocalTableManager::PrepareMoveEntry(DataTable &old_dt, DataTable &new_dt) {
+	lock_guard<mutex> l(table_storage_lock);
+	if (table_storage.find(old_dt) == table_storage.end()) {
+		return;
+	}
+	D_ASSERT(table_storage.find(new_dt) == table_storage.end());
+	table_storage.emplace(reference<DataTable>(new_dt), nullptr);
+}
+
+void LocalTableManager::PublishMoveEntry(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry,
+                                         PendingLocalStorageAlterMode mode,
+                                         shared_ptr<LocalTableStorage> &replacement_storage) noexcept {
+	lock_guard<mutex> l(table_storage_lock);
+	auto old_storage = table_storage.find(old_dt);
+	auto prepared_storage = table_storage.find(new_dt);
+	if (old_storage == table_storage.end()) {
+		if (prepared_storage != table_storage.end()) {
+			table_storage.erase(prepared_storage);
+		}
+		return;
+	}
+	D_ASSERT(prepared_storage != table_storage.end());
+	if (mode == PendingLocalStorageAlterMode::REBUILT) {
+		D_ASSERT(!prepared_storage->second);
+		D_ASSERT(replacement_storage);
+		replacement_storage->PublishAlter(*old_storage->second, new_entry);
+		prepared_storage->second = std::move(replacement_storage);
+	} else {
+		D_ASSERT(!prepared_storage->second);
+		prepared_storage->second = std::move(old_storage->second);
+		prepared_storage->second->table_ref = new_dt;
+		prepared_storage->second->table_entry = new_entry;
+	}
+	has_recluster_storage = has_recluster_storage || new_dt.GetDataTableInfo()->HasSortStorage();
+	table_storage.erase(old_storage);
+}
+
+void LocalTableManager::AbortMoveEntry(DataTable &new_dt) noexcept {
+	lock_guard<mutex> l(table_storage_lock);
+	auto prepared_storage = table_storage.find(new_dt);
+	if (prepared_storage == table_storage.end()) {
+		return;
+	}
+	table_storage.erase(prepared_storage);
+}
+
+//===--------------------------------------------------------------------===//
+// PendingLocalStorageAlter
+//===--------------------------------------------------------------------===//
+PendingLocalStorageAlter::PendingLocalStorageAlter(LocalStorage &storage_p, DataTable &old_table_p,
+                                                   DataTable &new_table_p, PendingLocalStorageAlterMode mode_p)
+    : storage(storage_p), old_table(old_table_p), new_table(new_table_p), mode(mode_p) {
+}
+
+PendingLocalStorageAlter::~PendingLocalStorageAlter() {
+	if (active) {
+		storage.AbortPreparedAlter(new_table);
+	}
+}
+
+void PendingLocalStorageAlter::Publish(DuckTableEntry &new_entry) noexcept {
+	D_ASSERT(active);
+	storage.PublishPreparedAlter(old_table, new_table, new_entry, mode, replacement_storage);
+	active = false;
 }
 
 //===--------------------------------------------------------------------===//
@@ -408,10 +603,14 @@ bool LocalStorage::NextParallelScan(ClientContext &context, DataTable &table, Pa
 	return storage->GetCollection().NextParallelScan(context, state, scan_state);
 }
 
-void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
+void LocalStorage::InitializeAppend(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry,
+                                    const AppendOrganization &organization) {
 	state.storage = &table_manager.GetOrCreateStorage(context, table);
 	state.storage->table_entry = &table_entry;
-	state.storage->GetCollection().InitializeAppend(TransactionData(transaction), state.append_state);
+	auto effective_organization =
+	    state.storage->force_unsorted_on_commit ? AppendOrganization::Unsorted() : organization;
+	state.storage->GetPrimaryCollection().InitializeAppend(TransactionData(transaction), state.append_state,
+	                                                       effective_organization);
 }
 
 void LocalStorage::InitializeStorage(LocalAppendState &state, DataTable &table, DuckTableEntry &table_entry) {
@@ -477,7 +676,7 @@ void LocalStorage::Append(LocalAppendState &state, DuckTableEntry &table_entry, 
 	}
 
 	// Append the chunk to the local storage.
-	auto flushed_row_group_idx = storage->GetCollection().Append(table_chunk, state.append_state);
+	auto flushed_row_group_idx = storage->GetPrimaryCollection().Append(table_chunk, state.append_state);
 
 	// Check if we should pre-emptively flush blocks to disk.
 	if (flushed_row_group_idx.IsValid()) {
@@ -486,12 +685,15 @@ void LocalStorage::Append(LocalAppendState &state, DuckTableEntry &table_entry, 
 }
 
 void LocalStorage::FinalizeAppend(LocalAppendState &state) {
-	state.storage->GetCollection().FinalizeAppend(state.append_state.transaction, state.append_state);
+	state.storage->GetPrimaryCollection().FinalizeAppend(state.append_state.transaction, state.append_state);
 }
 
 void LocalStorage::LocalMerge(DataTable &table, DuckTableEntry &table_entry, OptimisticWriteCollection &collection) {
 	auto &storage = table_manager.GetOrCreateStorage(context, table);
 	storage.table_entry = &table_entry;
+	if (storage.force_unsorted_on_commit) {
+		collection.ForceUnsorted(collection.collection->GetTotalRows());
+	}
 	if (!storage.append_indexes.Empty()) {
 		// append data to indexes if required
 		row_t base_id = MAX_ROW_ID + NumericCast<row_t>(storage.GetCollection().GetNextRowId());
@@ -552,6 +754,9 @@ idx_t LocalStorage::Delete(DataTable &table, DuckTableEntry &table_entry, Vector
 	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	idx_t delete_count = storage->GetCollection().Delete(TransactionData(0, 0), table_entry, ids, count);
 	storage->deleted_rows += delete_count;
+	if (delete_count > 0) {
+		storage->ForceUnsortedOnCommit();
+	}
 	return delete_count;
 }
 
@@ -563,6 +768,7 @@ void LocalStorage::Update(DataTable &table, DuckTableEntry &table_entry, Vector 
 
 	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	storage->GetCollection().Update(TransactionData(0, 0), table_entry, ids, column_ids, updates);
+	storage->ForceUnsortedOnCommit();
 }
 
 void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_ptr<StorageCommitState> commit_state) {
@@ -581,6 +787,12 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 
 	TableAppendState append_state;
 	table.AppendLock(transaction, append_state);
+	auto append_start = append_state.row_start;
+	if (storage.force_unsorted_on_commit) {
+		storage.VerifyUnsortedOnCommit();
+	} else {
+		storage.GetPrimaryCollection().VerifyAppendSpans(storage.GetCollection().GetTotalRows());
+	}
 	if ((append_state.row_start == 0 || storage.GetCollection().GetTotalRows() >= row_group_size) &&
 	    storage.deleted_rows == 0) {
 		// table is currently empty OR we are bulk appending: move over the storage directly
@@ -602,7 +814,7 @@ void LocalStorage::Flush(DataTable &table, LocalTableStorage &storage, optional_
 	}
 	// table_entry is set through the append path (InitializeAppend/Append/LocalMerge/Alter)
 	D_ASSERT(storage.table_entry);
-	transaction.PushAppend(*storage.table_entry, NumericCast<idx_t>(append_state.row_start), append_count);
+	transaction.PushAppend(*storage.table_entry, NumericCast<idx_t>(append_start), append_count);
 
 #ifdef DEBUG
 	// Verify that our index memory is stable.
@@ -618,6 +830,10 @@ void LocalStorage::Commit(optional_ptr<StorageCommitState> commit_state) {
 	for (auto &entry : table_storage) {
 		auto table = entry.first;
 		auto storage = entry.second.get();
+		if (!storage) {
+			continue;
+		}
+		storage->FinalizeAlterCleanup();
 		Flush(table, *storage, commit_state);
 		entry.second.reset();
 	}
@@ -672,37 +888,62 @@ void LocalStorage::MoveStorage(DataTable &old_dt, DataTable &new_dt) {
 	table_manager.InsertEntry(new_dt, std::move(new_storage));
 }
 
-void LocalStorage::AddColumn(DataTable &old_dt, DataTable &new_dt, ColumnDefinition &new_column,
-                             ExpressionExecutor &default_executor) {
-	// check if there are any pending appends for the old version of the table
-	auto storage = table_manager.MoveEntry(old_dt);
-	if (!storage) {
-		return;
-	}
-	auto new_storage = make_shared_ptr<LocalTableStorage>(context, new_dt, *storage, new_column, default_executor);
-	table_manager.InsertEntry(new_dt, std::move(new_storage));
+unique_ptr<PendingLocalStorageAlter> LocalStorage::PrepareMoveStorage(DataTable &old_dt, DataTable &new_dt) {
+	auto result = make_uniq<PendingLocalStorageAlter>(*this, old_dt, new_dt, PendingLocalStorageAlterMode::REKEY_ONLY);
+	table_manager.PrepareMoveEntry(old_dt, new_dt);
+	result->active = true;
+	return result;
 }
 
-void LocalStorage::DropColumn(DataTable &old_dt, DataTable &new_dt, const idx_t drop_column_index) {
-	// check if there are any pending appends for the old version of the table
-	auto storage = table_manager.MoveEntry(old_dt);
-	if (!storage) {
-		return;
-	}
-	auto new_storage = make_shared_ptr<LocalTableStorage>(new_dt, *storage, drop_column_index);
-	table_manager.InsertEntry(new_dt, std::move(new_storage));
+void LocalStorage::PublishPreparedAlter(DataTable &old_dt, DataTable &new_dt, DuckTableEntry &new_entry,
+                                        PendingLocalStorageAlterMode mode,
+                                        shared_ptr<LocalTableStorage> &replacement_storage) noexcept {
+	table_manager.PublishMoveEntry(old_dt, new_dt, new_entry, mode, replacement_storage);
 }
 
-void LocalStorage::ChangeType(DataTable &old_dt, DataTable &new_dt, idx_t changed_idx, const LogicalType &target_type,
-                              const vector<StorageIndex> &bound_columns, Expression &cast_expr) {
-	// check if there are any pending appends for the old version of the table
-	auto storage = table_manager.MoveEntry(old_dt);
-	if (!storage) {
-		return;
+void LocalStorage::AbortPreparedAlter(DataTable &new_dt) noexcept {
+	table_manager.AbortMoveEntry(new_dt);
+}
+
+unique_ptr<PendingLocalStorageAlter> LocalStorage::PrepareAddColumn(DataTable &old_dt, DataTable &new_dt,
+                                                                    ColumnDefinition &new_column,
+                                                                    ExpressionExecutor &default_executor) {
+	auto result = make_uniq<PendingLocalStorageAlter>(*this, old_dt, new_dt, PendingLocalStorageAlterMode::REBUILT);
+	auto storage = table_manager.GetStorageShared(old_dt);
+	if (storage) {
+		result->replacement_storage =
+		    make_shared_ptr<LocalTableStorage>(context, new_dt, *storage, new_column, default_executor);
+		table_manager.PrepareMoveEntry(old_dt, new_dt);
 	}
-	auto new_storage = make_shared_ptr<LocalTableStorage>(context, new_dt, *storage, changed_idx, target_type,
-	                                                      bound_columns, cast_expr, transaction);
-	table_manager.InsertEntry(new_dt, std::move(new_storage));
+	result->active = true;
+	return result;
+}
+
+unique_ptr<PendingLocalStorageAlter> LocalStorage::PrepareDropColumn(DataTable &old_dt, DataTable &new_dt,
+                                                                     const idx_t drop_column_index) {
+	auto result = make_uniq<PendingLocalStorageAlter>(*this, old_dt, new_dt, PendingLocalStorageAlterMode::REBUILT);
+	auto storage = table_manager.GetStorageShared(old_dt);
+	if (storage) {
+		result->replacement_storage = make_shared_ptr<LocalTableStorage>(context, new_dt, *storage, drop_column_index);
+		table_manager.PrepareMoveEntry(old_dt, new_dt);
+	}
+	result->active = true;
+	return result;
+}
+
+unique_ptr<PendingLocalStorageAlter> LocalStorage::PrepareChangeType(DataTable &old_dt, DataTable &new_dt,
+                                                                     idx_t changed_idx, const LogicalType &target_type,
+                                                                     const vector<StorageIndex> &bound_columns,
+                                                                     Expression &cast_expr) {
+	auto result = make_uniq<PendingLocalStorageAlter>(*this, old_dt, new_dt, PendingLocalStorageAlterMode::REBUILT);
+	auto storage = table_manager.GetStorageShared(old_dt);
+	if (storage) {
+		result->replacement_storage = make_shared_ptr<LocalTableStorage>(
+		    context, new_dt, *storage, changed_idx, target_type, bound_columns, cast_expr, transaction);
+		table_manager.PrepareMoveEntry(old_dt, new_dt);
+	}
+	result->active = true;
+	return result;
 }
 
 void LocalStorage::FetchChunk(DataTable &table, const Vector &row_ids, idx_t count, const vector<StorageIndex> &col_ids,
@@ -729,6 +970,14 @@ TableIndexList &LocalStorage::GetIndexes(ClientContext &context, DataTable &tabl
 
 optional_ptr<LocalTableStorage> LocalStorage::GetStorage(DataTable &table) {
 	return table_manager.GetStorage(table);
+}
+
+vector<shared_ptr<LocalTableStorage>> LocalStorage::GetTableStorages() const {
+	return table_manager.GetStorages();
+}
+
+bool LocalStorage::HasReclusterTableStorage() const {
+	return table_manager.HasReclusterStorage();
 }
 
 void LocalStorage::VerifyNewConstraint(DataTable &parent, const BoundConstraint &constraint) {

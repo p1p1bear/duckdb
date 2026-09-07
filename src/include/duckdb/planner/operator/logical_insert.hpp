@@ -63,6 +63,8 @@ public:
 	TableIndex table_index;
 	//! if returning option is used, return actual chunk to projection
 	bool return_chunk;
+	//! Whether this INSERT may use direct sorting for a SORTED BY table
+	bool allow_direct_sort;
 	//! The default statements used by the table
 	vector<unique_ptr<Expression>> bound_defaults;
 	//! The constraints used by the table
