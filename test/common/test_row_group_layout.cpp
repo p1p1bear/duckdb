@@ -1159,6 +1159,51 @@ TEST_CASE("Sorted table appenders preserve flush boundaries", "[storage][row_gro
 	DeleteDatabase(path);
 }
 
+TEST_CASE("Sorted appenders read the global write setting at each flush", "[storage][row_group_layout]") {
+	auto path = TestCreatePath("sorted_appender_setting.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	Connection controller(db);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false; SET threads=1"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path +
+	                          "' AS appender_setting "
+	                          "(ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE appender_setting"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER) SORTED BY(i)"));
+	Appender appender(con, "target");
+	for (idx_t row = 0; row < 2048; row++) {
+		appender.AppendRow(NumericCast<int32_t>(2047 - row));
+	}
+	REQUIRE_NO_FAIL(controller.Query("SET enable_sorted_write=false"));
+	appender.Flush();
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 1);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
+	});
+	for (idx_t row = 0; row < 2048; row++) {
+		appender.AppendRow(NumericCast<int32_t>(4095 - row));
+	}
+	REQUIRE_NO_FAIL(controller.Query("SET enable_sorted_write=true"));
+	appender.Flush();
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("target")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 2);
+		REQUIRE(collection->GetRowGroup(0)->GetSortMetadata() == RowGroupSortMetadata());
+		REQUIRE(collection->GetRowGroup(1)->GetSortMetadata() == RowGroupSortMetadata {1, 1});
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 2);
+	});
+	appender.Close();
+	auto rows = con.Query("SELECT count(*), sum(i) FROM target");
+	REQUIRE(CHECK_COLUMN(rows, 0, {4096}));
+	REQUIRE(CHECK_COLUMN(rows, 1, {8386560}));
+	DeleteDatabase(path);
+}
+
 TEST_CASE("Concurrent sorted inserts publish independent mergeable runs", "[storage][row_group_layout]") {
 	auto path = TestCreatePath("concurrent_sorted_insert.db");
 	DeleteDatabase(path);

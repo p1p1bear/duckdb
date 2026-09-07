@@ -1097,6 +1097,17 @@ struct EnableProgressBarPrintSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct EnableSortedWriteSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_sorted_write";
+	static constexpr const char *Description = "Sort sufficiently large writes to SORTED BY tables before inserting; "
+	                                           "disable to leave new rows for reclustering";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableViewDependenciesSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_view_dependencies";

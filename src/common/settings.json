@@ -712,6 +712,13 @@
         "custom_implementation": true
     },
     {
+        "name": "enable_sorted_write",
+        "description": "Sort sufficiently large writes to SORTED BY tables before inserting; disable to leave new rows for reclustering",
+        "type": "BOOLEAN",
+        "scope": "global",
+        "default_value": "true"
+    },
+    {
         "name": "enable_view_dependencies",
         "description": "Enable created VIEWs to create dependencies on the referenced objects (such as tables)",
         "type": "BOOLEAN",

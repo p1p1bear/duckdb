@@ -299,6 +299,39 @@ TEST_CASE("Successful checkpoints schedule automatic recluster work", "[storage]
 	DeleteDatabase(path);
 }
 
+TEST_CASE("Disabled sorted writes are organized by automatic reclustering", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_background_only.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4; SET auto_recluster=false; SET enable_sorted_write=false"));
+	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true; SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path +
+	                          "' AS background_only "
+	                          "(ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE background_only"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE tbl(i BIGINT) SORTED BY(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT 4095-i FROM range(4096) t(i)"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		REQUIRE(entry.GetStorage().GetDataTableInfo()->GetSortStorage()->next_run_id.load() == 1);
+	});
+
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl VALUES (-1)"));
+	GetReclusterManager(con, "tbl").WaitForAutoRecluster();
+	auto status = con.Query("SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() "
+	                        "WHERE table_name='tbl'");
+	REQUIRE(CHECK_COLUMN(status, 0, {1}));
+	REQUIRE(CHECK_COLUMN(status, 1, {0}));
+	auto rows = con.Query("SELECT count(*), sum(i) FROM tbl");
+	REQUIRE(CHECK_COLUMN(rows, 0, {4097}));
+	REQUIRE(CHECK_COLUMN(rows, 1, {8386559}));
+	auto inversions = con.Query("SELECT count(*) FROM (SELECT i, lag(i) OVER () previous FROM tbl) WHERE i<previous");
+	REQUIRE(CHECK_COLUMN(inversions, 0, {0}));
+	DeleteDatabase(path);
+}
+
 TEST_CASE("Maintenance commits chain bounded automatic conversion tasks", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_task_chain.db");
 	DeleteDatabase(path);

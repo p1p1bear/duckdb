@@ -1,5 +1,5 @@
 # name: benchmark/micro/order/sorted_write_recluster.benchmark
-# description: Explicitly recluster one historical persistent table range
+# description: Recluster persistent rows written with direct sorting disabled
 # group: [order]
 
 name SORTED BY Explicit Recluster
@@ -11,6 +11,7 @@ require_reinit
 load
 SET debug_skip_checkpoint_on_commit=true;
 SET auto_recluster=false;
+SET enable_sorted_write=false;
 CREATE TABLE source AS
 SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
        ((i * 97) % 10000)::INTEGER AS tenant_id,
@@ -21,9 +22,7 @@ SELECT ((i * 15485863) % 10000000)::BIGINT AS event_id,
        ((i * 31) % 1024)::SMALLINT AS region,
        lpad(to_hex(i), 16, '0') || repeat('x', 48) AS payload
 FROM range(10000000) t(i);
-CREATE TABLE events AS FROM source;
-CHECKPOINT;
-ALTER TABLE events SET SORTED BY (tenant_id, event_time, event_id);
+CREATE TABLE events SORTED BY (tenant_id, event_time, event_id) AS FROM source;
 CHECKPOINT;
 
 run
@@ -32,7 +31,5 @@ CALL recluster('main.events', max_bytes='16GB', max_tasks=4)
 cleanup
 CHECKPOINT;
 DROP TABLE events;
-CREATE TABLE events AS FROM source;
-CHECKPOINT;
-ALTER TABLE events SET SORTED BY (tenant_id, event_time, event_id);
+CREATE TABLE events SORTED BY (tenant_id, event_time, event_id) AS FROM source;
 CHECKPOINT;

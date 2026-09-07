@@ -9,6 +9,7 @@
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -127,7 +128,7 @@ unique_ptr<GlobalSinkState> PhysicalInsert::GetGlobalSinkState(ClientContext &co
 	if (action_type == OnConflictAction::UPDATE || update_is_del_and_insert) {
 		table->VerifyUpdateAllowed();
 	}
-	if (table->SortEnabled() && allow_direct_sort) {
+	if (table->SortEnabled() && allow_direct_sort && Settings::Get<EnableSortedWriteSetting>(context)) {
 		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
 	}
 	return std::move(result);

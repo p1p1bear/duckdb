@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/operator/persistent/batch_memory_manager.hpp"
 #include "duckdb/execution/operator/persistent/batch_task_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/append_state.hpp"
@@ -453,7 +454,7 @@ unique_ptr<GlobalSinkState> PhysicalBatchInsert::GetGlobalSinkState(ClientContex
 	static constexpr const idx_t MINIMUM_MEMORY_PER_COLUMN = 4ULL * 1024ULL * 1024ULL;
 	auto minimum_memory_per_thread = table->GetColumns().PhysicalColumnCount() * MINIMUM_MEMORY_PER_COLUMN;
 	auto result = make_uniq<BatchInsertGlobalState>(context, *table, minimum_memory_per_thread);
-	if (table->SortEnabled() && allow_direct_sort) {
+	if (table->SortEnabled() && allow_direct_sort && Settings::Get<EnableSortedWriteSetting>(context)) {
 		result->adaptive_sort = make_uniq<AdaptiveSortedWrite>(*table, insert_types, bound_constraints);
 	}
 	return std::move(result);
