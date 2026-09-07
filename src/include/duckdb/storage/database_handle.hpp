@@ -36,6 +36,7 @@ struct DatabaseHandle {
 	void Truncate(idx_t new_size);
 	void Trim(idx_t offset, idx_t length);
 
+	idx_t GetFileSize() const;
 	FileHandle &GetFileHandle();
 
 private:

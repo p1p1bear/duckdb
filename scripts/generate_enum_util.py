@@ -55,6 +55,19 @@ blacklist = [
     "SourceFinishNotificationState",
     "WatermarkState",
     "WriterWakeMode",
+    "AdaptiveInsertPhase",
+    "DeleteSlotState",
+    "HeldDDLCoordinationState",
+    "HeldTableGateMode",
+    "Kind",
+    "PendingLocalStorageAlterMode",
+    "RangeTaskState",
+    "ReclusterCandidateSelectionStatus",
+    "ReclusterCandidateType",
+    "ReclusterCommitLifecycle",
+    "ReclusterDeleteTransactionState",
+    "ReclusterTaskFinalizeStatus",
+    "ReclusterTaskStartStatus",
 ]
 
 enum_util_header_file = os.path.join("..", "src", "include", "duckdb", "common", "enum_util.hpp")

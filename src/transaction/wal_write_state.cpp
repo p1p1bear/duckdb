@@ -13,6 +13,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
 #include "duckdb/storage/table/chunk_info.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -291,6 +292,11 @@ void WALWriteState::CommitEntry(UndoFlags type, data_ptr_t data) {
 		if (!info->segment->column_data.GetTableInfo().IsTemporary()) {
 			WriteUpdate(*info);
 		}
+		break;
+	}
+	case UndoFlags::RECLUSTER: {
+		auto recluster = reinterpret_cast<ReclusterUndoData *>(data);
+		recluster->info->WriteToWAL(log);
 		break;
 	}
 	case UndoFlags::ATTACHED_DATABASE:
