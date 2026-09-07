@@ -252,8 +252,12 @@ extension binaries from a different source ID are rejected.
 ```sh
 make reldebug
 build/reldebug/test/unittest
-build/reldebug/test/run --workers=4 '*'
+build/reldebug/test/run --workers=4 --test-flags='--max-threads 8' '*'
 ```
+
+The test flag sets the default DuckDB thread count for SQL test databases. CPU
+affinity alone does not change that count; on large hosts the default can exceed
+the parallelism assumed by tests with deliberately small memory limits.
 
 Targeted entry points include `sorted_write_setting.test`, `adaptive_sorted_write.test`,
 `recluster_explicit.test`, `recluster_run_gaps.test`, and C++ tags
