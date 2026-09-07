@@ -95,6 +95,21 @@ TEST_CASE("Replacement manifest v1 round-trips its recovery contract", "[storage
 	REQUIRE(loaded.checksum == manifest.checksum);
 }
 
+TEST_CASE("Replacement manifest preserves row ID gaps in its input", "[storage][replacement_manifest]") {
+	auto manifest = CreateManifest();
+	manifest.old_groups[0] = ManifestOldGroup(2048, 1024, 20);
+	manifest.Seal();
+	MemoryStream stream;
+	manifest.Write(stream);
+	stream.SetPosition(0);
+	auto loaded = ReplacementManifest::Read(stream);
+	REQUIRE(loaded.old_groups == manifest.old_groups);
+	REQUIRE(loaded.replacement_groups.size() == 2);
+
+	manifest.replacement_groups[1].tuple_count = 2048;
+	REQUIRE_THROWS_AS(manifest.Seal(), SerializationException);
+}
+
 TEST_CASE("Replacement manifest rejects corrupt or inconsistent state", "[storage][replacement_manifest]") {
 	auto manifest = CreateManifest();
 	MemoryStream stream;
@@ -121,7 +136,7 @@ TEST_CASE("Replacement manifest rejects corrupt or inconsistent state", "[storag
 	REQUIRE_THROWS_AS(invalid.Seal(), SerializationException);
 
 	invalid = CreateManifest();
-	invalid.old_groups[0] = ManifestOldGroup(2048, 1024, 20);
+	invalid.old_groups[0] = ManifestOldGroup(2048, 3072, 20);
 	REQUIRE_THROWS_AS(invalid.Seal(), SerializationException);
 
 	auto invalid_metadata_pointer = (idx_t(MetadataManager::METADATA_BLOCK_COUNT) << 56ULL) | 30;

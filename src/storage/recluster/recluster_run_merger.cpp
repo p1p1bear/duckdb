@@ -83,8 +83,8 @@ void ReclusterRunMerger::BuildRunStates() {
 			active_metadata = identity.sort_metadata;
 			active_range = {identity.start, identity_end};
 		} else {
-			if (identity.start != active_range.end) {
-				throw InternalException("Recluster sorted run contains a physical row ID gap");
+			if (identity.start < active_range.end) {
+				throw InternalException("Recluster sorted run contains overlapping row groups");
 			}
 			active_range.end = identity_end;
 		}

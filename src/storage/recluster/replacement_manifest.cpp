@@ -195,13 +195,15 @@ void ReplacementManifest::Validate() const {
 	}
 
 	auto old_end = header.input_range.start;
+	idx_t old_row_count = 0;
 	for (auto &old_group : old_groups) {
 		ValidateIdentity(old_group, physical_columns);
-		if (old_group.start != old_end || old_group.start >= header.input_range.end ||
+		if (old_group.start < old_end || old_group.start >= header.input_range.end ||
 		    old_group.count > NumericCast<idx_t>(header.input_range.end - old_group.start)) {
-			throw SerializationException("Replacement manifest old row groups are not contiguous or are out of order");
+			throw SerializationException("Replacement manifest old row groups overlap or are out of order");
 		}
 		old_end = old_group.start + NumericCast<row_t>(old_group.count);
+		old_row_count += old_group.count;
 	}
 	if (old_groups.front().start != header.input_range.start || old_end != header.input_range.end) {
 		throw SerializationException("Replacement manifest old row groups do not cover its input range endpoints");
@@ -232,6 +234,9 @@ void ReplacementManifest::Validate() const {
 	}
 	if (replacement_end > range_end) {
 		throw SerializationException("Replacement manifest row IDs exceed its input range");
+	}
+	if (replacement_end - NumericCast<uint64_t>(header.input_range.start) > old_row_count) {
+		throw SerializationException("Replacement manifest contains more rows than its input row groups");
 	}
 	if (replacement_groups.empty() && !all_referenced_blocks.empty()) {
 		throw SerializationException("Empty replacement manifest references unused blocks");
