@@ -65,7 +65,7 @@ void InMemoryCheckpointer::WriteTable(TableCatalogEntry &table, Serializer &seri
 
 	// Write the table data
 	auto table_lock = table.GetStorage().GetCheckpointLock();
-	table.GetStorage().Checkpoint(data_writer, serializer);
+	table.GetStorage().Checkpoint(data_writer, serializer, *table_lock);
 	// flush any partial blocks BEFORE releasing the table lock
 	// flushing partial blocks updates where data lives and is not thread-safe
 	partial_block_manager.FlushPartialBlocks();
@@ -103,7 +103,8 @@ void InMemoryTableDataWriter::WriteUnchangedTable(MetaBlockPointer pointer,
 }
 
 void InMemoryTableDataWriter::FinalizeTable(const TableStatistics &global_stats, DataTableInfo &info,
-                                            RowGroupCollection &collection, Serializer &serializer) {
+                                            RowGroupCollection &collection, Serializer &serializer,
+                                            const StorageLockKey &checkpoint_lock) {
 	// nop: no need to write anything
 }
 

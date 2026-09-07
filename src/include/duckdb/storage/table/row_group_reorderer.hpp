@@ -16,6 +16,8 @@
 
 namespace duckdb {
 
+struct RowGroupCollectionSnapshot;
+
 struct OffsetPruningResult {
 	idx_t offset_remainder;
 	idx_t pruned_row_group_count;
@@ -26,6 +28,7 @@ class RowGroupReorderer {
 public:
 	RowGroupReorderer(const RowGroupOrderOptions &options_p, TransactionData transaction_p);
 	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(RowGroupSegmentTree &row_groups);
+	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(const RowGroupCollectionSnapshot &snapshot);
 	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentNode<RowGroup> &row_group);
 
 	static Value RetrieveStat(const BaseStatistics &stats, OrderByStatistics order_by, OrderByColumnType column_type);
@@ -35,11 +38,14 @@ public:
 	                                                 vector<PartitionStatistics> &stats);
 
 private:
+	optional_ptr<SegmentNode<RowGroup>> Initialize(vector<reference<SegmentNode<RowGroup>>> row_groups);
+
 	const RowGroupOrderOptions options;
 	const TransactionData transaction;
 
 	idx_t offset;
 	bool initialized;
+	vector<unique_ptr<SegmentNode<RowGroup>>> layout_row_groups;
 	vector<reference<SegmentNode<RowGroup>>> ordered_row_groups;
 };
 

@@ -21,6 +21,7 @@
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
@@ -36,6 +37,26 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
+
+shared_ptr<ColumnDropOwnershipBundle> RowGroup::InitializeColumnDropOwnership(ColumnData &column) {
+	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
+	auto bundle = make_shared_ptr<ColumnDropOwnershipBundle>();
+	vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
+	bundle->Initialize(std::move(runtime_tree.shape), canonical_tokens);
+	if (!runtime_tree.ApplyTokenPlan(canonical_tokens)) {
+		throw InternalException("Failed to initialize column drop ownership tokens");
+	}
+	return bundle;
+}
+
+void RowGroup::BindColumnDropOwnership(ColumnData &column, ColumnDropOwnershipBundle &bundle) {
+	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
+	vector<shared_ptr<RowGroupColumnDropOwnership>> canonical_tokens(runtime_tree.nodes.size());
+	if (bundle.Bind(std::move(runtime_tree.shape), canonical_tokens) == ColumnDropOwnershipBindResult::MISMATCH ||
+	    !runtime_tree.ApplyTokenPlan(canonical_tokens)) {
+		throw InternalException("Loaded column does not match its drop ownership bundle");
+	}
+}
 
 RowGroup::RowGroup(RowGroupCollection &collection_p, idx_t count)
     : SegmentBase<RowGroup>(count), collection(collection_p), version_info(nullptr), deletes_is_loaded(false),
@@ -53,6 +74,7 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, RowGroupPointer pointer)
 	}
 	this->column_pointers = std::move(pointer.data_pointers);
 	this->columns.resize(column_pointers.size());
+	this->column_drop_ownership_bundles.resize(columns.size());
 	this->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[columns.size()]);
 	for (idx_t c = 0; c < columns.size(); c++) {
 		this->is_loaded[c] = false;
@@ -62,6 +84,11 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, RowGroupPointer pointer)
 	this->extra_metadata_blocks = std::move(pointer.extra_metadata_blocks);
 	this->has_per_column_metadata_blocks = pointer.has_per_column_metadata_blocks;
 	this->per_column_metadata_blocks = std::move(pointer.per_column_metadata_blocks);
+	if (!pointer.sort_metadata.IsValid()) {
+		throw DataCorruptionException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
+	this->sort_metadata = pointer.sort_metadata;
+	this->sealed = sort_metadata.IsSorted();
 
 	Verify();
 }
@@ -73,6 +100,7 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, PersistentRowGroupData &dat
 	auto &info = GetTableInfo();
 	auto &types = collection.get().GetTypes();
 	columns.reserve(types.size());
+	column_drop_ownership_bundles.resize(types.size());
 	for (idx_t c = 0; c < types.size(); c++) {
 		auto entry = ColumnData::CreateColumn(block_manager, info, c, types[c]);
 		entry->InitializeColumn(data.column_data[c]);
@@ -178,6 +206,39 @@ ColumnData &RowGroup::GetRawColumnData(storage_t c) const {
 	return GetColumn(c);
 }
 
+bool RowGroup::HasColumnDropOwnershipBundle(idx_t column_index) const {
+	if (column_index >= column_drop_ownership_bundles.size()) {
+		throw InternalException("Column drop ownership bundle index is out of range");
+	}
+	lock_guard<mutex> guard(row_group_lock);
+	return column_drop_ownership_bundles[column_index] != nullptr;
+}
+
+const shared_ptr<ColumnDropOwnershipBundle> &
+RowGroup::GetOrCreateColumnDropOwnershipBundleLocked(idx_t column_index) const {
+	if (column_index >= column_drop_ownership_bundles.size()) {
+		throw InternalException("Column drop ownership bundle index is out of range");
+	}
+	auto &bundle = column_drop_ownership_bundles[column_index];
+	if (bundle) {
+		return bundle;
+	}
+	if (ColumnIsLoaded(column_index)) {
+		if (!columns[column_index]) {
+			throw InternalException("Loaded column is missing its column data");
+		}
+		bundle = InitializeColumnDropOwnership(*columns[column_index]);
+	} else {
+		bundle = make_shared_ptr<ColumnDropOwnershipBundle>();
+	}
+	return bundle;
+}
+
+const shared_ptr<ColumnDropOwnershipBundle> &RowGroup::GetColumnDropOwnershipBundle(idx_t column_index) const {
+	lock_guard<mutex> guard(row_group_lock);
+	return GetOrCreateColumnDropOwnershipBundleLocked(column_index);
+}
+
 void RowGroup::LoadColumn(storage_t c) const {
 	if (c == COLUMN_IDENTIFIER_ROW_ID) {
 		LoadRowIdColumnData();
@@ -211,13 +272,17 @@ void RowGroup::LoadColumn(storage_t c) const {
 	auto &types = GetCollection().GetTypes();
 	auto &block_pointer = column_pointers[c];
 	MetadataReader column_data_reader(metadata_manager, block_pointer);
-	this->columns[c] = ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), c, column_data_reader, types[c]);
-	is_loaded[c] = true;
-	if (this->columns[c]->count != this->count) {
+	auto loaded_column = ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), c, column_data_reader, types[c]);
+	if (loaded_column->count != this->count) {
 		throw InternalException("Corrupted database - loaded column with index %llu, count %llu did "
 		                        "not match count of row group %llu",
-		                        c, this->columns[c]->count.load(), this->count.load());
+		                        c, loaded_column->count.load(), this->count.load());
 	}
+	if (column_drop_ownership_bundles[c]) {
+		BindColumnDropOwnership(*loaded_column, *column_drop_ownership_bundles[c]);
+	}
+	this->columns[c] = std::move(loaded_column);
+	is_loaded[c] = true;
 }
 
 void RowGroup::UnloadColumn(storage_t c) {
@@ -249,6 +314,9 @@ DataTableInfo &RowGroup::GetTableInfo() const {
 void RowGroup::InitializeEmpty(const vector<LogicalType> &types, ColumnDataType data_type) {
 	// set up the segment trees for the column segments
 	D_ASSERT(columns.empty());
+	D_ASSERT(column_drop_ownership_bundles.empty());
+	columns.reserve(types.size());
+	column_drop_ownership_bundles.resize(types.size());
 	for (idx_t i = 0; i < types.size(); i++) {
 		auto column_data = ColumnData::CreateColumn(GetBlockManager(), GetTableInfo(), i, types[i], data_type);
 		columns.push_back(std::move(column_data));
@@ -437,6 +505,7 @@ unique_ptr<RowGroup> RowGroup::CreateNewRowGroupCopy(RowGroupCollection &new_col
 	row_group->owned_version_info = owned_version_info;
 	row_group->version_info = version_info.load();
 	row_group->columns.resize(new_column_count);
+	row_group->column_drop_ownership_bundles.resize(new_column_count);
 	if (is_loaded) {
 		row_group->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[new_column_count]);
 	}
@@ -444,6 +513,8 @@ unique_ptr<RowGroup> RowGroup::CreateNewRowGroupCopy(RowGroupCollection &new_col
 		row_group->column_pointers.resize(new_column_count);
 	}
 	row_group->has_per_column_metadata_blocks = has_per_column_metadata_blocks;
+	row_group->sort_metadata = sort_metadata;
+	row_group->sealed = sealed;
 	row_group->has_changes = true;
 	return row_group;
 }
@@ -503,6 +574,7 @@ unique_ptr<RowGroup> RowGroup::AlterType(RowGroupCollection &new_collection, con
 			column_data.reset();
 		} else {
 			row_group->columns[i] = columns[i];
+			row_group->column_drop_ownership_bundles[i] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 			if (row_group->is_loaded) {
 				row_group->is_loaded[i] = is_loaded[i].load();
 			}
@@ -558,6 +630,7 @@ unique_ptr<RowGroup> RowGroup::AddColumn(RowGroupCollection &new_collection, Col
 	// copy existing columns
 	for (idx_t i = 0; i < columns.size(); i++) {
 		row_group->columns[i] = columns[i];
+		row_group->column_drop_ownership_bundles[i] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 		if (row_group->is_loaded) {
 			row_group->is_loaded[i] = is_loaded[i].load();
 		}
@@ -597,6 +670,7 @@ unique_ptr<RowGroup> RowGroup::RemoveColumn(RowGroupCollection &new_collection, 
 			continue;
 		}
 		row_group->columns[target_idx] = columns[i];
+		row_group->column_drop_ownership_bundles[target_idx] = GetOrCreateColumnDropOwnershipBundleLocked(i);
 		if (row_group->is_loaded) {
 			row_group->is_loaded[target_idx] = is_loaded[i].load();
 		}
@@ -622,21 +696,28 @@ void RowGroup::CommitDrop(CommitDropState &drop_state) {
 	}
 }
 
-struct BlockIdDropper : public BlockIdVisitor {
-	explicit BlockIdDropper(CommitDropState &drop_state) : drop_state(drop_state) {
-	}
-
+struct BlockIdCollector : public BlockIdVisitor {
 	void Visit(block_id_t block_id) override {
-		drop_state.DropBlock(block_id);
+		block_ids.push_back(block_id);
 	}
 
-	CommitDropState &drop_state;
+	vector<block_id_t> block_ids;
 };
 
 void RowGroup::CommitDropColumn(const idx_t column_index, CommitDropState &drop_state) {
+	GetColumnDropOwnershipBundle(column_index);
 	auto &column = GetColumn(column_index);
-	BlockIdDropper dropper(drop_state);
-	column.VisitBlockIds(dropper);
+	auto runtime_tree = CaptureColumnDropOwnershipRuntimeTree(column);
+	for (auto &node_ref : runtime_tree.nodes) {
+		auto &node = node_ref.get();
+		auto ownership = node.GetDropOwnershipToken();
+		if (!ownership) {
+			throw InternalException("Cannot drop a column without initialized block ownership");
+		}
+		BlockIdCollector collector;
+		node.VisitDirectBlockIds(collector);
+		drop_state.DropColumnOwnership(std::move(ownership), std::move(collector.block_ids));
+	}
 }
 
 void RowGroup::CommitDrop() {
@@ -1211,6 +1292,9 @@ void RowGroup::InitializeAppendInternal(RowGroupAppendState &append_state) {
 	if (!RefersToSameObject(append_state.row_group->GetNode(), *this)) {
 		throw InternalException("RowGroup::InitializeAppend mismatch - call RowGroupAppendState::InitializeAppend");
 	}
+	if (sealed) {
+		throw InternalException("Cannot append to a sealed row group");
+	}
 	append_state.offset_in_row_group = this->count;
 	// for each column, initialize the append state
 	append_state.states = make_unsafe_uniq_array<ColumnAppendState>(GetColumnCount());
@@ -1223,6 +1307,9 @@ void RowGroup::InitializeAppendInternal(RowGroupAppendState &append_state) {
 }
 
 void RowGroup::Append(RowGroupAppendState &state, DataChunk &chunk, idx_t append_count) {
+	if (sealed) {
+		throw InternalException("Cannot append to a sealed row group");
+	}
 	// append to the current row_group
 	D_ASSERT(chunk.ColumnCount() == GetColumnCount());
 	for (idx_t i = 0; i < GetColumnCount(); i++) {
@@ -1362,12 +1449,19 @@ CompressionType ColumnCheckpointInfo::GetCompressionType() {
 }
 
 shared_ptr<ColumnData> RowGroup::CheckpointColumn(const RowGroup &row_group, idx_t column_idx, RowGroupWriteInfo &info,
-                                                  RowGroupWriteData &write_data) {
+                                                  RowGroupWriteData &write_data,
+                                                  shared_ptr<ColumnDropOwnershipBundle> &result_bundle) {
 	auto &column = row_group.GetColumn(column_idx);
+	auto source_bundle = row_group.GetColumnDropOwnershipBundle(column_idx);
 	ColumnCheckpointInfo checkpoint_info(info, column_idx);
 	auto checkpoint_state = column.Checkpoint(row_group, checkpoint_info);
 
 	auto result_col = checkpoint_state->GetFinalResult();
+	if (result_col.get() == &column) {
+		result_bundle = std::move(source_bundle);
+	} else {
+		result_bundle = InitializeColumnDropOwnership(*result_col);
+	}
 	// FIXME: we should get rid of the checkpoint state statistics - and instead use the stats in the ColumnData
 	// directly
 	auto stats = checkpoint_state->GetStatistics();
@@ -1407,12 +1501,16 @@ vector<RowGroupWriteData> RowGroup::WriteToDisk(RowGroupWriteInfo &info,
 	// first sequentially, and the pointers are written later, so that the
 	// pointers all end up densely packed, and thus more cache-friendly.
 	vector<vector<shared_ptr<ColumnData>>> result_columns;
+	vector<vector<shared_ptr<ColumnDropOwnershipBundle>>> result_bundles;
 	result_columns.resize(row_groups.size());
+	result_bundles.resize(row_groups.size());
 	for (idx_t column_idx = 0; column_idx < column_count; column_idx++) {
 		for (idx_t row_group_idx = 0; row_group_idx < row_groups.size(); row_group_idx++) {
 			auto &row_group = row_groups[row_group_idx].get();
+			shared_ptr<ColumnDropOwnershipBundle> result_bundle;
 			result_columns[row_group_idx].emplace_back(
-			    CheckpointColumn(row_group, column_idx, info, result[row_group_idx]));
+			    CheckpointColumn(row_group, column_idx, info, result[row_group_idx], result_bundle));
+			result_bundles[row_group_idx].push_back(std::move(result_bundle));
 		}
 	}
 
@@ -1422,8 +1520,11 @@ vector<RowGroupWriteData> RowGroup::WriteToDisk(RowGroupWriteInfo &info,
 		auto &row_group = row_groups[row_group_idx].get();
 		auto result_row_group = make_shared_ptr<RowGroup>(row_group.GetCollection(), row_group.count);
 		result_row_group->columns = std::move(result_columns[row_group_idx]);
+		result_row_group->column_drop_ownership_bundles = std::move(result_bundles[row_group_idx]);
 		result_row_group->version_info = row_group.version_info.load();
 		result_row_group->owned_version_info = row_group.owned_version_info;
+		result_row_group->sort_metadata = row_group.sort_metadata;
+		result_row_group->sealed = row_group.sealed;
 
 		row_group_write_data.result_row_group = std::move(result_row_group);
 	}
@@ -1510,6 +1611,14 @@ vector<MetaBlockPointer> RowGroup::GetExtraMetadataBlockPointers() const {
 	return extra_metadata_block_pointers;
 }
 
+vector<MetaBlockPointer> RowGroup::GetLoadedDeleteStoragePointers() const {
+	auto version_info = GetVersionInfoIfLoaded();
+	if (!version_info) {
+		return {};
+	}
+	return version_info->GetStoragePointersForRetention();
+}
+
 bool RowGroup::CanReuseMetadata(RowGroupWriter &writer) const {
 	if (!Settings::Get<ExperimentalMetadataReuseSetting>(writer.GetDatabase())) {
 		// disabled by configuration
@@ -1586,11 +1695,14 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 
 	auto result_row_group = make_shared_ptr<RowGroup>(GetCollection(), this->count);
 	result_row_group->columns.resize(GetColumnCount());
+	result_row_group->column_drop_ownership_bundles.resize(GetColumnCount());
 	result_row_group->column_pointers.resize(GetColumnCount());
 	result_row_group->deletes_pointers = deletes_pointers;
 	result_row_group->deletes_is_loaded = deletes_is_loaded.load();
 	result_row_group->owned_version_info = owned_version_info;
 	result_row_group->version_info = version_info.load();
+	result_row_group->sort_metadata = sort_metadata;
+	result_row_group->sealed = sealed;
 	if (is_loaded) {
 		result_row_group->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[GetColumnCount()]);
 		for (idx_t c = 0; c < GetColumnCount(); c++) {
@@ -1629,6 +1741,7 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 				                                ? std::move(*col_stats)
 				                                : BaseStatistics::CreateEmpty(GetCollection().GetTypes()[column_idx]));
 			}
+			result_row_group->column_drop_ownership_bundles[column_idx] = GetColumnDropOwnershipBundle(column_idx);
 		} else {
 			// checkpoint this column
 			auto &column = GetColumn(column_idx);
@@ -1637,11 +1750,12 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 				                        "(row group has %llu rows, column has %llu)",
 				                        column_idx, this->count.load(), column.count.load());
 			}
-			result_row_group->columns[column_idx] = CheckpointColumn(*this, column_idx, info, result);
+			result_row_group->columns[column_idx] = CheckpointColumn(
+			    *this, column_idx, info, result, result_row_group->column_drop_ownership_bundles[column_idx]);
 		}
 	}
 
-	if (partial_reuse) {
+	if (!reused_columns.empty()) {
 		// carry forward the extras for reused columns onto the new row group, so RowGroup::Checkpoint
 		// can look them up via this->per_column_metadata_blocks
 		auto extras = per_column_metadata_blocks.GetBlocksForColumns(reused_columns);
@@ -1676,6 +1790,7 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 	// construct the row group pointer and write the column meta data to disk
 	row_group_pointer.row_start = row_group_start;
 	row_group_pointer.tuple_count = count;
+	row_group_pointer.sort_metadata = sort_metadata;
 	if (write_data.write_action == RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
 		// we are re-using the previous metadata
 		row_group_pointer.data_pointers = column_pointers;
@@ -1856,8 +1971,11 @@ bool RowGroup::HasChanges() const {
 }
 
 bool RowGroup::IsPersistent() const {
-	for (auto &column : columns) {
-		if (!column->IsPersistent()) {
+	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+		if (!ColumnIsLoaded(column_index)) {
+			continue;
+		}
+		if (!columns[column_index]->IsPersistent()) {
 			// column is not persistent
 			return false;
 		}
@@ -1874,6 +1992,33 @@ PersistentRowGroupData RowGroup::SerializeRowGroupInfo(idx_t row_group_start) co
 	result.start = row_group_start;
 	result.count = count;
 	return result;
+}
+
+void RowGroup::SetPersistentMetadataPointers(const RowGroupPointer &pointer) {
+	if (pointer.tuple_count != count || pointer.data_pointers.size() != columns.size() ||
+	    pointer.sort_metadata != sort_metadata || !IsPersistent()) {
+		throw InternalException("Cannot install mismatched persistent row group metadata pointers");
+	}
+
+	lock_guard<mutex> guard(row_group_lock);
+	column_pointers = pointer.data_pointers;
+	deletes_pointers = pointer.deletes_pointers;
+	has_metadata_blocks = pointer.has_metadata_blocks;
+	extra_metadata_blocks = pointer.extra_metadata_blocks;
+	has_per_column_metadata_blocks = pointer.has_per_column_metadata_blocks;
+	per_column_metadata_blocks = pointer.per_column_metadata_blocks;
+	if (!is_loaded) {
+		is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[columns.size()]);
+	}
+	for (idx_t column_index = 0; column_index < columns.size(); column_index++) {
+		is_loaded[column_index] = false;
+		columns[column_index].reset();
+	}
+	allocation_size = 0;
+	row_id_column_data.reset();
+	row_id_is_loaded = false;
+	row_number_column_data.reset();
+	row_number_is_loaded = false;
 }
 
 void RowGroup::CompressVersionInfo(transaction_t lowest_active_start) {
@@ -1904,7 +2049,10 @@ vector<MetaBlockPointer> RowGroup::CheckpointDeletes(RowGroupWriter &writer) {
 	return vinfo->Checkpoint(writer);
 }
 
-void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes) {
+void RowGroup::Serialize(const RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes) {
+	if (!pointer.sort_metadata.IsValid()) {
+		throw SerializationException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
 	serializer.WriteProperty(100, "row_start", pointer.row_start);
 	serializer.WriteProperty(101, "tuple_count", pointer.tuple_count);
 	serializer.WriteProperty(102, "data_pointers", pointer.data_pointers);
@@ -1924,6 +2072,10 @@ void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer, bool 
 		serializer.WriteProperty(106, "has_per_column_metadata_blocks", pointer.has_per_column_metadata_blocks);
 		serializer.WritePropertyWithDefault(107, "per_column_metadata_blocks", pointer.per_column_metadata_blocks.data);
 	}
+	if (serializer.ShouldSerialize(MIN_SORTED_BY_STORAGE_VERSION)) {
+		serializer.WritePropertyWithDefault(108, "sort_order_id", pointer.sort_metadata.sort_order_id);
+		serializer.WritePropertyWithDefault(109, "run_id", pointer.sort_metadata.run_id);
+	}
 }
 
 RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
@@ -1938,12 +2090,33 @@ RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
 	    deserializer.ReadPropertyWithExplicitDefault<bool>(106, "has_per_column_metadata_blocks", false);
 	result.per_column_metadata_blocks = {
 	    deserializer.ReadPropertyWithDefault<vector<PerColumnMetadataBlock>>(107, "per_column_metadata_blocks")};
+	result.sort_metadata.sort_order_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_order_id_t>(108, "sort_order_id", INVALID_SORT_ORDER_ID);
+	result.sort_metadata.run_id =
+	    deserializer.ReadPropertyWithExplicitDefault<sort_run_id_t>(109, "run_id", INVALID_SORT_RUN_ID);
+	if (!result.sort_metadata.IsValid()) {
+		throw SerializationException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
 	if (result.has_per_column_metadata_blocks) {
 		// per-column metadata supersedes legacy extra_metadata_blocks
 		result.has_metadata_blocks = false;
 		result.extra_metadata_blocks.clear();
 	}
 	return result;
+}
+
+void RowGroup::SetSortMetadata(RowGroupSortMetadata metadata, bool sealed_p) {
+	if (!metadata.IsValid()) {
+		throw InternalException("Row group sort order and run identifiers must both be zero or both be non-zero");
+	}
+	if (metadata.IsSorted() && !sealed_p) {
+		throw InternalException("A sorted row group must be sealed");
+	}
+	if (!(sort_metadata == metadata) || sealed != sealed_p) {
+		has_changes = true;
+	}
+	sort_metadata = metadata;
+	sealed = sealed_p;
 }
 
 //===--------------------------------------------------------------------===//
@@ -2054,11 +2227,16 @@ idx_t RowGroup::Delete(TransactionData transaction, DuckTableEntry &table_entry,
 
 void RowGroup::Verify() {
 #ifdef DEBUG
+	D_ASSERT(sort_metadata.IsValid());
+	D_ASSERT(!sort_metadata.IsSorted() || sealed);
+	D_ASSERT(column_drop_ownership_bundles.size() == columns.size());
 	for (idx_t c = 0; c < columns.size(); c++) {
 		if (!ColumnIsLoaded(c)) {
 			continue;
 		}
 		if (columns[c]) {
+			D_ASSERT(column_drop_ownership_bundles[c] ? columns[c]->GetDropOwnershipToken()
+			                                          : !columns[c]->GetDropOwnershipToken());
 			columns[c]->Verify(*this);
 		}
 	}
@@ -2102,6 +2280,8 @@ void VersionDeleteState::Flush() {
 		// now push the delete into the undo buffer, but only if any deletes were actually performed
 		transaction.transaction->PushDelete(table_entry, info.GetOrCreateVersionInfo(), current_chunk, rows,
 		                                    actual_delete_count, base_row + chunk_row);
+		transaction.transaction->RecordReclusterDeletes(info.GetTableInfo(), NumericCast<row_t>(base_row + chunk_row),
+		                                                rows, actual_delete_count);
 	}
 	count = 0;
 }

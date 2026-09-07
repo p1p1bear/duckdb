@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 
 namespace duckdb {
@@ -17,6 +18,8 @@ class DatabaseInstance;
 struct CheckpointOptions;
 class TableIOManager;
 class RowGroupCollection;
+class TableReclusterState;
+struct DataTableSortRuntime;
 
 struct DataTableInfo {
 	friend class DataTable;
@@ -24,6 +27,7 @@ struct DataTableInfo {
 public:
 	DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p, vector<Identifier> schema_path,
 	              Identifier table);
+	~DataTableInfo();
 
 	//! Bind unknown indexes throwing an exception if binding fails.
 	//! Only binds the specified index type, or all, if nullptr.
@@ -48,15 +52,29 @@ public:
 	unique_ptr<StorageLockKey> GetSharedLock() {
 		return checkpoint_lock.GetSharedLock();
 	}
+	unique_ptr<StorageLockKey> GetSharedReclusterWriteLock();
+	unique_ptr<StorageLockKey> GetExclusiveReclusterWriteLock();
+	unique_ptr<StorageLockKey> TryGetExclusiveReclusterWriteLock();
+	unique_ptr<StorageLockKey> GetReclusterDDLCoordinationLock();
+	unique_ptr<StorageLockKey> TryGetReclusterDDLCoordinationLock();
 	bool AppendRequiresNewRowGroup(RowGroupCollection &collection, transaction_t checkpoint_id);
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
+	void InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata);
+	void ResetSortStorage();
+	bool HasSortStorage() const;
+	shared_ptr<TableSortStorageState> GetSortStorage() const;
+	shared_ptr<TableReclusterState> GetOrCreateReclusterState(uint64_t initialization_token);
+	shared_ptr<TableReclusterState> GetReclusterState() const;
 
 	Identifier GetSchemaName();
 	//! The full (possibly nested) schema path of the table
 	const vector<Identifier> &GetSchemaPath() const;
 	Identifier GetTableName();
 	void SetTableName(Identifier name);
+
+private:
+	DataTableSortRuntime &GetOrCreateSortRuntime() const;
 
 private:
 	//! The database instance of the table
@@ -79,6 +97,10 @@ private:
 	optional_idx last_seen_checkpoint;
 	//! The amount of row groups the checkpoint is processing
 	optional_idx checkpoint_row_group_count;
+	atomic<bool> sort_storage_initialized = false;
+	//! Writer coordination and maintenance state, allocated only after SORTED BY is used.
+	mutable mutex sort_runtime_lock;
+	mutable unique_ptr<DataTableSortRuntime> sort_runtime;
 };
 
 } // namespace duckdb

@@ -44,6 +44,15 @@ public:
 		return make_uniq<StorageLockKey>(shared_from_this(), StorageLockType::SHARED);
 	}
 
+	unique_ptr<StorageLockKey> TryGetSharedLock() DUCKDB_NO_THREAD_SAFETY_ANALYSIS {
+		lock_guard<mutex> guard(state_lock);
+		if (writer_active || writer_tickets != writers_done) {
+			return nullptr;
+		}
+		read_count++;
+		return make_uniq<StorageLockKey>(shared_from_this(), StorageLockType::SHARED);
+	}
+
 	unique_ptr<StorageLockKey> TryGetExclusiveLock() DUCKDB_NO_THREAD_SAFETY_ANALYSIS {
 		lock_guard<mutex> guard(state_lock);
 		if (writer_active || read_count != 0) {
@@ -120,6 +129,10 @@ unique_ptr<StorageLockKey> StorageLock::TryGetExclusiveLock() {
 
 unique_ptr<StorageLockKey> StorageLock::GetSharedLock() {
 	return internals->GetSharedLock();
+}
+
+unique_ptr<StorageLockKey> StorageLock::TryGetSharedLock() {
+	return internals->TryGetSharedLock();
 }
 
 unique_ptr<StorageLockKey> StorageLock::TryUpgradeCheckpointLock(StorageLockKey &lock) {

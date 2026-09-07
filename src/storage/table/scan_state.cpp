@@ -204,6 +204,38 @@ ParallelCollectionScanState::ParallelCollectionScanState()
     : collection(nullptr), current_row_group(nullptr), processed_rows(0) {
 }
 
+void ParallelCollectionScanState::SetRowGroupSnapshot(RowGroupCollectionSnapshot snapshot) {
+	row_groups = snapshot.GetBaseTree();
+	row_group_snapshot.reset();
+	layout_cursor.reset();
+	current_layout_row_group.reset();
+	if (snapshot.kind == RowGroupCollectionSnapshot::Kind::BASE_TREE) {
+		return;
+	}
+	row_group_snapshot = std::move(snapshot);
+	if (!reorderer) {
+		layout_cursor = make_uniq<LayoutRowGroupCursor>(*row_group_snapshot);
+	}
+}
+
+bool ParallelCollectionScanState::AssignNextLayoutRowGroup() {
+	D_ASSERT(layout_cursor);
+	if (!current_layout_row_group) {
+		current_layout_row_group = make_uniq<LayoutRowGroupEntry>();
+	}
+	while (layout_cursor->Next(*current_layout_row_group)) {
+		if (!partitions_to_scan || partitions_to_scan->count(current_layout_row_group->layout_index) > 0) {
+			return true;
+		}
+	}
+	current_layout_row_group.reset();
+	return false;
+}
+
+bool ParallelCollectionScanState::UsesLayoutCursor() const {
+	return layout_cursor != nullptr;
+}
+
 void ParallelCollectionScanState::AssignRowGroup(optional_ptr<SegmentNode<RowGroup>> row_group) {
 	current_row_group = row_group;
 	while (current_row_group && !ShouldScanPartition(*current_row_group)) {
@@ -211,9 +243,10 @@ void ParallelCollectionScanState::AssignRowGroup(optional_ptr<SegmentNode<RowGro
 	}
 }
 
-optional_ptr<SegmentNode<RowGroup>> ParallelCollectionScanState::GetRootSegment(RowGroupSegmentTree &row_groups) const {
+optional_ptr<SegmentNode<RowGroup>> ParallelCollectionScanState::GetRootSegment(RowGroupSegmentTree &row_groups) {
 	if (reorderer) {
-		return reorderer->GetRootSegment(row_groups);
+		return row_group_snapshot ? reorderer->GetRootSegment(*row_group_snapshot)
+		                          : reorderer->GetRootSegment(row_groups);
 	}
 	return row_groups.GetRootSegment();
 }
@@ -231,22 +264,68 @@ CollectionScanState::CollectionScanState(TableScanState &parent_p)
       valid_sel(STANDARD_VECTOR_SIZE), random(-1), parent(parent_p) {
 }
 
-optional_ptr<SegmentNode<RowGroup>> CollectionScanState::GetNextRowGroup(SegmentNode<RowGroup> &row_group) const {
+void CollectionScanState::SetRowGroupSnapshot(RowGroupCollectionSnapshot snapshot, optional<RowGroupRange> scan_range) {
+	row_groups = snapshot.GetBaseTree();
+	row_group_snapshot.reset();
+	layout_cursor.reset();
+	layout_row_group.reset();
+	row_group = nullptr;
+	if (snapshot.kind == RowGroupCollectionSnapshot::Kind::BASE_TREE) {
+		return;
+	}
+	row_group_snapshot = std::move(snapshot);
+	if (reorderer && scan_range) {
+		throw InternalException("Cannot combine a reordered row group scan with a row ID range");
+	}
+	if (!reorderer) {
+		layout_cursor = make_uniq<LayoutRowGroupCursor>(*row_group_snapshot, std::move(scan_range));
+	}
+}
+
+SegmentNode<RowGroup> &CollectionScanState::SetLayoutRowGroup(LayoutRowGroupEntry entry) {
+	layout_row_group = make_uniq<SegmentNode<RowGroup>>(NumericCast<idx_t>(entry.row_start), std::move(entry.row_group),
+	                                                    entry.layout_index);
+	row_group = layout_row_group.get();
+	return *layout_row_group;
+}
+
+optional_ptr<SegmentNode<RowGroup>> CollectionScanState::NextLayoutRowGroup() {
+	D_ASSERT(layout_cursor);
+	LayoutRowGroupEntry entry;
+	if (!layout_cursor->Next(entry)) {
+		layout_row_group.reset();
+		return nullptr;
+	}
+	return SetLayoutRowGroup(std::move(entry));
+}
+
+optional_ptr<SegmentNode<RowGroup>> CollectionScanState::GetNextRowGroup(SegmentNode<RowGroup> &row_group) {
 	if (reorderer) {
 		return reorderer->GetNextRowGroup(row_group);
+	}
+	if (layout_cursor) {
+		D_ASSERT(layout_row_group && RefersToSameObject(*layout_row_group, row_group));
+		return NextLayoutRowGroup();
 	}
 	return row_groups->GetNextSegment(row_group);
 }
 
 optional_ptr<SegmentNode<RowGroup>> CollectionScanState::GetNextRowGroup(SegmentLock &l,
-                                                                         SegmentNode<RowGroup> &row_group) const {
+                                                                         SegmentNode<RowGroup> &row_group) {
+	if (layout_cursor) {
+		return GetNextRowGroup(row_group);
+	}
 	D_ASSERT(!reorderer);
 	return row_groups->GetNextSegment(l, row_group);
 }
 
-optional_ptr<SegmentNode<RowGroup>> CollectionScanState::GetRootSegment() const {
+optional_ptr<SegmentNode<RowGroup>> CollectionScanState::GetRootSegment() {
 	if (reorderer) {
-		return reorderer->GetRootSegment(*row_groups);
+		return row_group_snapshot ? reorderer->GetRootSegment(*row_group_snapshot)
+		                          : reorderer->GetRootSegment(*row_groups);
+	}
+	if (layout_cursor) {
+		return NextLayoutRowGroup();
 	}
 	return row_groups->GetRootSegment();
 }
@@ -284,6 +363,10 @@ bool CollectionScanState::Scan(DataChunk &result, TableScanType type, optional_p
 		row_group->GetNode().Scan(*this, result, type);
 		if (result.size() > 0) {
 			return true;
+		}
+		if (max_row <= row_group->GetRowStart() + row_group->GetNode().count) {
+			row_group = nullptr;
+			return false;
 		}
 		// move to the next row group
 		if (l) {

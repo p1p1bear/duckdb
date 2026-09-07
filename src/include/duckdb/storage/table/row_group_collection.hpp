@@ -11,6 +11,7 @@
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/segment_tree.hpp"
 #include "duckdb/storage/statistics/column_statistics.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/common/enums/column_segment_info_scan_type.hpp"
@@ -28,6 +29,7 @@ class TableDataWriter;
 class TableIndexList;
 class TableStatistics;
 struct TableAppendState;
+struct AppendOrganization;
 class DuckTransaction;
 class BoundConstraint;
 class RowGroupSegmentTree;
@@ -45,6 +47,11 @@ class DuckTableEntry;
 class RowGroupIterationHelper;
 class TableScanState;
 class BoundIndex;
+class TableLayoutHistory;
+struct LayoutPatch;
+struct RowGroupCollectionSnapshot;
+struct RowGroupLayout;
+struct LayoutRowGroupEntry;
 
 //! How checkpoint vacuum handles table indexes when rowids may change.
 enum class VacuumIndexStrategy : uint8_t {
@@ -77,6 +84,9 @@ public:
 public:
 	idx_t GetTotalRows() const;
 	idx_t GetNextRowId() const;
+	uint64_t GetStorageGenerationId() const {
+		return storage_generation_id;
+	}
 	idx_t GetRowGroupCount() const;
 	Allocator &GetAllocator() const;
 
@@ -88,6 +98,7 @@ public:
 	bool IsEmpty() const;
 
 	void AppendRowGroup(SegmentLock &l, idx_t start_row);
+	void AppendRowGroup(SegmentLock &l, idx_t start_row, const AppendOrganization &organization);
 	//! Get the nth row-group, negative numbers start from the back (so -1 is the last row group, etc)
 	optional_ptr<RowGroup> GetRowGroup(int64_t index);
 	//! Overrides a row group - should only be used if you know what you're doing (will likely be removed in the future)
@@ -97,13 +108,20 @@ public:
 
 	void InitializeScan(const QueryContext &context, CollectionScanState &state, const vector<StorageIndex> &column_ids,
 	                    optional_ptr<TableFilterSet> table_filters);
+	void InitializeScan(TransactionData transaction, const QueryContext &context, CollectionScanState &state,
+	                    const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> table_filters);
+	void InitializeScan(const QueryContext &context, CollectionScanState &state, const vector<StorageIndex> &column_ids,
+	                    optional_ptr<TableFilterSet> table_filters, RowGroupCollectionSnapshot snapshot);
 	void InitializeCreateIndexScan(CreateIndexScanState &state);
 	void InitializeScanWithOffset(const QueryContext &context, CollectionScanState &state,
+	                              const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row);
+	void InitializeScanWithOffset(TransactionData transaction, const QueryContext &context, CollectionScanState &state,
 	                              const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row);
 	static bool InitializeScanInRowGroup(ClientContext &context, CollectionScanState &state,
 	                                     RowGroupCollection &collection, SegmentNode<RowGroup> &row_group,
 	                                     idx_t vector_index, idx_t max_row);
 	void InitializeParallelScan(ParallelCollectionScanState &state);
+	void InitializeParallelScan(TransactionData transaction, ParallelCollectionScanState &state);
 	bool NextParallelScan(ClientContext &context, ParallelCollectionScanState &state, CollectionScanState &scan_state);
 
 	RowGroupIterationHelper Chunks(DuckTransaction &transaction);
@@ -117,12 +135,15 @@ public:
 
 	//! Initialize an append of a variable number of rows. FinalizeAppend must be called after appending is done.
 	void InitializeAppend(TableAppendState &state);
+	void InitializeAppend(TableAppendState &state, const AppendOrganization &organization);
 	//! Initialize an append with a variable number of rows. FinalizeAppend should not be called after appending is
 	//! done.
 	void InitializeAppend(TransactionData transaction, TableAppendState &state);
+	void InitializeAppend(TransactionData transaction, TableAppendState &state, const AppendOrganization &organization);
 	//! Appends to the row group collection. Returns the finished row group index if a new row group has been appended
 	//! to
 	optional_idx Append(DataChunk &chunk, TableAppendState &state);
+	void FinalizeCompletedAppendRowGroup(TableAppendState &state, idx_t row_group_index);
 	//! FinalizeAppend flushes an append with a variable number of rows.
 	void FinalizeAppend(TransactionData transaction, TableAppendState &state);
 	void CommitAppend(transaction_t commit_id, idx_t row_start, idx_t count);
@@ -142,7 +163,7 @@ public:
 	void UpdateColumn(TransactionData transaction, DuckTableEntry &table_entry, Vector &row_ids,
 	                  const vector<column_t> &column_path, DataChunk &updates);
 
-	void Checkpoint(TableDataWriter &writer, TableStatistics &global_stats);
+	void Checkpoint(TableDataWriter &writer, TableStatistics &global_stats, bool force_table_metadata_rewrite = false);
 
 	//! Decides how vacuum handles this table's indexes.
 	VacuumIndexStrategy
@@ -218,13 +239,35 @@ public:
 	//! Get a ptr to the raw segment tree. This can be useful for some extensions to have directly exposed.
 	shared_ptr<RowGroupSegmentTree> GetRowGroups() const;
 
+	void InitializeLayoutHistory(layout_version_t version);
+	void ResetLayoutHistory();
+	bool HasLayoutHistory() const;
+	RowGroupCollectionSnapshot GetSnapshot(TransactionData transaction) const;
+	RowGroupCollectionSnapshot GetSnapshot(DuckTransaction &transaction) const;
+	RowGroupCollectionSnapshot GetCurrentSnapshot() const;
+	shared_ptr<const RowGroupLayout> GetCurrentLayout() const;
+	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(shared_ptr<const LayoutPatch> patch) const;
+	shared_ptr<RowGroupLayout> BuildPendingPatchedLayout(const shared_ptr<const RowGroupLayout> &base_layout,
+	                                                     shared_ptr<const LayoutPatch> patch) const;
+	void PublishLayout(shared_ptr<const RowGroupLayout> layout);
+	void RevertPublishedLayout(const shared_ptr<const RowGroupLayout> &published_layout,
+	                           const shared_ptr<const RowGroupLayout> &previous_layout);
+	bool MaterializeCurrentLayout();
+	void InstallCheckpointTree(shared_ptr<RowGroupSegmentTree> tree);
+	void CleanupLayoutHistory(transaction_t oldest_active_start);
+	bool LookupRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t row_id, LayoutRowGroupEntry &result) const;
+
 private:
-	optional_ptr<SegmentNode<RowGroup>> NextUpdateRowGroup(RowGroupSegmentTree &row_groups, row_t *ids, idx_t &pos,
-	                                                       idx_t count) const;
+	LayoutRowGroupEntry NextUpdateRowGroup(const RowGroupCollectionSnapshot &snapshot, row_t *ids, idx_t &pos,
+	                                       idx_t count) const;
+	void FinalizeAlteredCollection(const RowGroupCollectionSnapshot &snapshot, idx_t total_rows, idx_t next_row_id,
+	                               idx_t current_rowid_end);
 
 	void SetRowGroups(shared_ptr<RowGroupSegmentTree> row_groups);
 
 private:
+	//! Process-local identity used to invalidate checkpoint candidates after physical schema replacement.
+	const uint64_t storage_generation_id;
 	//! BlockManager
 	BlockManager &block_manager;
 	//! The row group size of the row group collection
@@ -242,6 +285,8 @@ private:
 	mutable mutex row_group_pointer_lock;
 	//! The owning pointer of the segment tree
 	shared_ptr<RowGroupSegmentTree> owned_row_groups;
+	//! Present only for collections that have persistent sort storage metadata.
+	shared_ptr<TableLayoutHistory> layout_history;
 	//! Table statistics
 	TableStatistics stats;
 	//! Allocation size, only tracked for appends

@@ -1,5 +1,8 @@
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/storage/recluster/row_group_layout.hpp"
+
 namespace duckdb {
 
 namespace {
@@ -334,12 +337,45 @@ optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetRootSegment(RowGroupSe
 		return ordered_row_groups[0].get();
 	}
 
+	vector<reference<SegmentNode<RowGroup>>> input_row_groups;
+	for (auto &row_group : row_groups.SegmentNodes()) {
+		input_row_groups.push_back(row_group);
+	}
+	return Initialize(std::move(input_row_groups));
+}
+
+optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetRootSegment(const RowGroupCollectionSnapshot &snapshot) {
+	if (snapshot.kind == RowGroupCollectionSnapshot::Kind::BASE_TREE) {
+		return GetRootSegment(*snapshot.base_tree);
+	}
+	if (initialized) {
+		if (ordered_row_groups.empty()) {
+			return nullptr;
+		}
+		return ordered_row_groups[0].get();
+	}
+
+	vector<reference<SegmentNode<RowGroup>>> input_row_groups;
+	LayoutRowGroupCursor cursor(snapshot);
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		layout_row_groups.push_back(make_uniq<SegmentNode<RowGroup>>(NumericCast<idx_t>(entry.row_start),
+		                                                             std::move(entry.row_group), entry.layout_index));
+		input_row_groups.push_back(*layout_row_groups.back());
+	}
+	return Initialize(std::move(input_row_groups));
+}
+
+optional_ptr<SegmentNode<RowGroup>>
+RowGroupReorderer::Initialize(vector<reference<SegmentNode<RowGroup>>> input_row_groups) {
+	D_ASSERT(!initialized);
 	initialized = true;
 
 	vector<reference<SegmentNode<RowGroup>>> null_only_groups;
 	vector<reference<SegmentNode<RowGroup>>> ambiguous_groups;
 	multimap<Value, RowGroupSegmentNodeEntry> row_group_map;
-	for (auto &row_group : row_groups.SegmentNodes()) {
+	for (auto &row_group_ref : input_row_groups) {
+		auto &row_group = row_group_ref.get();
 		auto stats = row_group.GetNode().GetStatistics(options.column_idx);
 		if (!stats) {
 			ambiguous_groups.push_back(row_group);

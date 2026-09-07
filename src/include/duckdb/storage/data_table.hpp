@@ -10,6 +10,7 @@
 
 #include "duckdb/common/enums/column_segment_info_scan_type.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/persistent_table_data.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -18,6 +19,7 @@ namespace duckdb {
 
 class BoundForeignKeyConstraint;
 class AttachedDatabase;
+class AdaptiveSortedWrite;
 class ClientContext;
 class ColumnList;
 class ColumnDataCollection;
@@ -49,6 +51,7 @@ struct ColumnFetchState;
 struct ColumnSegmentInfo;
 struct ColumnSegmentInfoScanState;
 struct DataTableInfo;
+struct SortMetadataOnlyAlterTag {};
 struct LocalAppendState;
 struct ParallelTableScanState;
 struct TableAppendState;
@@ -62,6 +65,8 @@ enum class DataTableVersion {
 
 //! DataTable represents a physical table on disk
 class DataTable : public enable_shared_from_this<DataTable> {
+	friend class AdaptiveSortedWrite;
+
 public:
 	//! Constructs a new data table from an (optional) set of persistent segments
 	DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager, vector<Identifier> schema_path,
@@ -72,10 +77,14 @@ public:
 	//! Constructs a DataTable as a delta on an existing data table but with one column removed
 	DataTable(ClientContext &context, DataTable &parent, idx_t removed_column);
 	//! Constructs a DataTable as a delta on an existing data table but with one column changed type
-	DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
+	DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const ColumnDefinition &replacement_column,
 	          const vector<StorageIndex> &bound_columns, Expression &cast_expr);
 	//! Constructs a DataTable as a delta on an existing data table but with one column added new constraint
 	DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint);
+	//! Constructs a detached metadata-only replacement sharing the parent's row groups.
+	DataTable(ClientContext &context, DataTable &parent, const ColumnList &replacement_columns,
+	          SortMetadataOnlyAlterTag);
+	~DataTable();
 
 	//! A reference to the database instance
 	AttachedDatabase &db;
@@ -115,29 +124,32 @@ public:
 
 	//! Initializes appending to transaction-local storage
 	void InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
-	                           const vector<unique_ptr<BoundConstraint>> &bound_constraints);
+	                           const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+	                           const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Initializes only the delete-indexes of the transaction-local storage
 	void InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
 	                            const vector<unique_ptr<BoundConstraint>> &bound_constraints);
 	//! Append a DataChunk to the transaction-local storage of the table.
 	void LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry, ClientContext &context, DataChunk &chunk,
-	                 bool unsafe);
+	                 bool constraints_verified);
 	//! Finalizes a transaction-local append
 	void FinalizeLocalAppend(LocalAppendState &state);
 	//! Append a chunk to the transaction-local storage of this table and update the delete indexes.
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, Vector &row_ids,
-	                 DataChunk &delete_chunk);
+	                 DataChunk &delete_chunk, const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Appends to the transaction-local storage of this table
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
-	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool unsafe = false);
+	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool constraints_verified,
+	                 const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Append a chunk to the transaction-local storage of this table.
 	void LocalWALAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
 	                    const vector<unique_ptr<BoundConstraint>> &bound_constraints);
 	//! Append a column data collection with default values to the transaction-local storage of this table.
 	void LocalAppend(DuckTableEntry &table, ClientContext &context, ColumnDataCollection &collection,
 	                 const vector<unique_ptr<BoundConstraint>> &bound_constraints,
-	                 optional_ptr<const vector<LogicalIndex>> column_ids);
+	                 optional_ptr<const vector<LogicalIndex>> column_ids,
+	                 const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Merge a row group collection into the transaction-local storage
 	void LocalMerge(ClientContext &context, DuckTableEntry &table_entry, OptimisticWriteCollection &collection);
 	//! Create an optimistic row group collection for this table. Used for optimistically writing parallel appends.
@@ -175,8 +187,11 @@ public:
 
 	//! Fetches an append lock
 	void AppendLock(DuckTransaction &transaction, TableAppendState &state);
+	//! Verify commit-time recluster coordination before acquiring database commit locks.
+	void PrepareReclusterCommit(DuckTransaction &transaction);
 	//! Begin appending structs to this table, obtaining necessary locks, etc
-	void InitializeAppend(DuckTransaction &transaction, TableAppendState &state);
+	void InitializeAppend(DuckTransaction &transaction, TableAppendState &state,
+	                      const AppendOrganization &organization = AppendOrganization::Unsorted());
 	//! Append a chunk to the table using the AppendState obtained from InitializeAppend
 	void Append(DataChunk &chunk, TableAppendState &state);
 	//! Finalize an append
@@ -226,6 +241,8 @@ public:
 	bool IsRoot() const {
 		return IsMainTable();
 	}
+	//! Publishes a detached metadata-only or constraint replacement.
+	void PublishAlter(DuckTableEntry &new_entry);
 	string TableModification() const;
 
 	//! Get statistics of a physical column within the table
@@ -239,7 +256,7 @@ public:
 	//! Obtains a lock during a checkpoint operation that prevents other threads from reading this table
 	unique_ptr<StorageLockKey> GetCheckpointLock();
 	//! Checkpoint the table to the specified table data writer
-	void Checkpoint(TableDataWriter &writer, Serializer &serializer);
+	void Checkpoint(TableDataWriter &writer, Serializer &serializer, const StorageLockKey &checkpoint_lock);
 	//! Accumulates the table's on-disk blocks for reclamation into the drop state.
 	void CommitDropTable(CommitDropState &drop_state);
 	//! Accumulates the column's on-disk blocks for reclamation into the drop state.
@@ -310,6 +327,10 @@ public:
 	vector<PartitionStatistics> GetPartitionStats(ClientContext &context);
 
 private:
+	void HoldReclusterWriteGate(ClientContext &context, const char *operation);
+	void HoldReclusterWriteGate(DuckTransaction &transaction, const char *operation);
+	void VerifyCurrentForDML(DuckTransaction &transaction, const char *operation) const;
+
 	//! Verify the new added constraints against current persistent&local data
 	void VerifyNewConstraint(LocalStorage &local_storage, DataTable &parent, const BoundConstraint &constraint);
 
@@ -347,5 +368,10 @@ private:
 	shared_ptr<RowGroupCollection> row_groups;
 	//! The version of the data table
 	atomic<DataTableVersion> version;
+	//! The parent and append lock retained until this detached replacement is published or discarded.
+	optional_ptr<DataTable> pending_alter_parent;
+	unique_lock<mutex> pending_alter_lock;
+	//! The LocalStorage replacement waiting for catalog publication.
+	unique_ptr<PendingLocalStorageAlter> pending_local_storage_alter;
 };
 } // namespace duckdb

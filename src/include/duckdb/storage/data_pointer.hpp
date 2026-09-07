@@ -17,6 +17,7 @@
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 #include "duckdb/storage/table/per_column_metadata_blocks.hpp"
 #include "duckdb/storage/table/per_column_metadata_blocks.hpp"
 
@@ -87,6 +88,8 @@ struct RowGroupPointer {
 	//! Per-column metadata blocks beyond the start block
 	//! Each column entry contains the additional block IDs that the column's metadata spans (excluding the start block)
 	PerColumnMetadataBlocks per_column_metadata_blocks;
+	//! The sort rule and run that produced this row group, or zeroes for an unorganized row group
+	RowGroupSortMetadata sort_metadata;
 };
 
 } // namespace duckdb

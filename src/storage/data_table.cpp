@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/delete_state.hpp"
@@ -41,6 +42,13 @@
 
 namespace duckdb {
 
+struct DataTableSortRuntime {
+	StorageLock write_gate;
+	StorageLock ddl_gate;
+	shared_ptr<TableReclusterState> recluster_state;
+	shared_ptr<TableSortStorageState> sort_storage;
+};
+
 DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p,
                              vector<Identifier> schema_path, Identifier table)
     : db(db), table_io_manager(std::move(table_io_manager_p)), schema_path(std::move(schema_path)),
@@ -48,8 +56,91 @@ DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> ta
 	D_ASSERT(!this->schema_path.empty());
 }
 
+DataTableInfo::~DataTableInfo() {
+}
+
+DataTableSortRuntime &DataTableInfo::GetOrCreateSortRuntime() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
+	}
+	return *sort_runtime;
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetSharedReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.GetSharedLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetExclusiveReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.GetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::TryGetExclusiveReclusterWriteLock() {
+	return GetOrCreateSortRuntime().write_gate.TryGetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::GetReclusterDDLCoordinationLock() {
+	return GetOrCreateSortRuntime().ddl_gate.GetExclusiveLock();
+}
+
+unique_ptr<StorageLockKey> DataTableInfo::TryGetReclusterDDLCoordinationLock() {
+	return GetOrCreateSortRuntime().ddl_gate.TryGetExclusiveLock();
+}
+
 void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) {
 	indexes.Bind(context, *this, index_type);
+}
+
+void DataTableInfo::InitializeSortStorage(const PersistentTableSortStorageMetadata &metadata) {
+	auto storage = make_shared_ptr<TableSortStorageState>(metadata);
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (sort_storage_initialized.load(std::memory_order_relaxed)) {
+		throw InternalException("Sort storage state has already been initialized");
+	}
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
+	}
+	sort_runtime->sort_storage = std::move(storage);
+	sort_storage_initialized.store(true, std::memory_order_release);
+}
+
+void DataTableInfo::ResetSortStorage() {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (sort_runtime) {
+		sort_runtime->sort_storage.reset();
+	}
+	sort_storage_initialized.store(false, std::memory_order_release);
+}
+
+bool DataTableInfo::HasSortStorage() const {
+	return sort_storage_initialized.load(std::memory_order_acquire);
+}
+
+shared_ptr<TableSortStorageState> DataTableInfo::GetSortStorage() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime || !sort_runtime->sort_storage) {
+		throw InternalException("Table does not have sort storage state");
+	}
+	return sort_runtime->sort_storage;
+}
+
+shared_ptr<TableReclusterState> DataTableInfo::GetOrCreateReclusterState(uint64_t initialization_token) {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
+		sort_runtime = make_uniq<DataTableSortRuntime>();
+	}
+	if (!sort_runtime->recluster_state) {
+		sort_runtime->recluster_state = make_shared_ptr<TableReclusterState>(initialization_token);
+	}
+	return sort_runtime->recluster_state;
+}
+
+shared_ptr<TableReclusterState> DataTableInfo::GetReclusterState() const {
+	lock_guard<mutex> guard(sort_runtime_lock);
+	if (!sort_runtime) {
+		return nullptr;
+	}
+	return sort_runtime->recluster_state;
 }
 
 bool DataTableInfo::IsTemporary() const {
@@ -75,6 +166,9 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
       info(make_shared_ptr<DataTableInfo>(db, std::move(table_io_manager_p), std::move(schema_path), std::move(table))),
       column_definitions(std::move(column_definitions_p)), version(DataTableVersion::MAIN_TABLE) {
 	// initialize the table with the existing data from disk, if any
+	if (data && data->sort_storage_metadata) {
+		info->InitializeSortStorage(*data->sort_storage_metadata);
+	}
 	auto types = GetTypes();
 	auto &io_manager = TableIOManager::Get(*this);
 	this->row_groups = make_shared_ptr<RowGroupCollection>(info, io_manager, types, 0);
@@ -84,6 +178,9 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
 	} else {
 		this->row_groups->InitializeEmpty();
 		D_ASSERT(row_groups->GetTotalRows() == 0);
+	}
+	if (info->HasSortStorage()) {
+		row_groups->InitializeLayoutHistory(info->GetSortStorage()->current_layout_version.load());
 	}
 	row_groups->Verify();
 }
@@ -102,22 +199,21 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, ColumnDefinition
 	default_executor.AddExpression(default_value);
 
 	// prevent any new tuples from being added to the parent
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 
 	this->row_groups = parent.row_groups->AddColumn(context, new_column, default_executor);
 
-	// also add this column to client local storage
-	local_storage.AddColumn(parent, *this, new_column, default_executor);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the client-local replacement without changing the currently visible map entry.
+	pending_local_storage_alter = local_storage.PrepareAddColumn(parent, *this, new_column, default_executor);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_column)
     : db(parent.db), info(parent.info), version(DataTableVersion::MAIN_TABLE) {
 	// prevent any new tuples from being added to the parent
 	auto &local_storage = LocalStorage::Get(context, db);
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
@@ -154,11 +250,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_co
 	// alter the row_groups and remove the column from each of them
 	this->row_groups = parent.row_groups->RemoveColumn(removed_column);
 
-	// scan the original table, and fill the new column with the transformed value
-	local_storage.DropColumn(parent, *this, removed_column);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the local collection replacement while preserving the old map entry.
+	pending_local_storage_alter = local_storage.PrepareDropColumn(parent, *this, removed_column);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint)
@@ -169,7 +262,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	info->BindIndexes(context);
 
 	auto &local_storage = LocalStorage::Get(context, db);
-	lock_guard<mutex> parent_lock(parent.append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
@@ -177,17 +271,51 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	if (constraint.type != ConstraintType::UNIQUE) {
 		VerifyNewConstraint(local_storage, parent, constraint);
 	}
-	local_storage.MoveStorage(parent, *this);
-	parent.version = DataTableVersion::ALTERED;
+	pending_local_storage_alter = local_storage.PrepareMoveStorage(parent, *this);
 }
 
-DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
-                     const vector<StorageIndex> &bound_columns, Expression &cast_expr)
+DataTable::DataTable(ClientContext &context, DataTable &parent, const ColumnList &replacement_columns,
+                     SortMetadataOnlyAlterTag)
+    : db(parent.db), info(parent.info), row_groups(parent.row_groups), version(DataTableVersion::MAIN_TABLE) {
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
+	for (auto &column_def : replacement_columns.Physical()) {
+		column_definitions.emplace_back(column_def.Copy());
+	}
+	auto &local_storage = LocalStorage::Get(context, db);
+	pending_local_storage_alter = local_storage.PrepareMoveStorage(parent, *this);
+}
+
+DataTable::~DataTable() {
+	pending_local_storage_alter.reset();
+	if (pending_alter_lock.owns_lock()) {
+		pending_alter_lock.unlock();
+	}
+}
+
+void DataTable::PublishAlter(DuckTableEntry &new_entry) {
+	if (!pending_alter_parent) {
+		return;
+	}
+	auto &parent = *pending_alter_parent;
+	D_ASSERT(pending_alter_lock.owns_lock());
+	D_ASSERT(pending_local_storage_alter);
+	pending_local_storage_alter->Publish(new_entry);
+	parent.version = DataTableVersion::ALTERED;
+	pending_local_storage_alter.reset();
+	pending_alter_parent = nullptr;
+	pending_alter_lock.unlock();
+}
+
+DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx,
+                     const ColumnDefinition &replacement_column, const vector<StorageIndex> &bound_columns,
+                     Expression &cast_expr)
     : db(parent.db), info(parent.info), version(DataTableVersion::MAIN_TABLE) {
 	auto &transaction = DuckTransaction::Get(context, db);
 	auto &local_storage = LocalStorage::Get(transaction);
 	// prevent any tuples from being added to the parent
-	lock_guard<mutex> lock(append_lock);
+	pending_alter_parent = parent;
+	pending_alter_lock = unique_lock<mutex>(parent.append_lock);
 	for (auto &column_def : parent.column_definitions) {
 		column_definitions.emplace_back(column_def.Copy());
 	}
@@ -205,17 +333,17 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 	}
 
 	// change the type in this DataTable
-	column_definitions[changed_idx].SetType(target_type);
+	column_definitions[changed_idx].SetType(replacement_column.Type());
+	column_definitions[changed_idx].SetPersistentColumnId(replacement_column.PersistentColumnId());
 
 	// set up the statistics for the table
 	// the column that had its type changed will have the new statistics computed during conversion
-	row_groups = parent.row_groups->AlterType(context, changed_idx, target_type, bound_columns, cast_expr, transaction);
+	row_groups = parent.row_groups->AlterType(context, changed_idx, replacement_column.Type(), bound_columns, cast_expr,
+	                                          transaction);
 
-	// scan the original table, and fill the new column with the transformed value
-	local_storage.ChangeType(parent, *this, changed_idx, target_type, bound_columns, cast_expr);
-
-	// this table replaces the previous table, hence the parent is no longer the root DataTable
-	parent.version = DataTableVersion::ALTERED;
+	// Prepare the local collection replacement while preserving the old map entry.
+	pending_local_storage_alter = local_storage.PrepareChangeType(parent, *this, changed_idx, replacement_column.Type(),
+	                                                              bound_columns, cast_expr);
 }
 
 vector<LogicalType> DataTable::GetTypes() {
@@ -254,14 +382,15 @@ void DataTable::InitializeScan(ClientContext &context, DuckTransaction &transact
                                const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> table_filters) {
 	auto &local_storage = LocalStorage::Get(transaction);
 	state.Initialize(column_ids, context, table_filters);
-	row_groups->InitializeScan(context, state.table_state, column_ids, table_filters);
+	row_groups->InitializeScan(TransactionData(transaction), context, state.table_state, column_ids, table_filters);
 	local_storage.InitializeScan(*this, state.local_state, table_filters);
 }
 
 void DataTable::InitializeScanWithOffset(DuckTransaction &transaction, TableScanState &state,
                                          const vector<StorageIndex> &column_ids, idx_t start_row, idx_t end_row) {
 	state.Initialize(column_ids);
-	row_groups->InitializeScanWithOffset(QueryContext(), state.table_state, column_ids, start_row, end_row);
+	row_groups->InitializeScanWithOffset(TransactionData(transaction), QueryContext(), state.table_state, column_ids,
+	                                     start_row, end_row);
 }
 
 idx_t DataTable::GetRowGroupSize() const {
@@ -290,7 +419,8 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
 void DataTable::InitializeParallelScan(ClientContext &context, ParallelTableScanState &state,
                                        const vector<ColumnIndex> &column_indexes) {
 	auto &local_storage = LocalStorage::Get(context, db);
-	row_groups->InitializeParallelScan(state.scan_state);
+	auto &transaction = DuckTransaction::Get(context, db);
+	row_groups->InitializeParallelScan(TransactionData(transaction), state.scan_state);
 
 	local_storage.InitializeParallelScan(*this, state.local_state);
 }
@@ -990,15 +1120,49 @@ string DataTable::TableModification() const {
 	}
 }
 
+void DataTable::VerifyCurrentForDML(DuckTransaction &transaction, const char *operation) const {
+	if (!IsMainTable()) {
+		throw TransactionException("Transaction conflict: attempting to %s table \"%s\" but it has been %s by a "
+		                           "different transaction",
+		                           operation, GetTableName(), TableModification());
+	}
+	auto current_layout = row_groups->GetCurrentLayout();
+	if (current_layout && transaction.start_time < current_layout->visible_from) {
+		throw TransactionException("Transaction conflict: attempting to %s table \"%s\" from before its current "
+		                           "storage layout was published",
+		                           operation, GetTableName());
+	}
+}
+
+void DataTable::HoldReclusterWriteGate(ClientContext &context, const char *operation) {
+	auto &transaction = DuckTransaction::Get(context, db);
+	HoldReclusterWriteGate(transaction, operation);
+}
+
+void DataTable::HoldReclusterWriteGate(DuckTransaction &transaction, const char *operation) {
+	if (!info->HasSortStorage()) {
+		return;
+	}
+	VerifyCurrentForDML(transaction, operation);
+	transaction.HoldSharedReclusterWriteLock(*info);
+	VerifyCurrentForDML(transaction, operation);
+}
+
+void DataTable::PrepareReclusterCommit(DuckTransaction &transaction) {
+	HoldReclusterWriteGate(transaction, "commit to");
+}
+
 void DataTable::InitializeLocalAppend(LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
-                                      const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+                                      const vector<unique_ptr<BoundConstraint>> &bound_constraints,
+                                      const AppendOrganization &organization) {
 	if (!IsMainTable()) {
 		throw TransactionException("Transaction conflict: attempting to insert into table \"%s\" but it has been %s by "
 		                           "a different transaction",
 		                           GetTableName(), TableModification());
 	}
+	HoldReclusterWriteGate(context, "insert into");
 	auto &local_storage = LocalStorage::Get(context, db);
-	local_storage.InitializeAppend(state, *this, table);
+	local_storage.InitializeAppend(state, *this, table, organization);
 	state.constraint_state = InitializeConstraintState(table, bound_constraints);
 }
 
@@ -1009,6 +1173,7 @@ void DataTable::InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &
 		                           "a different transaction",
 		                           GetTableName(), TableModification());
 	}
+	HoldReclusterWriteGate(context, "insert into");
 
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.InitializeStorage(state, *this, table);
@@ -1016,7 +1181,7 @@ void DataTable::InitializeLocalStorage(LocalAppendState &state, DuckTableEntry &
 }
 
 void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry, ClientContext &context,
-                            DataChunk &chunk, bool unsafe) {
+                            DataChunk &chunk, bool constraints_verified) {
 	if (chunk.size() == 0) {
 		return;
 	}
@@ -1029,7 +1194,7 @@ void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry
 
 	// Insert any row ids into the DELETE ART and verify constraints afterward.
 	// This happens only for the global indexes.
-	if (!unsafe) {
+	if (!constraints_verified) {
 		auto &constraint_state = *state.constraint_state;
 		VerifyAppendConstraints(constraint_state, context, chunk, *state.storage, nullptr);
 	}
@@ -1039,10 +1204,11 @@ void DataTable::LocalAppend(LocalAppendState &state, DuckTableEntry &table_entry
 }
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
-                            const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool unsafe) {
+                            const vector<unique_ptr<BoundConstraint>> &bound_constraints, bool constraints_verified,
+                            const AppendOrganization &organization) {
 	LocalAppendState append_state;
-	InitializeLocalAppend(append_state, table, context, bound_constraints);
-	LocalAppend(append_state, table, context, chunk, unsafe);
+	InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
+	LocalAppend(append_state, table, context, chunk, constraints_verified);
 	FinalizeLocalAppend(append_state);
 }
 
@@ -1073,6 +1239,7 @@ OptimisticDataWriter &DataTable::GetOptimisticWriter(ClientContext &context) {
 }
 
 void DataTable::LocalMerge(ClientContext &context, DuckTableEntry &table_entry, OptimisticWriteCollection &collection) {
+	HoldReclusterWriteGate(context, "insert into");
 	auto &local_storage = LocalStorage::Get(context, db);
 	local_storage.LocalMerge(*this, table_entry, collection);
 }
@@ -1090,10 +1257,10 @@ void DataTable::LocalWALAppend(DuckTableEntry &table, ClientContext &context, Da
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
                             const vector<unique_ptr<BoundConstraint>> &bound_constraints, Vector &row_ids,
-                            DataChunk &delete_chunk) {
+                            DataChunk &delete_chunk, const AppendOrganization &organization) {
 	LocalAppendState append_state;
 	auto &storage = table.GetStorage();
-	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
+	storage.InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
 	append_state.storage->AppendToDeleteIndexes(row_ids, delete_chunk);
 
 	storage.LocalAppend(append_state, table, context, chunk, false);
@@ -1102,10 +1269,11 @@ void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, DataC
 
 void DataTable::LocalAppend(DuckTableEntry &table, ClientContext &context, ColumnDataCollection &collection,
                             const vector<unique_ptr<BoundConstraint>> &bound_constraints,
-                            optional_ptr<const vector<LogicalIndex>> column_ids) {
+                            optional_ptr<const vector<LogicalIndex>> column_ids,
+                            const AppendOrganization &organization) {
 	LocalAppendState append_state;
 	auto &storage = table.GetStorage();
-	storage.InitializeLocalAppend(append_state, table, context, bound_constraints);
+	storage.InitializeLocalAppend(append_state, table, context, bound_constraints, organization);
 
 	if (!column_ids || column_ids->empty()) {
 		for (auto &chunk : collection.Chunks()) {
@@ -1165,6 +1333,9 @@ void DataTable::AppendLock(DuckTransaction &transaction, TableAppendState &state
 		                           "a different transaction",
 		                           GetTableName(), TableModification());
 	}
+	if (info->HasSortStorage() && !transaction.HoldsReclusterWriteLock(*info)) {
+		throw InternalException("Sorted table append reached commit without holding its transaction write gate");
+	}
 	state.table_lock = transaction.SharedLockTable(*info);
 	state.row_start = NumericCast<row_t>(row_groups->GetNextRowId());
 	state.current_row = state.row_start;
@@ -1203,12 +1374,13 @@ optional_idx DataTableInfo::CheckpointRowGroupCount(const CheckpointOptions &opt
 	return checkpoint_row_group_count;
 }
 
-void DataTable::InitializeAppend(DuckTransaction &transaction, TableAppendState &state) {
+void DataTable::InitializeAppend(DuckTransaction &transaction, TableAppendState &state,
+                                 const AppendOrganization &organization) {
 	// obtain the append lock for this table
 	if (!state.append_lock) {
 		throw InternalException("DataTable::AppendLock should be called before DataTable::InitializeAppend");
 	}
-	row_groups->InitializeAppend(transaction, state);
+	row_groups->InitializeAppend(transaction, state, organization);
 }
 
 void DataTable::Append(DataChunk &chunk, TableAppendState &state) {
@@ -1557,6 +1729,7 @@ void DataTable::VerifyDeleteConstraints(optional_ptr<LocalTableStorage> storage,
 
 unique_ptr<TableDeleteState> DataTable::InitializeDelete(TableCatalogEntry &table, ClientContext &context,
                                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	HoldReclusterWriteGate(context, "delete from");
 	auto &transaction = DuckTransaction::Get(context, db);
 	// Bind all indexes.
 	info->BindIndexes(context);
@@ -1723,6 +1896,10 @@ void DataTable::VerifyUpdateConstraints(ConstraintState &state, ClientContext &c
 
 unique_ptr<TableUpdateState> DataTable::InitializeUpdate(TableCatalogEntry &table, ClientContext &context,
                                                          const vector<unique_ptr<BoundConstraint>> &bound_constraints) {
+	if (table.IsDuckTable()) {
+		table.Cast<DuckTableEntry>().VerifyUpdateAllowed();
+	}
+	HoldReclusterWriteGate(context, "update");
 	// Bind all indexes.
 	info->BindIndexes(context);
 	auto result = make_uniq<TableUpdateState>();
@@ -1792,6 +1969,7 @@ void DataTable::UpdateColumn(DuckTableEntry &table, ClientContext &context, Vect
 	if (updates.size() == 0) {
 		return;
 	}
+	HoldReclusterWriteGate(context, "update");
 
 	if (!IsMainTable()) {
 		throw TransactionException(
@@ -1833,11 +2011,12 @@ unique_ptr<StorageLockKey> DataTable::GetCheckpointLock() {
 	return info->checkpoint_lock.GetExclusiveLock();
 }
 
-void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer) {
+void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer, const StorageLockKey &checkpoint_lock) {
+	auto materialized_layout = row_groups->MaterializeCurrentLayout();
 	writer.SetRowGroupCount(info->CheckpointRowGroupCount(writer.GetCheckpointOptions()));
 	// checkpoint each individual row group
 	TableStatistics global_stats;
-	row_groups->Checkpoint(writer, global_stats);
+	row_groups->Checkpoint(writer, global_stats, materialized_layout);
 	row_groups->SetRowGroupAppendMode(RowGroupAppendMode::SUGGEST_NEW);
 	if (writer.GetRebuildIndexes()) {
 		MetricsTimer timer;
@@ -1854,7 +2033,7 @@ void DataTable::Checkpoint(TableDataWriter &writer, Serializer &serializer) {
 	//   row-group pointers
 	//   table pointer
 	//   index data
-	writer.FinalizeTable(global_stats, *info, *row_groups, serializer);
+	writer.FinalizeTable(global_stats, *info, *row_groups, serializer, checkpoint_lock);
 	row_groups->SetStats(global_stats);
 }
 

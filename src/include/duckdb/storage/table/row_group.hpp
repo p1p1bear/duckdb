@@ -20,11 +20,13 @@
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/checkpoint/checkpoint_options.hpp"
+#include "duckdb/storage/recluster/table_sort_metadata.hpp"
 
 namespace duckdb {
 class AttachedDatabase;
 class BlockManager;
 class ColumnData;
+class ColumnDropOwnershipBundle;
 class DatabaseInstance;
 class DataTable;
 class DuckTableEntry;
@@ -112,6 +114,8 @@ private:
 	shared_ptr<RowVersionManager> owned_version_info;
 	//! The column data of the row_group (mutable because `const` can lazily load)
 	mutable vector<shared_ptr<ColumnData>> columns;
+	//! Fixed-size lazy ownership slots. A published non-null slot is never reset or replaced.
+	mutable vector<shared_ptr<ColumnDropOwnershipBundle>> column_drop_ownership_bundles;
 
 public:
 	void MoveToCollection(RowGroupCollection &collection);
@@ -124,6 +128,16 @@ public:
 	const vector<MetaBlockPointer> &GetColumnStartPointers() const;
 
 	vector<MetaBlockPointer> GetExtraMetadataBlockPointers() const;
+	const vector<MetaBlockPointer> &GetDeleteStartPointers() const {
+		return deletes_pointers;
+	}
+	vector<MetaBlockPointer> GetLoadedDeleteStoragePointers() const;
+	bool HasPerColumnMetadataBlocks() const {
+		return has_per_column_metadata_blocks;
+	}
+	vector<vector<idx_t>> GetPerColumnMetadataBlocks(const vector<idx_t> &columns) const {
+		return per_column_metadata_blocks.GetBlocksForColumns(columns);
+	}
 
 	BlockManager &GetBlockManager() const;
 	DataTableInfo &GetTableInfo() const;
@@ -202,6 +216,8 @@ public:
 	                           idx_t row_group_start);
 	bool IsPersistent() const;
 	PersistentRowGroupData SerializeRowGroupInfo(idx_t row_group_start) const;
+	//! Installs durable metadata pointers and releases loaded persistent columns.
+	void SetPersistentMetadataPointers(const RowGroupPointer &pointer);
 
 	static void InitializeAppend(SegmentNode<RowGroup> &row_group, RowGroupAppendState &append_state);
 	void Append(RowGroupAppendState &append_state, DataChunk &chunk, idx_t append_count);
@@ -227,6 +243,13 @@ public:
 	idx_t GetAllocationSize() const {
 		return allocation_size;
 	}
+	const RowGroupSortMetadata &GetSortMetadata() const {
+		return sort_metadata;
+	}
+	bool IsSealed() const {
+		return sealed;
+	}
+	void SetSortMetadata(RowGroupSortMetadata metadata, bool sealed);
 
 	void Verify();
 
@@ -236,7 +259,7 @@ public:
 	RowVersionManager &GetOrCreateVersionInfo();
 
 	// Serialization
-	static void Serialize(RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes);
+	static void Serialize(const RowGroupPointer &pointer, Serializer &serializer, bool supports_per_column_writes);
 	static RowGroupPointer Deserialize(Deserializer &deserializer);
 
 	idx_t GetRowGroupSize() const;
@@ -253,6 +276,8 @@ public:
 	//! Direct accessors, fall outside of general use but can be useful to some extensions
 	ColumnData &GetRawColumnData(const StorageIndex &c) const;
 	ColumnData &GetRawColumnData(storage_t c) const;
+	bool HasColumnDropOwnershipBundle(idx_t column_index) const;
+	const shared_ptr<ColumnDropOwnershipBundle> &GetColumnDropOwnershipBundle(idx_t column_index) const;
 
 private:
 	//! Registers prefetch candidates for the next row_count rows, returns false when prefetching is not supported
@@ -279,7 +304,11 @@ private:
 	void UnloadColumn(storage_t c);
 	bool HasUnchangedColumns() const;
 	static shared_ptr<ColumnData> CheckpointColumn(const RowGroup &row_group, idx_t column_idx, RowGroupWriteInfo &info,
-	                                               RowGroupWriteData &write_data);
+	                                               RowGroupWriteData &write_data,
+	                                               shared_ptr<ColumnDropOwnershipBundle> &result_bundle);
+	static shared_ptr<ColumnDropOwnershipBundle> InitializeColumnDropOwnership(ColumnData &column);
+	static void BindColumnDropOwnership(ColumnData &column, ColumnDropOwnershipBundle &bundle);
+	const shared_ptr<ColumnDropOwnershipBundle> &GetOrCreateColumnDropOwnershipBundleLocked(idx_t column_index) const;
 
 	bool HasUnloadedDeletes() const;
 	unique_ptr<RowGroup> CreateNewRowGroupCopy(RowGroupCollection &new_collection, idx_t new_column_count);
@@ -305,6 +334,8 @@ private:
 	//! Whether or not `row_number_column_data` is loaded (mutable because `const` can lazy load)
 	mutable atomic<bool> row_number_is_loaded;
 	atomic<bool> has_changes;
+	RowGroupSortMetadata sort_metadata;
+	bool sealed = false;
 };
 
 } // namespace duckdb
