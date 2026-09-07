@@ -1,6 +1,7 @@
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/storage/table/list_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/statistics/list_stats.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
@@ -325,6 +326,18 @@ void ListColumnData::FetchRows(TransactionData transaction, ColumnFetchState &st
 			ListVector::Append(result, child_scan, child_scan_count);
 		}
 	}
+}
+
+ColumnDropOwnershipRuntimeKind ListColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::LIST;
+}
+
+void ListColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!validity || !child_column) {
+		throw InternalException("Cannot observe incomplete list column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VALIDITY, 0), *validity);
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::ELEMENT, 0), *child_column);
 }
 
 void ListColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {

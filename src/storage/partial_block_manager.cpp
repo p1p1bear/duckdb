@@ -85,7 +85,8 @@ bool PartialBlockManager::HasBlockAllocation(uint32_t segment_size) {
 
 void PartialBlockManager::AllocateBlock(PartialBlockState &state, uint32_t segment_size) {
 	D_ASSERT(segment_size <= block_manager.GetBlockSize());
-	if (partial_block_type == PartialBlockType::FULL_CHECKPOINT) {
+	if (partial_block_type == PartialBlockType::FULL_CHECKPOINT ||
+	    partial_block_type == PartialBlockType::RECLUSTER_TASK) {
 		state.block_id = GetFreeBlockId();
 	} else {
 		state.block_id = INVALID_BLOCK;
@@ -98,9 +99,12 @@ void PartialBlockManager::AllocateBlock(PartialBlockState &state, uint32_t segme
 block_id_t PartialBlockManager::GetFreeBlockId() {
 	if (partial_block_type == PartialBlockType::FULL_CHECKPOINT) {
 		return block_manager.GetFreeBlockIdForCheckpoint();
-	} else {
-		return block_manager.GetFreeBlockId();
 	}
+	auto block_id = block_manager.GetFreeBlockId();
+	if (partial_block_type == PartialBlockType::RECLUSTER_TASK) {
+		task_private_blocks.push_back(block_id);
+	}
+	return block_id;
 }
 
 bool PartialBlockManager::GetPartialBlock(idx_t segment_size, unique_ptr<PartialBlock> &partial_block) {
@@ -128,14 +132,13 @@ unique_ptr<PartialBlock> PartialBlockManager::CreatePartialBlock(ColumnData &col
 void PartialBlockManager::RegisterPartialBlock(PartialBlockAllocation allocation) {
 	auto &state = allocation.partial_block->state;
 	D_ASSERT(partial_block_type != PartialBlockType::FULL_CHECKPOINT || state.block_id >= 0);
+	auto unaligned_size = allocation.allocation_size + state.offset;
+	auto new_size = AlignValue(unaligned_size);
+	if (new_size != unaligned_size) {
+		allocation.partial_block->AddUninitializedRegion(unaligned_size, new_size);
+	}
+	state.offset = new_size;
 	if (state.block_use_count < max_use_count) {
-		auto unaligned_size = allocation.allocation_size + state.offset;
-		auto new_size = AlignValue(unaligned_size);
-		if (new_size != unaligned_size) {
-			// register the uninitialized region so we can correctly initialize it before writing to disk
-			allocation.partial_block->AddUninitializedRegion(unaligned_size, new_size);
-		}
-		state.offset = new_size;
 		auto new_space_left = state.block_size - new_size;
 		// check if the block is STILL partially filled after adding the segment_size
 		if (new_space_left >= block_manager.GetBlockSize() - max_partial_block_size) {
@@ -211,6 +214,22 @@ optional_ptr<ClientContext> PartialBlockManager::GetClientContext() const {
 
 void PartialBlockManager::Rollback() {
 	ClearBlocks();
+	if (partial_block_type == PartialBlockType::RECLUSTER_TASK) {
+		for (auto block_id : task_private_blocks) {
+			block_manager.MarkBlockAsModified(block_id);
+		}
+		task_private_blocks.clear();
+	}
+}
+
+vector<block_id_t> PartialBlockManager::TakeTaskPrivateBlocks() {
+	if (partial_block_type != PartialBlockType::RECLUSTER_TASK) {
+		throw InternalException("Cannot take task-private blocks from a non-recluster partial block manager");
+	}
+	if (!partially_filled_blocks.empty()) {
+		throw InternalException("Cannot take task-private blocks before flushing partial blocks");
+	}
+	return std::move(task_private_blocks);
 }
 
 } // namespace duckdb

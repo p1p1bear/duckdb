@@ -1,4 +1,5 @@
 #include "duckdb/storage/table/geo_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/table/standard_column_data.hpp"
 
 #include "duckdb/storage/statistics/struct_stats.hpp"
@@ -621,6 +622,21 @@ void GeoColumnData::GetColumnSegmentInfo(const QueryContext &context, idx_t row_
 
 void GeoColumnData::Verify(RowGroup &parent) {
 	return base_column->Verify(parent);
+}
+
+ColumnDropOwnershipRuntimeKind GeoColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::GEOMETRY;
+}
+
+uint64_t GeoColumnData::GetDropOwnershipLayoutValue() const noexcept {
+	return static_cast<uint64_t>(storage_type);
+}
+
+void GeoColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!base_column) {
+		throw InternalException("Cannot observe incomplete geometry column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::GEOMETRY_STORAGE, 0), *base_column);
 }
 
 void GeoColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {

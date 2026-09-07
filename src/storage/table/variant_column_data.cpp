@@ -2,6 +2,7 @@
 #include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/storage/table/variant_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/function/variant/variant_shredding.hpp"
@@ -504,6 +505,28 @@ void VariantColumnData::FetchRows(TransactionData transaction, ColumnFetchState 
 		auto context = transaction.transaction->context.lock();
 		auto fetched_row = extracted_variant.GetValue(0).CastAs(*context, result.GetType());
 		result.SetValue(result_idx, fetched_row);
+	}
+}
+
+ColumnDropOwnershipRuntimeKind VariantColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::VARIANT;
+}
+
+uint64_t VariantColumnData::GetDropOwnershipLayoutValue() const noexcept {
+	return IsShredded() ? 1 : 0;
+}
+
+void VariantColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor) {
+	if (!validity || (sub_columns.size() != 1 && sub_columns.size() != 2)) {
+		throw InternalException("Cannot observe incomplete variant column drop ownership");
+	}
+	visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VALIDITY, 0), *validity);
+	for (idx_t child_index = 0; child_index < sub_columns.size(); child_index++) {
+		if (!sub_columns[child_index]) {
+			throw InternalException("Cannot observe incomplete variant column drop ownership");
+		}
+		visitor.Visit(ColumnDropOwnershipChildKey(ColumnDropOwnershipChildRole::VARIANT_CHILD, child_index),
+		              *sub_columns[child_index]);
 	}
 }
 

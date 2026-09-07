@@ -1,8 +1,13 @@
 #include "duckdb/storage/table/validity_column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
 namespace duckdb {
+
+ColumnDropOwnershipRuntimeKind ValidityColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::VALIDITY;
+}
 
 ValidityColumnData::ValidityColumnData(BlockManager &block_manager, DataTableInfo &info, idx_t column_index,
                                        ColumnDataType data_type, optional_ptr<ColumnData> parent)

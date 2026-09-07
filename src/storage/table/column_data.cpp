@@ -1,4 +1,5 @@
 #include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/column_drop_ownership_runtime.hpp"
 #include "duckdb/main/attached_database.hpp"
 
 #include "duckdb/common/exception/transaction_exception.hpp"
@@ -808,11 +809,32 @@ void ColumnData::AppendSegment(SegmentLock &l, unique_ptr<ColumnSegment> segment
 	data.AppendSegment(l, std::move(segment));
 }
 
-void ColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {
+ColumnDropOwnershipRuntimeKind ColumnData::GetDropOwnershipRuntimeKind() const noexcept {
+	return ColumnDropOwnershipRuntimeKind::INVALID;
+}
+
+uint64_t ColumnData::GetDropOwnershipLayoutValue() const noexcept {
+	return 0;
+}
+
+void ColumnData::VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &) {
+}
+
+void ColumnData::SetDropOwnershipToken(shared_ptr<RowGroupColumnDropOwnership> token) noexcept {
+	D_ASSERT(token);
+	D_ASSERT(!drop_ownership_token || drop_ownership_token == token);
+	drop_ownership_token = std::move(token);
+}
+
+void ColumnData::VisitDirectBlockIds(BlockIdVisitor &visitor) const {
 	for (auto &segment_p : data.Segments()) {
 		auto &segment = segment_p;
 		segment.VisitBlockIds(visitor);
 	}
+}
+
+void ColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {
+	VisitDirectBlockIds(visitor);
 }
 
 unique_ptr<ColumnCheckpointState> ColumnData::CreateCheckpointState(const RowGroup &row_group,

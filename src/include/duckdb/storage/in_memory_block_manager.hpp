@@ -49,6 +49,11 @@ public:
 	void IncreaseBlockReferenceCount(block_id_t block_id) override {
 		throw InternalException("Cannot perform IO in in-memory database - IncreaseBlockReferenceCount!");
 	}
+	shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) override {
+		throw InternalException("Cannot perform IO in in-memory database - RegisterBlockReservation!");
+	}
+	void UnregisterBlockReservation(block_id_t block_id) noexcept override {
+	}
 	idx_t GetMetaBlock() override {
 		throw InternalException("Cannot perform IO in in-memory database - GetMetaBlock!");
 	}

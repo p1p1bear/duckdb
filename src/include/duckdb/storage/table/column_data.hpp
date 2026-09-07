@@ -21,7 +21,9 @@
 #include "duckdb/common/atomic_ptr.hpp"
 
 namespace duckdb {
+enum class ColumnDropOwnershipRuntimeKind : uint8_t;
 class ColumnData;
+class ColumnDropOwnershipChildVisitor;
 class ColumnSegment;
 class DatabaseInstance;
 class PartialBlockManager;
@@ -41,6 +43,7 @@ struct TableScanOptions;
 struct TransactionData;
 struct PersistentColumnData;
 class ValidityColumnData;
+class RowGroupColumnDropOwnership;
 struct ColumnDataFinalizeAppendState;
 struct SuballocationBlock;
 
@@ -189,6 +192,14 @@ public:
 	                          idx_t update_count, idx_t depth, idx_t row_group_start);
 	virtual unique_ptr<BaseStatistics> GetUpdateStatistics();
 
+	virtual ColumnDropOwnershipRuntimeKind GetDropOwnershipRuntimeKind() const noexcept;
+	virtual uint64_t GetDropOwnershipLayoutValue() const noexcept;
+	virtual void VisitDropOwnershipChildren(ColumnDropOwnershipChildVisitor &visitor);
+	const shared_ptr<RowGroupColumnDropOwnership> &GetDropOwnershipToken() const noexcept {
+		return drop_ownership_token;
+	}
+	void SetDropOwnershipToken(shared_ptr<RowGroupColumnDropOwnership> token) noexcept;
+	void VisitDirectBlockIds(BlockIdVisitor &visitor) const;
 	virtual void VisitBlockIds(BlockIdVisitor &visitor) const;
 
 	virtual unique_ptr<ColumnCheckpointState> CreateCheckpointState(const RowGroup &row_group,
@@ -282,6 +293,8 @@ private:
 	//!	The compression function used by the ColumnData
 	//! This is empty if the segments have mixed compression or the ColumnData is empty
 	atomic_ptr<const CompressionFunction> compression;
+	//! Ownership for this node's direct persistent segment tree, excluding nested children.
+	shared_ptr<RowGroupColumnDropOwnership> drop_ownership_token;
 
 public:
 	template <class TARGET>

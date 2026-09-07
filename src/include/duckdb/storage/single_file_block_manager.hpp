@@ -17,15 +17,101 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/encryption_functions.hpp"
 #include "duckdb/storage/database_handle.hpp"
 
 namespace duckdb {
 
+class AllocatorBlockReservation;
 class DatabaseInstance;
+class SingleFileBlockManager;
 struct MetadataHandle;
 enum class FreeBlockType { NEWLY_USED_BLOCK, CHECKPOINTED_BLOCK };
+
+//! Holds allocator locks and all nodes required to mark committed drops without allocation.
+class PreparedBlockModificationBatch {
+public:
+	PreparedBlockModificationBatch(PreparedBlockModificationBatch &&other) noexcept = default;
+	PreparedBlockModificationBatch &operator=(PreparedBlockModificationBatch &&other) noexcept = delete;
+	~PreparedBlockModificationBatch() = default;
+
+	PreparedBlockModificationBatch(const PreparedBlockModificationBatch &) = delete;
+	PreparedBlockModificationBatch &operator=(const PreparedBlockModificationBatch &) = delete;
+
+private:
+	enum class FinalDropTarget : uint8_t { NONE, MODIFIED, FREE, FREE_IN_USE };
+
+	struct DropDelta {
+		block_id_t block_id;
+		idx_t drop_count;
+		uint32_t remaining_references = 0;
+		FinalDropTarget target = FinalDropTarget::NONE;
+	};
+
+	PreparedBlockModificationBatch(SingleFileBlockManager &manager_p, vector<DropDelta> deltas_p,
+	                               set<block_id_t> staged_free_nodes_p,
+	                               unordered_set<block_id_t> staged_modified_nodes_p,
+	                               vector<shared_ptr<BlockHandle>> held_blocks_p, unique_lock<mutex> block_lock_p,
+	                               unique_lock<mutex> reservation_lock_p);
+
+private:
+	friend class SingleFileBlockManager;
+
+	optional_ptr<SingleFileBlockManager> manager;
+	vector<DropDelta> deltas;
+	set<block_id_t> staged_free_nodes;
+	unordered_set<block_id_t> staged_modified_nodes;
+	vector<shared_ptr<BlockHandle>> held_blocks;
+	bool applied = false;
+	unique_lock<mutex> block_lock;
+	unique_lock<mutex> reservation_lock;
+};
+
+//! One retirement entry's persistent drops and complete runtime-protected block set.
+struct CheckpointBlockDropSource {
+	CheckpointBlockDropSource(const vector<block_id_t> &actions_p, const vector<block_id_t> &protected_resources_p,
+	                          const AllocatorBlockReservation &reservation_p)
+	    : actions(actions_p), protected_resources(protected_resources_p), reservation(reservation_p) {
+	}
+
+	reference<const vector<block_id_t>> actions;
+	reference<const vector<block_id_t>> protected_resources;
+	reference<const AllocatorBlockReservation> reservation;
+};
+
+//! Holds allocator locks and all nodes required to apply a validated checkpoint drop without allocation.
+class PreparedCheckpointBlockDropBatch {
+public:
+	PreparedCheckpointBlockDropBatch(PreparedCheckpointBlockDropBatch &&other) noexcept = default;
+	PreparedCheckpointBlockDropBatch &operator=(PreparedCheckpointBlockDropBatch &&other) noexcept = delete;
+	~PreparedCheckpointBlockDropBatch() = default;
+
+	PreparedCheckpointBlockDropBatch(const PreparedCheckpointBlockDropBatch &) = delete;
+	PreparedCheckpointBlockDropBatch &operator=(const PreparedCheckpointBlockDropBatch &) = delete;
+
+private:
+	struct DropDelta {
+		block_id_t block_id;
+		idx_t drop_count;
+		uint32_t remaining_references = 0;
+	};
+
+	PreparedCheckpointBlockDropBatch(SingleFileBlockManager &manager_p, vector<DropDelta> deltas_p,
+	                                 set<block_id_t> staged_free_nodes_p, unique_lock<mutex> block_lock_p,
+	                                 unique_lock<mutex> reservation_lock_p);
+
+private:
+	friend class SingleFileBlockManager;
+
+	optional_ptr<SingleFileBlockManager> manager;
+	vector<DropDelta> deltas;
+	set<block_id_t> staged_free_nodes;
+	bool applied = false;
+	unique_lock<mutex> block_lock;
+	unique_lock<mutex> reservation_lock;
+};
 
 struct EncryptionOptions {
 	//! indicates whether the db is encrypted
@@ -96,8 +182,15 @@ public:
 	void MarkBlockAsUsed(block_id_t block_id) override;
 	//! Mark a block as modified (re-writeable after a checkpoint)
 	void MarkBlockAsModified(block_id_t block_id) override;
+	PreparedBlockModificationBatch PrepareBlockDropsForCommit(const vector<block_id_t> &actions);
+	void ApplyPreparedBlockDrops(PreparedBlockModificationBatch &&batch) noexcept;
+	//! Sources and reservations must remain stable until the returned batch is applied or destroyed.
+	PreparedCheckpointBlockDropBatch PrepareBlockDropsForCheckpoint(const vector<CheckpointBlockDropSource> &sources);
+	void ApplyPreparedBlockDrops(PreparedCheckpointBlockDropBatch &&batch) noexcept;
 	//! Increase the reference count of a block. The block should hold at least one reference
 	void IncreaseBlockReferenceCount(block_id_t block_id) override;
+	shared_ptr<BlockHandle> RegisterBlockReservation(block_id_t block_id) override;
+	void UnregisterBlockReservation(block_id_t block_id) noexcept override;
 	//! UnregisterBlock, only accepts non-temporary block ids
 	void UnregisterBlock(block_id_t id) override;
 	//! Return the meta block id
@@ -126,6 +219,8 @@ public:
 	}
 	//! Returns the number of total blocks
 	idx_t TotalBlocks() override;
+	//! Returns whether a complete block is present in the physical database file.
+	bool BlockExistsOnDisk(block_id_t block_id) const;
 	//! Returns the number of free blocks
 	idx_t FreeBlocks() override;
 	//! Whether or not the attached database is a remote file
@@ -193,6 +288,7 @@ private:
 	block_id_t GetFreeBlockIdInternal(FreeBlockType type);
 	//! Adds a free block to the free_list, returns true if it was added to the regular free_list
 	bool AddFreeBlock(unique_lock<mutex> &lock, block_id_t block_id);
+	void UnregisterBlockHandle(block_id_t block_id) override;
 
 private:
 	AttachedDatabase &db;
