@@ -1,0 +1,101 @@
+#include "duckdb/storage/recluster/recluster_task_context.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_output_writer.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+
+namespace duckdb {
+
+ReclusterTaskContext::ReclusterTaskContext(persistent_table_id_t table_id_p, uint64_t initialization_token_p,
+                                           ReclusterCandidate candidate_p, SortOrderDefinition sort_definition_p,
+                                           vector<idx_t> physical_sort_indexes_p, shared_ptr<DataTable> storage_p,
+                                           AttachedDatabase &db_p, optional_ptr<ClientContext> driver_context_p,
+                                           idx_t max_threads_p)
+    : table_id(table_id_p), initialization_token(initialization_token_p), candidate(std::move(candidate_p)),
+      sort_definition(std::move(sort_definition_p)), physical_sort_indexes(std::move(physical_sort_indexes_p)),
+      storage(std::move(storage_p)), row_id_remap(candidate.expected_row_groups), db(db_p.shared_from_this()),
+      driver_context(driver_context_p), max_threads(max_threads_p), snapshot_start_time(0) {
+	if (table_id == hugeint_t(0, 0) || initialization_token == 0 || !storage || sort_definition.columns.empty() ||
+	    sort_definition.sort_order_id != candidate.sort_order_id ||
+	    physical_sort_indexes.size() != sort_definition.columns.size()) {
+		throw InternalException("Invalid recluster task context");
+	}
+
+	snapshot_connection = make_uniq<Connection>(db_p.GetDatabase());
+	auto &transaction_context = snapshot_connection->context->transaction;
+	transaction_context.BeginTransaction();
+	transaction_context.SetReadOnly();
+	auto &transaction = DuckTransaction::Get(*snapshot_connection->context, db_p);
+	snapshot_start_time = transaction.start_time;
+}
+
+idx_t ReclusterTaskContext::GetThreadLimit(idx_t available_threads) const {
+	if (available_threads == 0) {
+		return 1;
+	}
+	return max_threads == 0 ? available_threads : MinValue(available_threads, max_threads);
+}
+
+ReclusterTaskContext::~ReclusterTaskContext() {
+}
+
+bool ReclusterTaskContext::HasActiveSnapshot() const {
+	return snapshot_connection && snapshot_connection->context->transaction.HasActiveTransaction();
+}
+
+ClientContext &ReclusterTaskContext::GetSnapshotContext() {
+	if (!HasActiveSnapshot()) {
+		throw InternalException("Recluster task read snapshot is no longer active");
+	}
+	return *snapshot_connection->context;
+}
+
+DuckTransaction &ReclusterTaskContext::GetSnapshotTransaction() {
+	return DuckTransaction::Get(GetSnapshotContext(), *db);
+}
+
+void ReclusterTaskContext::InterruptCheck() const {
+	if (HasActiveSnapshot()) {
+		snapshot_connection->context->InterruptCheck();
+	}
+	if (driver_context) {
+		driver_context->InterruptCheck();
+	}
+}
+
+void ReclusterTaskContext::CloseSnapshot() {
+	if (!snapshot_connection) {
+		return;
+	}
+	auto connection = std::move(snapshot_connection);
+	if (connection->context->transaction.HasActiveTransaction()) {
+		connection->context->transaction.Rollback(nullptr);
+	}
+}
+
+ReclusterOutput &ReclusterTaskContext::GetOutput() {
+	if (!output) {
+		throw InternalException("Recluster task has no private output");
+	}
+	return *output;
+}
+
+const ReclusterOutput &ReclusterTaskContext::GetOutput() const {
+	if (!output) {
+		throw InternalException("Recluster task has no private output");
+	}
+	return *output;
+}
+
+void ReclusterTaskContext::SetOutput(unique_ptr<ReclusterOutput> output_p) {
+	if (!output_p || output) {
+		throw InternalException("Invalid recluster private output installation");
+	}
+	output = std::move(output_p);
+}
+
+} // namespace duckdb

@@ -1,0 +1,104 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/storage/recluster/table_recluster_state.hpp
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/map.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/storage/recluster/checkpoint_snapshot.hpp"
+#include "duckdb/storage/recluster/range_task.hpp"
+
+namespace duckdb {
+
+class ReclusterManager;
+
+struct TableReclusterTaskStatus {
+	idx_t active_prepare_tasks = 0;
+	idx_t pending_finalize_tasks = 0;
+	idx_t pending_delete_rows = 0;
+	idx_t prepared_bytes = 0;
+};
+
+struct TableReclusterCatalogSnapshot {
+	bool accepts_new_tasks = false;
+	persistent_table_id_t table_id = hugeint_t(0, 0);
+	sort_order_id_t sort_order_id = INVALID_SORT_ORDER_ID;
+	uint64_t storage_generation_id = 0;
+	shared_ptr<const CheckpointLayoutSnapshot> checkpoint;
+};
+
+struct TableReclusterSchedulingSnapshot : TableReclusterCatalogSnapshot {
+	vector<RowGroupRange> reserved_ranges;
+};
+
+class TableReclusterState {
+public:
+	explicit TableReclusterState(uint64_t initialization_token);
+
+	uint64_t GetInitializationToken() const {
+		return initialization_token;
+	}
+
+	void SynchronizeCatalog(persistent_table_id_t table_id, sort_order_id_t sort_order_id,
+	                        uint64_t storage_generation_id, bool accept_new_tasks);
+	bool TryInstallCheckpointSnapshot(sort_order_id_t sort_order_id, uint64_t storage_generation_id,
+	                                  shared_ptr<const CheckpointLayoutSnapshot> snapshot) noexcept;
+	bool HasUsableCheckpoint() const;
+	TableReclusterCatalogSnapshot GetCatalogSnapshot() const;
+	TableReclusterSchedulingSnapshot GetSchedulingSnapshot() const;
+	bool TryRegisterTask(shared_ptr<RangeTask> task);
+	bool OwnsTask(const shared_ptr<RangeTask> &task) const;
+	shared_ptr<RangeTask> GetTask(recluster_task_id_t task_id) const;
+	shared_ptr<RangeTask> GetTaskForRow(row_t row_id) const;
+	vector<shared_ptr<RangeTask>> DisableAndGetTasks();
+	void RemoveTask(recluster_task_id_t task_id);
+	TableReclusterTaskStatus GetTaskStatus() const;
+	optional<int64_t> ObserveRemainingWorkAgeMsIfMatches(persistent_table_id_t table_id, sort_order_id_t sort_order_id,
+	                                                     uint64_t storage_generation_id, bool has_remaining_work);
+	void SetLastError(string error);
+	optional<string> GetLastError() const;
+
+	idx_t GetTaskCount() const;
+
+private:
+	friend class ReclusterManager;
+
+	unique_lock<mutex> LockFinalize() {
+		return unique_lock<mutex>(finalize_mutex);
+	}
+	unique_lock<mutex> TryLockExplicit() {
+		return unique_lock<mutex>(explicit_mutex, std::try_to_lock);
+	}
+
+	struct RangeReservation {
+		RowGroupRange range;
+		recluster_task_id_t task_id;
+	};
+
+	bool RangeIsAvailable(const RowGroupRange &range) const;
+	void RemoveTaskInternal(recluster_task_id_t task_id);
+
+private:
+	uint64_t initialization_token;
+	mutable mutex finalize_mutex;
+	mutable mutex explicit_mutex;
+	mutable mutex task_lock;
+	bool accept_new_tasks = false;
+	persistent_table_id_t table_id = hugeint_t(0, 0);
+	sort_order_id_t current_sort_order_id = INVALID_SORT_ORDER_ID;
+	uint64_t current_storage_generation_id = 0;
+	shared_ptr<const CheckpointLayoutSnapshot> last_checkpoint;
+	map<row_t, RangeReservation> reserved_ranges;
+	unordered_map<recluster_task_id_t, shared_ptr<RangeTask>> tasks;
+	optional<int64_t> remaining_work_observed_ms;
+	optional<string> last_error;
+};
+
+} // namespace duckdb

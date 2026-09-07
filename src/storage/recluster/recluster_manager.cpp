@@ -1,0 +1,867 @@
+#include "duckdb/storage/recluster/recluster_manager.hpp"
+
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/duck_catalog.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/storage/block_manager.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/recluster/recluster_candidate.hpp"
+#include "duckdb/storage/recluster/recluster_block_metrics.hpp"
+#include "duckdb/storage/recluster/recluster_commit.hpp"
+#include "duckdb/storage/recluster/recluster_delete_catchup.hpp"
+#include "duckdb/storage/recluster/range_task.hpp"
+#include "duckdb/storage/recluster/recluster_output_writer.hpp"
+#include "duckdb/storage/recluster/recluster_task_context.hpp"
+#include "duckdb/storage/recluster/table_recluster_state.hpp"
+#include "duckdb/storage/recluster/table_sort_bind.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
+
+#include <chrono>
+#include <exception>
+#include <thread>
+
+namespace duckdb {
+
+static constexpr idx_t RECLUSTER_CONVERSION_ROW_GROUP_TARGET = 32;
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_TIMEOUT {5000};
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_INITIAL_DELAY {1};
+static constexpr std::chrono::milliseconds EXPLICIT_FINALIZE_RETRY_MAX_DELAY {50};
+
+ReclusterManager::ReclusterManager(AttachedDatabase &db_p)
+    : db(db_p), wal_block_retention(db_p), retirement_registry(db_p) {
+}
+
+uint64_t ReclusterManager::AllocateInitializationToken() {
+	auto result = next_initialization_token.fetch_add(1);
+	if (result == 0 || result == NumericLimits<uint64_t>::Maximum()) {
+		throw InternalException("Recluster table initialization token space is exhausted");
+	}
+	return result;
+}
+
+uint64_t ReclusterManager::BeginCheckpoint() {
+	auto result = next_checkpoint_number.fetch_add(1);
+	if (result == 0 || result == NumericLimits<uint64_t>::Maximum()) {
+		throw InternalException("Recluster checkpoint number space is exhausted");
+	}
+	return result;
+}
+
+shared_ptr<TableReclusterState> ReclusterManager::SynchronizeTable(DuckTableEntry &table) {
+	if (!table.HasSortHistory()) {
+		return nullptr;
+	}
+	auto &sort_metadata = *table.GetSortMetadata();
+	auto &storage = table.GetStorage();
+	auto &table_info = *storage.GetDataTableInfo();
+	auto state = table_info.GetReclusterState();
+	if (!state) {
+		state = table_info.GetOrCreateReclusterState(AllocateInitializationToken());
+	}
+	auto storage_generation_id = storage.GetRowGroupCollection()->GetStorageGenerationId();
+	auto accept_new_tasks = sort_metadata.IsEnabled() && !db.IsReadOnly();
+	state->SynchronizeCatalog(sort_metadata.table_id, sort_metadata.current_sort_order_id, storage_generation_id,
+	                          accept_new_tasks);
+
+	lock_guard<mutex> guard(queue_lock);
+	if (accept_new_tasks) {
+		enabled_tables.insert(sort_metadata.table_id);
+	} else {
+		enabled_tables.erase(sort_metadata.table_id);
+	}
+	return state;
+}
+
+optional<PendingCheckpointTableState> ReclusterManager::PrepareCheckpoint(DuckTableEntry &table,
+                                                                          uint64_t checkpoint_number) {
+	if (!table.SortEnabled()) {
+		SynchronizeTable(table);
+		return nullopt;
+	}
+	auto state = SynchronizeTable(table);
+	auto &storage = table.GetStorage();
+	auto snapshot =
+	    BuildCheckpointLayoutSnapshot(*storage.GetRowGroupCollection(), storage.Columns(), checkpoint_number);
+	if (!snapshot) {
+		return nullopt;
+	}
+
+	PendingCheckpointTableState result;
+	result.table_id = table.GetSortMetadata()->table_id;
+	result.sort_order_id = table.GetSortMetadata()->current_sort_order_id;
+	result.initialization_token = state->GetInitializationToken();
+	result.state = std::move(state);
+	result.storage = storage.shared_from_this();
+	result.candidate_snapshot = make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(*snapshot));
+	return result;
+}
+
+void ReclusterManager::OnCheckpointSuccess(vector<PendingCheckpointTableState> &&states) noexcept {
+	ClearAutoCheckpointRequest();
+	vector<QualifiedName> installed_tables;
+	for (auto &pending : states) {
+		if (!pending.storage || !pending.storage->IsMainTable() || !pending.candidate_snapshot) {
+			continue;
+		}
+		auto current_state = pending.storage->GetDataTableInfo()->GetReclusterState();
+		if (current_state.get() != pending.state.get()) {
+			continue;
+		}
+		auto catalog_state = current_state->GetCatalogSnapshot();
+		if (current_state->GetInitializationToken() != pending.initialization_token ||
+		    catalog_state.table_id != pending.table_id) {
+			continue;
+		}
+		auto storage_generation_id = pending.storage->GetRowGroupCollection()->GetStorageGenerationId();
+		if (storage_generation_id != pending.candidate_snapshot->storage_generation_id) {
+			continue;
+		}
+		if (pending.state->TryInstallCheckpointSnapshot(pending.sort_order_id, storage_generation_id,
+		                                                std::move(pending.candidate_snapshot))) {
+			try {
+				auto &table_info = *pending.storage->GetDataTableInfo();
+				auto schema_path = table_info.GetSchemaPath();
+				schema_path.insert(schema_path.begin(), db.GetName());
+				installed_tables.emplace_back(std::move(schema_path), table_info.GetTableName());
+			} catch (...) { // NOLINT: checkpoint publication cannot fail while queuing best-effort background work
+			}
+		}
+	}
+	if (!installed_tables.empty()) {
+		RequestAutoRecluster(installed_tables);
+	}
+}
+
+template <class CALLBACK>
+static void ScanReclusterTables(AttachedDatabase &db, CALLBACK &&callback) {
+	auto &catalog = db.GetCatalog().Cast<DuckCatalog>();
+	catalog.ScanSchemas([&](SchemaCatalogEntry &schema) {
+		schema.Scan(CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+			if (!entry.internal && entry.type == CatalogType::TABLE_ENTRY) {
+				callback(entry.Cast<DuckTableEntry>());
+			}
+		});
+	});
+}
+
+vector<QualifiedName> ReclusterManager::DiscoverSortedTables() {
+	vector<QualifiedName> result;
+	ScanReclusterTables(db, [&](DuckTableEntry &table) {
+		if (table.SortEnabled()) {
+			result.push_back(table.schema.GetQualifiedName(table.name));
+		}
+	});
+	return result;
+}
+
+void ReclusterManager::InitializeCheckpointTables() {
+	ScanReclusterTables(db, [&](DuckTableEntry &table) {
+		if (!table.SortEnabled()) {
+			return;
+		}
+		auto state = SynchronizeTable(table);
+		auto &storage = table.GetStorage();
+		auto snapshot = BuildCheckpointLayoutSnapshot(*storage.GetRowGroupCollection(), storage.Columns(), 0);
+		if (!snapshot) {
+			return;
+		}
+		state->TryInstallCheckpointSnapshot(table.GetSortMetadata()->current_sort_order_id,
+		                                    snapshot->storage_generation_id,
+		                                    make_shared_ptr<const CheckpointLayoutSnapshot>(std::move(*snapshot)));
+	});
+}
+
+void ReclusterManager::SynchronizeLoadedCatalog() {
+	{
+		lock_guard<mutex> guard(queue_lock);
+		enabled_tables.clear();
+	}
+	ScanReclusterTables(db, [&](DuckTableEntry &table) {
+		if (table.HasSortHistory()) {
+			SynchronizeTable(table);
+		}
+	});
+}
+
+static recluster_task_id_t GenerateReclusterTaskId(TableReclusterState &state) {
+	for (idx_t attempt = 0; attempt < 8; attempt++) {
+		auto task_id = UUID::GenerateRandomUUID();
+		if (task_id != recluster_task_id_t(0, 0) && !state.GetTask(task_id)) {
+			return task_id;
+		}
+	}
+	throw InternalException("Failed to allocate a unique recluster task ID");
+}
+
+const char *ReclusterExplicitStateToString(ReclusterExplicitState state) {
+	switch (state) {
+	case ReclusterExplicitState::COMPLETE:
+		return "COMPLETE";
+	case ReclusterExplicitState::BUDGET_EXHAUSTED:
+		return "BUDGET_EXHAUSTED";
+	case ReclusterExplicitState::NO_ELIGIBLE_RANGE:
+		return "NO_ELIGIBLE_RANGE";
+	case ReclusterExplicitState::ALREADY_RUNNING:
+		return "ALREADY_RUNNING";
+	case ReclusterExplicitState::FAILED:
+		return "FAILED";
+	default:
+		throw InternalException("Unknown explicit recluster state");
+	}
+}
+
+static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange &range) {
+	unordered_set<block_id_t> blocks;
+	LayoutRowGroupCursor cursor(storage.GetRowGroupCollection()->GetCurrentSnapshot(), range);
+	LayoutRowGroupEntry entry;
+	while (cursor.Next(entry)) {
+		AddReclusterRowGroupBlocks(*entry.row_group, blocks);
+	}
+	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
+}
+
+static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const ReclusterLayoutAnalysis &analysis) {
+	unordered_set<block_id_t> blocks;
+	idx_t transient_bytes = 0;
+	bool has_remaining_work = false;
+	for (auto &row_group_analysis : analysis.GetRowGroups()) {
+		if (!analysis.RequiresRewrite(row_group_analysis)) {
+			continue;
+		}
+		has_remaining_work = true;
+		auto &row_group = *row_group_analysis.entry.row_group;
+		auto has_persistent_blocks = AddReclusterRowGroupBlocks(row_group, blocks);
+		auto row_group_transient_bytes =
+		    GetReclusterRowGroupTransientBytes(row_group, row_group_analysis.physical_rows, has_persistent_blocks);
+		transient_bytes = SaturatingAddReclusterValue(transient_bytes, row_group_transient_bytes);
+	}
+	auto persistent_bytes = GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
+	auto total_bytes = SaturatingAddReclusterValue(persistent_bytes, transient_bytes);
+	if (total_bytes > 0 || !has_remaining_work) {
+		return total_bytes;
+	}
+	return 1;
+}
+
+idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
+	ReclusterLayoutAnalysis analysis(*storage.GetRowGroupCollection(), storage.Columns(), state);
+	return EstimateAnalyzedRemainingReclusterBytes(storage, analysis);
+}
+
+ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
+                                                        optional_ptr<ClientContext> driver_context, idx_t max_threads) {
+	auto &storage = table.GetStorage();
+	if (&storage.GetDataTableInfo()->GetDB() != &db) {
+		throw InternalException("Cannot start a recluster task through a different attached database");
+	}
+	auto state = storage.GetDataTableInfo()->GetReclusterState();
+	if (!state) {
+		return {};
+	}
+
+	shared_ptr<RangeTask> task;
+	while (true) {
+		auto table_write_lock = storage.GetDataTableInfo()->GetExclusiveReclusterWriteLock();
+		auto layout_lock = TryGetSharedLayoutPublishLock();
+		if (!layout_lock) {
+			table_write_lock.reset();
+			auto wait_for_checkpoint = GetSharedLayoutPublishLock();
+			(void)wait_for_checkpoint;
+			continue;
+		}
+
+		if (!storage.IsMainTable() || !table.SortEnabled()) {
+			return {};
+		}
+		auto &metadata = *table.GetSortMetadata();
+		auto definition = metadata.GetCurrent();
+		auto catalog_state = state->GetCatalogSnapshot();
+		if (metadata.table_id != catalog_state.table_id || !definition ||
+		    definition->sort_order_id != candidate.sort_order_id) {
+			return {};
+		}
+		auto validated =
+		    RevalidateReclusterCandidate(*storage.GetRowGroupCollection(), storage.Columns(), *state, candidate);
+		if (!validated) {
+			return {};
+		}
+
+		auto physical_sort_indexes = BindPersistentSortIndexes(storage.Columns(), *definition);
+		auto task_id = GenerateReclusterTaskId(*state);
+		auto task_context = make_uniq<ReclusterTaskContext>(
+		    metadata.table_id, state->GetInitializationToken(), std::move(*validated), *definition,
+		    std::move(physical_sort_indexes), storage.shared_from_this(), db, driver_context, max_threads);
+		task = make_shared_ptr<RangeTask>(task_id, std::move(task_context));
+		if (!state->TryRegisterTask(task)) {
+			return {ReclusterTaskStartStatus::RANGE_UNAVAILABLE, nullptr};
+		}
+		break;
+	}
+
+	if (!task->TryAdvance(RangeTaskState::STARTING, RangeTaskState::PREPARING)) {
+		task->TryEnterCancelling();
+		task->TryDetach();
+		task->GetTaskContext().CloseSnapshot();
+		state->RemoveTask(task->GetTaskId());
+		return {ReclusterTaskStartStatus::CANCELLED, nullptr};
+	}
+	return {ReclusterTaskStartStatus::STARTED, std::move(task)};
+}
+
+static bool CheckFinalizeManifest(const ReplacementManifest &manifest) {
+	try {
+		manifest.VerifySeal();
+		return true;
+	} catch (SerializationException &) {
+		return false;
+	}
+}
+
+static bool CheckFinalizeCheckpoint(const shared_ptr<const CheckpointLayoutSnapshot> &checkpoint,
+                                    const ReclusterCandidate &candidate) {
+	if (!checkpoint || checkpoint->storage_generation_id != candidate.storage_generation_id) {
+		return false;
+	}
+	return FindCheckpointRowGroups(*checkpoint, candidate.expected_row_groups).IsValid();
+}
+
+enum class FinalizeInputCheck : uint8_t { VALID, LAYOUT_CHANGED, INVALID };
+
+static FinalizeInputCheck CheckFinalizeInputs(RowGroupCollection &collection, const vector<ColumnDefinition> &columns,
+                                              const ReclusterCandidate &candidate,
+                                              const shared_ptr<const RowGroupLayout> &expected_layout) {
+	auto snapshot = collection.GetCurrentSnapshot();
+	if (snapshot.kind != RowGroupCollectionSnapshot::Kind::VERSIONED_LAYOUT) {
+		return FinalizeInputCheck::INVALID;
+	}
+	if (snapshot.layout.get() != expected_layout.get()) {
+		return FinalizeInputCheck::LAYOUT_CHANGED;
+	}
+	if (snapshot.HasPatch(candidate.range) ||
+	    !MatchRowGroupPhysicalIdentitiesV1(snapshot, columns, candidate.expected_row_groups)) {
+		return FinalizeInputCheck::INVALID;
+	}
+	return FinalizeInputCheck::VALID;
+}
+
+static vector<row_t> BuildFinalDeleteRowIds(RangeTask &task, const ReclusterDeleteJournalScan &scan) {
+	vector<row_t> result;
+	result.reserve(scan.committed_rowid_count);
+	auto &remap = task.GetTaskContext().GetRowIdRemap();
+	for (auto &slot_ref : scan.slots) {
+		auto &slot = slot_ref.get();
+		if (slot.GetState() != DeleteSlotState::COMMITTED) {
+			continue;
+		}
+		for (auto old_row_id : slot.GetOldRowIds()) {
+			auto new_row_id = remap.GetNewRowId(old_row_id);
+			if (new_row_id != INVALID_REMAP_ROW_ID) {
+				result.push_back(new_row_id);
+			}
+		}
+	}
+	std::sort(result.begin(), result.end());
+	result.erase(std::unique(result.begin(), result.end()), result.end());
+	return result;
+}
+
+static ReclusterTaskFinalizeStatus CancelFinalizeTask(TableReclusterState &state, const shared_ptr<RangeTask> &task) {
+	if (task->TryEnterCancelling()) {
+		if (task->HasTaskContext() && task->GetTaskContext().HasOutput()) {
+			task->GetTaskContext().GetOutput().Abort();
+		}
+		if (task->HasTaskContext()) {
+			task->GetTaskContext().CloseSnapshot();
+		}
+		task->TryDetach();
+	} else {
+		task->TryFail();
+	}
+	state.RemoveTask(task->GetTaskId());
+	return ReclusterTaskFinalizeStatus::CANCELLED;
+}
+
+static ReclusterTaskFinalizeStatus FailFinalizeTask(TableReclusterState &state, const shared_ptr<RangeTask> &task) {
+	if (task->HasTaskContext() && task->GetTaskContext().HasOutput()) {
+		task->GetTaskContext().GetOutput().Abort();
+	}
+	if (task->HasTaskContext()) {
+		task->GetTaskContext().CloseSnapshot();
+	}
+	task->TryFail();
+	state.RemoveTask(task->GetTaskId());
+	return ReclusterTaskFinalizeStatus::STALE_TASK;
+}
+
+ReclusterTaskFinalizeStatus ReclusterManager::FinalizeTask(DuckTableEntry &table, const shared_ptr<RangeTask> &task) {
+	if (!task || !task->HasTaskContext()) {
+		return ReclusterTaskFinalizeStatus::STALE_TASK;
+	}
+	auto storage = task->GetTaskContext().GetStorage();
+	if (!storage || &storage->GetDataTableInfo()->GetDB() != &db) {
+		throw InternalException("Cannot finalize a recluster task through a different attached database");
+	}
+	auto state = storage->GetDataTableInfo()->GetReclusterState();
+	if (!state) {
+		return ReclusterTaskFinalizeStatus::STALE_TASK;
+	}
+
+	auto finalize_lock = state->LockFinalize();
+	if (task->IsAbortRequested()) {
+		return CancelFinalizeTask(*state, task);
+	}
+	if (!state->OwnsTask(task) || !task->TryAdvance(RangeTaskState::PREPARED, RangeTaskState::FINALIZING)) {
+		return ReclusterTaskFinalizeStatus::STALE_TASK;
+	}
+
+	bool entered_committing = false;
+	bool undo_pushed = false;
+	try {
+		auto &task_context = task->GetTaskContext();
+		auto &candidate = task_context.GetCandidate();
+		auto &output = task_context.GetOutput();
+		auto &manifest = output.GetManifest();
+		Connection maintenance_connection(db.GetDatabase());
+		unique_ptr<StorageLockKey> table_write_gate;
+		unique_ptr<StorageLockKey> layout_lock;
+		shared_ptr<const RowGroupLayout> current_layout;
+		shared_ptr<const CheckpointLayoutSnapshot> current_checkpoint;
+		unique_ptr<ReclusterCommitInfo> commit_info;
+		while (true) {
+			if (task->IsAbortRequested()) {
+				return CancelFinalizeTask(*state, task);
+			}
+			auto preparation_layout_lock = GetSharedLayoutPublishLock();
+			current_layout = storage->GetRowGroupCollection()->GetCurrentLayout();
+			if (!current_layout || current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
+			    storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() !=
+			        current_layout->layout_version) {
+				return FailFinalizeTask(*state, task);
+			}
+			current_checkpoint = state->GetCatalogSnapshot().checkpoint;
+			auto input_check =
+			    CheckFinalizeInputs(*storage->GetRowGroupCollection(), storage->Columns(), candidate, current_layout);
+			if (input_check == FinalizeInputCheck::LAYOUT_CHANGED) {
+				current_layout.reset();
+				current_checkpoint.reset();
+				continue;
+			}
+			if (manifest.header.task_id != task->GetTaskId() || manifest.header.table_id != task_context.GetTableId() ||
+			    manifest.header.prepared_layout_version != candidate.layout_version ||
+			    manifest.header.sort_order_id != candidate.sort_order_id ||
+			    manifest.header.input_range.start != task->GetRange().start ||
+			    manifest.header.input_range.end != task->GetRange().end ||
+			    manifest.old_groups != candidate.expected_row_groups ||
+			    manifest.sort_columns != task_context.GetSortDefinition().columns ||
+			    !manifest.MatchesPhysicalColumns(storage->Columns()) || !CheckFinalizeManifest(manifest) ||
+			    !CheckFinalizeCheckpoint(current_checkpoint, candidate) || input_check != FinalizeInputCheck::VALID) {
+				return FailFinalizeTask(*state, task);
+			}
+
+			auto patch = make_shared_ptr<LayoutPatch>();
+			patch->task_id = task->GetTaskId();
+			patch->range = task->GetRange();
+			patch->sort_order_id = output.GetSortOrderId();
+			patch->run_id = output.GetRunId();
+			patch->replaced_physical_rows = candidate.input_physical_rows;
+			patch->replacement_physical_rows = output.GetRowCount();
+			patch->replacement_groups = output.GetRowGroups();
+			auto pending_layout =
+			    storage->GetRowGroupCollection()->BuildPendingPatchedLayout(current_layout, std::move(patch));
+			auto resources = ReclusterCommitInfo::Prepare(task, storage, current_layout);
+			auto prepared_wal_checkpoint_iteration = resources.wal_checkpoint_iteration;
+			preparation_layout_lock.reset();
+			auto &journal_limits = task->GetDeleteJournalLimits();
+			auto final_scan = task->ScanResolvedDeletes(manifest.header.last_applied_delete_sequence,
+			                                            journal_limits.max_slots, journal_limits.max_rowids);
+			if (final_scan.blocked_by_reserved || final_scan.limit_exceeded ||
+			    final_scan.resolved_through != task->GetLatestDeleteSequence()) {
+				if (!task->TryAdvance(RangeTaskState::FINALIZING, RangeTaskState::PREPARED)) {
+					return CancelFinalizeTask(*state, task);
+				}
+				return ReclusterTaskFinalizeStatus::RETRY;
+			}
+			auto final_deleted_new_rowids = BuildFinalDeleteRowIds(*task, final_scan);
+			auto prepared_commit = make_uniq<ReclusterCommitInfo>(
+			    task, state, storage, current_layout, std::move(pending_layout), std::move(final_deleted_new_rowids),
+			    final_scan.resolved_through, std::move(resources));
+
+			table_write_gate = storage->GetDataTableInfo()->GetExclusiveReclusterWriteLock();
+			layout_lock = TryGetSharedLayoutPublishLock();
+			if (!layout_lock) {
+				table_write_gate.reset();
+				prepared_commit.reset();
+				current_layout.reset();
+				current_checkpoint.reset();
+				auto wait_for_checkpoint = GetSharedLayoutPublishLock();
+				wait_for_checkpoint.reset();
+				continue;
+			}
+			bool wal_generation_matches = true;
+			if (db.GetRecoveryMode() != RecoveryMode::NO_WAL_WRITES && db.GetStorageManager().HasWAL()) {
+				auto checkpoint_iteration =
+				    db.GetStorageManager().GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+				wal_generation_matches = checkpoint_iteration == prepared_wal_checkpoint_iteration;
+			}
+			auto gate_state = state->GetCatalogSnapshot();
+			if (storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
+			    gate_state.checkpoint.get() != current_checkpoint.get() ||
+			    task->GetLatestDeleteSequence() != final_scan.resolved_through || !wal_generation_matches) {
+				layout_lock.reset();
+				table_write_gate.reset();
+				prepared_commit.reset();
+				current_layout.reset();
+				current_checkpoint.reset();
+				continue;
+			}
+			commit_info = std::move(prepared_commit);
+			break;
+		}
+
+		if (task->IsAbortRequested()) {
+			return CancelFinalizeTask(*state, task);
+		}
+		auto current_definition = table.GetSortMetadata() ? table.GetSortMetadata()->GetCurrent() : nullptr;
+		auto catalog_state = state->GetCatalogSnapshot();
+		if (!storage->IsMainTable() || &table.GetStorage() != storage.get() || !table.SortEnabled() ||
+		    !current_definition || !(*current_definition == task_context.GetSortDefinition()) ||
+		    table.GetSortMetadata()->table_id != task_context.GetTableId() ||
+		    state->GetInitializationToken() != task_context.GetInitializationToken() || !state->OwnsTask(task) ||
+		    !catalog_state.accepts_new_tasks || catalog_state.table_id != task_context.GetTableId() ||
+		    catalog_state.sort_order_id != candidate.sort_order_id ||
+		    catalog_state.storage_generation_id != candidate.storage_generation_id ||
+		    storage->GetRowGroupCollection()->GetStorageGenerationId() != candidate.storage_generation_id ||
+		    !current_layout || !commit_info ||
+		    storage->GetRowGroupCollection()->GetCurrentLayout().get() != current_layout.get() ||
+		    catalog_state.checkpoint.get() != current_checkpoint.get() ||
+		    current_layout->patches.size() >= MAX_LAYOUT_PATCHES_PER_CHECKPOINT ||
+		    storage->GetDataTableInfo()->GetSortStorage()->current_layout_version.load() !=
+		        current_layout->layout_version) {
+			return FailFinalizeTask(*state, task);
+		}
+
+		if (!task->TryEnterCommitting()) {
+			return CancelFinalizeTask(*state, task);
+		}
+		entered_committing = true;
+		auto &maintenance_context = maintenance_connection.context->transaction;
+		maintenance_context.BeginTransaction();
+		MetaTransaction::Get(*maintenance_connection.context).ModifyDatabase(db, DatabaseModificationType());
+		auto &maintenance_transaction = DuckTransaction::Get(*maintenance_connection.context, db);
+		maintenance_transaction.SetIsReclusterMaintenanceTransaction();
+		maintenance_transaction.PushRecluster(std::move(commit_info));
+		undo_pushed = true;
+		maintenance_context.Commit();
+		if (task->GetState() != RangeTaskState::PUBLISHED) {
+			throw InternalException("Recluster maintenance transaction did not publish its task");
+		}
+		return ReclusterTaskFinalizeStatus::PUBLISHED;
+	} catch (...) {
+		if (!entered_committing) {
+			if (!task->TryAdvance(RangeTaskState::FINALIZING, RangeTaskState::PREPARED)) {
+				FailFinalizeTask(*state, task);
+			}
+		} else if (!undo_pushed && task->GetState() == RangeTaskState::COMMITTING) {
+			FailFinalizeTask(*state, task);
+		}
+		throw;
+	}
+}
+
+static void CancelExplicitTask(TableReclusterState &state, const shared_ptr<RangeTask> &task) {
+	if (!task || !state.OwnsTask(task)) {
+		return;
+	}
+	std::exception_ptr cleanup_error;
+	task->RequestCancel();
+	if (task->TryEnterCancelling()) {
+		if (task->HasTaskContext() && task->GetTaskContext().HasOutput()) {
+			try {
+				task->GetTaskContext().GetOutput().Abort();
+			} catch (...) {
+				cleanup_error = std::current_exception();
+			}
+		}
+		if (task->HasTaskContext()) {
+			try {
+				task->GetTaskContext().CloseSnapshot();
+			} catch (...) {
+				if (!cleanup_error) {
+					cleanup_error = std::current_exception();
+				}
+			}
+		}
+		if (!task->TryDetach() && !cleanup_error) {
+			cleanup_error = std::make_exception_ptr(InternalException("Failed to detach an explicit recluster task"));
+		}
+	} else if (!task->IsFinished()) {
+		task->TryFail();
+	}
+	state.RemoveTask(task->GetTaskId());
+	if (cleanup_error) {
+		std::rethrow_exception(cleanup_error);
+	}
+}
+
+ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, const QualifiedName &table_name,
+                                                      const ReclusterExplicitOptions &options) {
+	if (options.max_bytes == 0 || options.max_tasks == 0) {
+		throw InvalidInputException("Explicit recluster budgets must be greater than zero");
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw TransactionException("CALL recluster cannot run inside an explicit transaction");
+	}
+	if (db.IsReadOnly()) {
+		throw PermissionException("Cannot recluster a read-only database");
+	}
+
+	auto &initial_table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
+	auto storage = initial_table.GetStorage().shared_from_this();
+	if (&storage->GetDataTableInfo()->GetDB() != &db) {
+		throw InternalException("Cannot explicitly recluster a table through a different attached database");
+	}
+	shared_ptr<TableReclusterState> state;
+	{
+		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
+		if (!storage->IsMainTable()) {
+			throw TransactionException("Transaction conflict: cannot recluster table %s from an old catalog snapshot",
+			                           table_name.ToString());
+		}
+		if (!initial_table.SortEnabled()) {
+			throw InvalidInputException("Table %s does not have SORTED BY enabled", table_name.ToString());
+		}
+		state = SynchronizeTable(initial_table);
+	}
+	if (!state) {
+		throw InternalException("SORTED BY table has no recluster state");
+	}
+
+	ReclusterExplicitResult result;
+	result.table_name = table_name.ToString();
+	result.state = ReclusterExplicitState::COMPLETE;
+	auto explicit_lock = state->TryLockExplicit();
+	if (!explicit_lock.owns_lock() || state->GetTaskCount() != 0) {
+		result.state = ReclusterExplicitState::ALREADY_RUNNING;
+		result.message = "another maintenance task is already active for this table";
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+		return result;
+	}
+	bool checkpoint_created = false;
+	bool remaining_bytes_computed = false;
+	idx_t tasks_at_last_checkpoint = 0;
+	idx_t stale_attempts = 0;
+	while (result.tasks_completed < options.max_tasks) {
+		remaining_bytes_computed = false;
+		context.InterruptCheck();
+		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
+		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
+		if (!storage->IsMainTable() || &table.GetStorage() != storage.get() || !table.SortEnabled() ||
+		    storage->GetDataTableInfo()->GetReclusterState().get() != state.get()) {
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the table definition changed while recluster was running";
+			break;
+		}
+
+		auto caller_remaining_budget = options.max_bytes - result.input_bytes;
+		auto remaining_budget = MinValue(caller_remaining_budget, GetReclusterTaskInputByteLimit(*storage));
+		auto full_mode = options.mode == ReclusterMode::FULL;
+		auto max_row_group_limit =
+		    full_mode ? GetFullReclusterRowGroupLimit(*storage) : GetReclusterRowGroupLimit(*storage);
+		auto max_merge_runs = full_mode ? FULL_RECLUSTER_MAX_MERGE_RUNS : DEFAULT_RECLUSTER_MAX_MERGE_RUNS;
+		auto current_definition = table.GetSortMetadata()->GetCurrent();
+		if (!current_definition) {
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the current SORTED BY definition is missing";
+			break;
+		}
+		auto physical_sort_indexes = BindPersistentSortIndexes(storage->Columns(), *current_definition);
+		ReclusterLayoutAnalysis analysis(*storage->GetRowGroupCollection(), storage->Columns(), *state,
+		                                 optional_idx(physical_sort_indexes[0]));
+		auto checkpoint_row_groups = analysis.GetCheckpointRowGroupCount();
+		if (checkpoint_row_groups > 0) {
+			max_row_group_limit = MinValue(max_row_group_limit, checkpoint_row_groups);
+		}
+		idx_t max_row_groups = MinValue(max_row_group_limit, RECLUSTER_CONVERSION_ROW_GROUP_TARGET);
+		bool expanded_for_run = false;
+		ReclusterCandidateSelection selection;
+		idx_t candidate_bytes = 0;
+		while (true) {
+			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups, max_merge_runs);
+			limits.prioritize_overlap = !full_mode;
+			selection = analysis.SelectCandidate(limits);
+			if (!selection.candidate) {
+				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
+				    selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT) {
+					max_row_groups = max_row_group_limit;
+					expanded_for_run = true;
+					continue;
+				}
+				break;
+			}
+			candidate_bytes = EstimateReclusterRangeBytes(*storage, selection.candidate->range);
+			auto candidate_budget = full_mode && selection.candidate->type != ReclusterCandidateType::CONVERSION
+			                            ? caller_remaining_budget
+			                            : remaining_budget;
+			if (candidate_bytes <= candidate_budget ||
+			    (selection.candidate->row_group_count == 1 && candidate_bytes <= caller_remaining_budget)) {
+				break;
+			}
+			if (full_mode && selection.candidate->type != ReclusterCandidateType::CONVERSION) {
+				selection.candidate.reset();
+				break;
+			}
+			if (selection.candidate->row_group_count <= 1) {
+				selection.candidate.reset();
+				break;
+			}
+			auto scaled_row_groups = static_cast<idx_t>(
+			    (static_cast<long double>(selection.candidate->row_group_count) * candidate_budget) / candidate_bytes);
+			max_row_groups = MinValue(selection.candidate->row_group_count - 1, MaxValue<idx_t>(scaled_row_groups, 1));
+		}
+
+		if (!selection.candidate) {
+			result.remaining_recluster_bytes = EstimateAnalyzedRemainingReclusterBytes(*storage, analysis);
+			remaining_bytes_computed = true;
+			if (candidate_bytes > caller_remaining_budget || result.input_bytes >= options.max_bytes) {
+				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+				result.message = "the remaining byte budget cannot admit another row group";
+				break;
+			}
+			if (result.remaining_recluster_bytes == 0) {
+				result.state = ReclusterExplicitState::COMPLETE;
+				result.message = "no recluster work remains";
+				break;
+			}
+			auto made_progress_since_checkpoint = result.tasks_completed > tasks_at_last_checkpoint;
+			auto checkpoint_can_refresh_full = full_mode && made_progress_since_checkpoint &&
+			                                   selection.status == ReclusterCandidateSelectionStatus::NO_ELIGIBLE_RANGE;
+			auto can_create_checkpoint = !checkpoint_created || (full_mode && made_progress_since_checkpoint);
+			if (can_create_checkpoint && options.create_checkpoint &&
+			    (selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE ||
+			     checkpoint_can_refresh_full)) {
+				TransactionManager::Get(db).Checkpoint(context, false);
+				checkpoint_created = true;
+				tasks_at_last_checkpoint = result.tasks_completed;
+				continue;
+			}
+			result.state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
+			result.message = selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT
+			                     ? (full_mode ? "the next sorted run exceeds the FULL remap memory limit"
+			                                  : "the next sorted run exceeds the per-task row-group limit")
+			                     : "remaining work is waiting for a successful checkpoint";
+			break;
+		}
+
+		auto start = TryStartTask(table, *selection.candidate, context, options.max_threads);
+		if (start.status != ReclusterTaskStartStatus::STARTED || !start.task) {
+			if (start.status == ReclusterTaskStartStatus::RANGE_UNAVAILABLE) {
+				result.state = ReclusterExplicitState::ALREADY_RUNNING;
+				result.message = "the selected range is already being maintained";
+				break;
+			}
+			if (++stale_attempts < 8) {
+				continue;
+			}
+			result.state = ReclusterExplicitState::FAILED;
+			result.message = "the table changed repeatedly while selecting recluster work";
+			break;
+		}
+		stale_attempts = 0;
+
+		try {
+			WriteReclusterOutput(*start.task);
+			if (!start.task->TryAdvance(RangeTaskState::PREPARING, RangeTaskState::CATCHING_UP_DELETES)) {
+				throw InternalException("Failed to begin explicit recluster DELETE catch-up");
+			}
+			while (start.task->GetState() == RangeTaskState::CATCHING_UP_DELETES) {
+				ReclusterDeleteCatchup catchup(*start.task);
+				catchup.Run();
+			}
+			auto task_output_bytes = start.task->GetTaskContext().GetOutput().GetByteSize();
+
+			auto retry_deadline = std::chrono::steady_clock::now() + EXPLICIT_FINALIZE_RETRY_TIMEOUT;
+			auto retry_delay = EXPLICIT_FINALIZE_RETRY_INITIAL_DELAY;
+			while (true) {
+				context.InterruptCheck();
+				auto finalize_status = FinalizeTask(table, start.task);
+				if (finalize_status == ReclusterTaskFinalizeStatus::PUBLISHED) {
+					break;
+				}
+				if (finalize_status != ReclusterTaskFinalizeStatus::RETRY) {
+					throw IOException("Explicit recluster task could not publish its replacement layout");
+				}
+				if (std::chrono::steady_clock::now() >= retry_deadline) {
+					throw IOException("Explicit recluster timed out waiting for concurrent DELETE transactions");
+				}
+				std::this_thread::sleep_for(retry_delay);
+				retry_delay *= 2;
+				if (retry_delay > EXPLICIT_FINALIZE_RETRY_MAX_DELAY) {
+					retry_delay = EXPLICIT_FINALIZE_RETRY_MAX_DELAY;
+				}
+			}
+			result.tasks_completed++;
+			result.input_bytes = SaturatingAddReclusterValue(result.input_bytes, candidate_bytes);
+			result.output_bytes = SaturatingAddReclusterValue(result.output_bytes, task_output_bytes);
+		} catch (...) {
+			auto error = std::current_exception();
+			CancelExplicitTask(*state, start.task);
+			try {
+				std::rethrow_exception(error);
+			} catch (InterruptException &) {
+				throw;
+			} catch (FatalException &) {
+				throw;
+			} catch (DataCorruptionException &) {
+				throw;
+			} catch (SerializationException &) {
+				throw;
+			} catch (InternalException &) {
+				throw;
+			} catch (std::exception &ex) {
+				result.state = ReclusterExplicitState::FAILED;
+				result.message = ex.what();
+				break;
+			}
+		}
+	}
+
+	if (!remaining_bytes_computed) {
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+	}
+	if (result.state == ReclusterExplicitState::FAILED || result.state == ReclusterExplicitState::ALREADY_RUNNING ||
+	    result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE) {
+		if (result.state == ReclusterExplicitState::FAILED) {
+			state->SetLastError(result.message);
+		}
+		return result;
+	}
+	if (result.remaining_recluster_bytes == 0) {
+		result.state = ReclusterExplicitState::COMPLETE;
+		result.message = "no recluster work remains";
+	} else if (result.tasks_completed >= options.max_tasks) {
+		result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+		result.message = "the task budget was exhausted";
+	} else if (result.input_bytes >= options.max_bytes) {
+		result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
+		result.message = "the byte budget was exhausted";
+	}
+	return result;
+}
+
+} // namespace duckdb
