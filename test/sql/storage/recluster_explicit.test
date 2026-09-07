@@ -1,0 +1,466 @@
+# name: test/sql/storage/recluster_explicit.test
+# description: Explicitly recluster checkpointed SORTED BY table ranges
+# group: [storage]
+
+statement ok
+SET threads=1
+
+statement ok
+SET auto_recluster=false
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown
+
+statement ok
+SET debug_skip_checkpoint_on_commit=true
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE r
+
+statement ok
+CREATE TABLE plain(i INTEGER)
+
+statement error
+CALL recluster('r.main.plain')
+----
+<REGEX>:.*does not have SORTED BY enabled.*
+
+statement ok
+CREATE TABLE events(k INTEGER, payload BIGINT)
+
+statement ok
+INSERT INTO events SELECT ((i * 37) % 4096)::INTEGER, i FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE events SET SORTED BY (k)
+
+# SET changes the active rule and clears the preceding checkpoint snapshot.
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.events', create_checkpoint=false)
+----
+0	NO_ELIGIBLE_RANGE
+
+# One explicit call may create at most one checkpoint and then consume its candidate.
+query TIIIITT
+SELECT table_name, tasks_completed, (input_bytes > 0)::INTEGER, (output_bytes > 0)::INTEGER,
+       remaining_recluster_bytes, state, message
+FROM recluster('r.main.events', create_checkpoint=true, max_tasks=1)
+----
+r.main.events	1	1	1	0	COMPLETE	no recluster work remains
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM events
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM events
+----
+4096	8386560
+
+# Existing sorted runs use the streaming merge path and publish through the
+# same replacement manifest and WAL protocol.
+statement ok
+CREATE TABLE merged(k BIGINT, payload BIGINT) SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO merged SELECT x * 3 + (2 - {i}), {i} * 10000 + x FROM range(4096) t(x)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.merged', max_bytes='64MB', max_tasks=1)
+----
+1	0	COMPLETE
+
+query I
+SELECT run_count::BIGINT FROM duckdb_recluster_status() WHERE table_name = 'merged'
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM merged
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM merged
+----
+12288	148039680
+
+statement ok
+CREATE TABLE budgeted(k INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO budgeted SELECT (4095 - i)::INTEGER, repeat('x', 32) FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE budgeted SET SORTED BY (k)
+
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.budgeted', max_bytes='1B')
+----
+0	BUDGET_EXHAUSTED
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.budgeted', max_bytes='16MB', max_tasks=1)
+----
+1	COMPLETE
+
+statement error
+CALL recluster('r.main.events', max_tasks=0)
+----
+<REGEX>:.*max_tasks must be greater than zero.*
+
+statement error
+CALL recluster('r.main.events', max_bytes='-1MB')
+----
+<REGEX>:.*max_bytes must be a positive byte size.*
+
+statement error
+CALL recluster('r.main.events', mode='invalid')
+----
+<REGEX>:.*mode must be either 'incremental' or 'full'.*
+
+# Incremental mode leaves mature runs intact. FULL raises the explicit remap
+# budget and streams these runs even under a small memory limit.
+statement ok
+CREATE TABLE full_merge(k BIGINT, payload BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO full_merge SELECT x * 2 + 1, x FROM range(81920) t(x)
+
+statement ok
+INSERT INTO full_merge SELECT x * 2, 81920 + x FROM range(81920) t(x)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+SET memory_limit='16MB'
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.full_merge')
+----
+0	COMPLETE
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.full_merge', mode='full', max_bytes='1B')
+----
+0	BUDGET_EXHAUSTED
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.full_merge', mode='full')
+----
+1	0	COMPLETE
+
+query II
+SELECT run_count::BIGINT, (remaining_recluster_bytes = 0)::BIGINT
+FROM duckdb_recluster_status() WHERE table_name = 'full_merge'
+----
+1	1
+
+query II
+SELECT count(*), sum(payload) FROM full_merge
+----
+163840	13421690880
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_merge
+) WHERE k < previous_k
+----
+0
+
+statement ok
+SET memory_limit='1GB'
+
+# FULL checkpoints only after making progress, then continues with the next
+# merge level. Thirty-three input runs require a 32-way merge followed by a
+# second two-way merge.
+statement ok
+CREATE TABLE full_hierarchy(k BIGINT) SORTED BY (k)
+
+loop i 0 33
+
+statement ok
+INSERT INTO full_hierarchy SELECT x * 33 + (32 - {i}) FROM range(2048) t(x)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.full_hierarchy', mode='full')
+----
+2	0	COMPLETE
+
+query I
+SELECT run_count::BIGINT FROM duckdb_recluster_status() WHERE table_name = 'full_hierarchy'
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_hierarchy
+) WHERE k < previous_k
+----
+0
+
+# An existing runtime state must follow a RESET/SET transition instead of
+# treating the preceding sort order and checkpoint as current.
+statement ok
+CREATE TABLE respecified(k BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO respecified SELECT i FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE respecified RESET SORTED BY
+
+statement ok
+ALTER TABLE respecified SET SORTED BY (k)
+
+query IIT
+SELECT tasks_completed, (remaining_recluster_bytes > 0)::BIGINT, state
+FROM recluster('r.main.respecified', create_checkpoint=false)
+----
+0	1	NO_ELIGIBLE_RANGE
+
+statement ok
+BEGIN
+
+statement error
+CALL recluster('r.main.events')
+----
+<REGEX>:.*cannot run inside an explicit transaction.*
+
+statement ok
+ROLLBACK
+
+# A recovered checkpoint snapshot uses checkpoint number zero. Automatic work
+# waits for a new checkpoint, while an explicit caller can consume it after
+# full physical identity and layout revalidation.
+statement ok
+CREATE TABLE recovered_full(k BIGINT) SORTED BY (k)
+
+statement ok
+INSERT INTO recovered_full SELECT x * 2 + 1 FROM range(4096) t(x)
+
+statement ok
+INSERT INTO recovered_full SELECT x * 2 FROM range(4096) t(x)
+
+statement ok
+CHECKPOINT r
+
+# Reopen with the maintenance WAL still present and verify replayed layouts.
+statement ok
+USE memory
+
+restart
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r
+
+statement ok
+USE r
+
+query II
+SELECT count(*), sum(payload) FROM events
+----
+4096	8386560
+
+query II
+SELECT count(*), sum(payload) FROM merged
+----
+12288	148039680
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM merged
+) WHERE k < previous_k
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM full_merge
+----
+163840	13421690880
+
+query I
+SELECT count(*) FROM full_hierarchy
+----
+67584
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM full_hierarchy
+) WHERE k < previous_k
+----
+0
+
+query T
+SELECT blocked_reason FROM duckdb_recluster_status() WHERE table_name = 'recovered_full'
+----
+NO_CHECKPOINTED_RANGE
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.recovered_full', mode='full', create_checkpoint=false)
+----
+1	0	COMPLETE
+
+statement ok
+FORCE CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.recovered_full', mode='full')
+----
+0	0	COMPLETE
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM recovered_full
+) WHERE k < previous_k
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, lag(k) OVER () AS previous_k FROM budgeted
+) WHERE k < previous_k
+----
+0
+
+# Empty and single-row tables follow the same explicit maintenance path.
+statement ok
+SET auto_recluster=false
+
+statement ok
+CREATE TABLE empty_sorted(k INTEGER) SORTED BY (k)
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.empty_sorted', create_checkpoint=true)
+----
+0	0	COMPLETE
+
+statement ok
+CREATE TABLE single_sorted(k INTEGER) SORTED BY (k)
+
+statement ok
+INSERT INTO single_sorted VALUES (42)
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.single_sorted', create_checkpoint=true)
+----
+1	0	COMPLETE
+
+query I
+SELECT k FROM single_sorted
+----
+42
+
+# Recluster uses DuckDB's existing sort implementation for scalar and nested
+# keys, including NULLS LAST semantics.
+statement ok
+CREATE TABLE typed_keys(
+    v VARCHAR,
+    ts TIMESTAMP,
+    amount DECIMAL(18, 2),
+    nested_key INTEGER[],
+    payload BIGINT
+)
+
+statement ok
+INSERT INTO typed_keys
+SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE lpad(((4095 - i) % 97)::VARCHAR, 3, '0') END,
+       CASE WHEN i % 19 = 0 THEN NULL
+            ELSE TIMESTAMP '2026-01-01' + ((4095 - i) % 113) * INTERVAL 1 MINUTE END,
+       CASE WHEN i % 23 = 0 THEN NULL ELSE (((4095 - i) % 101) - 50)::DECIMAL(18, 2) END,
+       CASE WHEN i % 29 = 0 THEN NULL ELSE [((4095 - i) % 31)::INTEGER, (i % 7)::INTEGER] END,
+       i
+FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+ALTER TABLE typed_keys SET SORTED BY (v, ts, amount, nested_key)
+
+statement ok
+CHECKPOINT r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state
+FROM recluster('r.main.typed_keys')
+----
+1	0	COMPLETE
+
+query I
+SELECT count(*)
+FROM (
+    SELECT sort_key, lag(sort_key) OVER () AS previous_key
+    FROM (
+        SELECT create_sort_key(v, 'ASC NULLS LAST',
+                               ts, 'ASC NULLS LAST',
+                               amount, 'ASC NULLS LAST',
+                               nested_key, 'ASC NULLS LAST') AS sort_key
+        FROM typed_keys
+    ) keys
+)
+WHERE previous_key IS NOT NULL AND sort_key < previous_key
+----
+0
+
+query II
+SELECT count(*), sum(payload) FROM typed_keys
+----
+4096	8386560
+
+statement ok
+CHECKPOINT r
+
+statement ok
+USE memory
+
+statement ok
+DETACH r
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_explicit.db' AS r (READ_ONLY)
+
+statement error
+CALL recluster('r.main.events')
+----
+<REGEX>:.*Cannot recluster a read-only database.*

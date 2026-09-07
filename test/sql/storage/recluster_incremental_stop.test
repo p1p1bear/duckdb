@@ -1,0 +1,276 @@
+# name: test/sql/storage/recluster_incremental_stop.test
+# description: Incremental maintenance stops at mature or unhelpful runs while FULL can still merge them
+# group: [storage]
+
+statement ok
+SET threads=1
+
+statement ok
+SET auto_recluster=false
+
+statement ok
+SET debug_skip_checkpoint_on_commit=true
+
+statement ok
+SET debug_verify_blocks=true
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_incremental_stop.db' AS r (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+USE r
+
+# Each input has 32 full RGs and overlaps the other run completely.
+statement ok
+CREATE TABLE mature(k BIGINT) SORTED BY(k)
+
+loop i 0 2
+
+statement ok
+INSERT INTO mature SELECT 65535-i FROM range(65536) t(i)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query II
+SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() WHERE table_name='mature'
+----
+2	0
+
+loop i 0 2
+
+query IIT
+SELECT tasks_completed, input_bytes, state FROM recluster('r.main.mature', max_bytes='1B')
+----
+0	0	COMPLETE
+
+endloop
+
+# Small overlapping runs can merge without rewriting their mature neighbors.
+loop i 0 2
+
+statement ok
+INSERT INTO mature SELECT 8191-i FROM range(8192) t(i)
+
+endloop
+
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.mature', max_tasks=100)
+----
+1	COMPLETE
+
+query II
+SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() WHERE table_name='mature'
+----
+3	0
+
+statement ok
+CHECKPOINT r
+
+statement ok
+USE memory
+
+statement ok
+DETACH r
+
+statement ok
+ATTACH '{TEST_DIR}/recluster_incremental_stop.db' AS r (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE r
+
+query IIT
+SELECT tasks_completed, remaining_recluster_bytes, state FROM recluster('r.main.mature')
+----
+0	0	COMPLETE
+
+query II
+SELECT count(*), sum(k) FROM mature
+----
+147456	4362002432
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.mature', mode='full')
+----
+1	COMPLETE
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='mature'
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM mature) WHERE k<previous
+----
+0
+
+# Disjoint full runs need no rewrite, even when their physical sequence is inverted.
+statement ok
+CREATE TABLE disjoint(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO disjoint SELECT i+4096 FROM range(4096) t(i)
+
+statement ok
+INSERT INTO disjoint SELECT i FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM disjoint) WHERE k<previous
+----
+1
+
+query II
+SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() WHERE table_name='disjoint'
+----
+2	0
+
+query IIT
+SELECT tasks_completed, input_bytes, state FROM recluster('r.main.disjoint')
+----
+0	0	COMPLETE
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.disjoint', mode='full')
+----
+1	COMPLETE
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () previous FROM disjoint) WHERE k<previous
+----
+0
+
+# Disjoint ranges can still benefit from packing rows after small deletions.
+statement ok
+CREATE TABLE partial(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO partial SELECT i+16384 FROM range(8192) t(i)
+
+statement ok
+INSERT INTO partial SELECT i FROM range(8192) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+DELETE FROM partial WHERE k%8=0
+
+query I
+SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('partial')
+----
+8
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.partial')
+----
+1	COMPLETE
+
+query II
+SELECT count(*), sum(k) FROM partial
+----
+14336	176160768
+
+query I
+SELECT run_count FROM duckdb_recluster_status() WHERE table_name='partial'
+----
+1
+
+statement ok
+CHECKPOINT r
+
+query I
+SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('partial')
+----
+7
+
+# NULLs and non-finite bounds cannot prove that a merge is unhelpful.
+foreach special NULL 'NaN'::DOUBLE
+
+statement ok
+CREATE TABLE special_values(k DOUBLE) SORTED BY(k)
+
+statement ok
+INSERT INTO special_values SELECT CASE WHEN i=0 THEN {special} ELSE i+4096 END FROM range(4096) t(i)
+
+statement ok
+INSERT INTO special_values SELECT CASE WHEN i=0 THEN {special} ELSE i END FROM range(4096) t(i)
+
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.special_values')
+----
+1	COMPLETE
+
+query I
+SELECT count(*) FROM special_values
+----
+8192
+
+statement ok
+DROP TABLE special_values
+
+endloop
+
+# Maturity does not suppress required DELETE cleanup.
+statement ok
+CREATE TABLE cleanup(k BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO cleanup SELECT i FROM range(131072) t(i)
+
+statement ok
+CHECKPOINT r
+
+statement ok
+DELETE FROM cleanup WHERE k%4=0
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.cleanup')
+----
+1	COMPLETE
+
+query II
+SELECT count(*), sum(k) FROM cleanup
+----
+98304	6442450944
+
+# A changed rule converts the old layout even if its preceding run was mature.
+statement ok
+CREATE TABLE changed(k BIGINT, j BIGINT) SORTED BY(k)
+
+statement ok
+INSERT INTO changed SELECT i, 65535-i FROM range(65536) t(i)
+
+statement ok
+ALTER TABLE changed SET SORTED BY(j)
+
+statement ok
+CHECKPOINT r
+
+query IT
+SELECT tasks_completed, state FROM recluster('r.main.changed')
+----
+1	COMPLETE
+
+query II
+SELECT count(*), sum(k) FROM changed
+----
+65536	2147450880
+
+query I
+SELECT count(*) FROM (SELECT j, lag(j) OVER () previous FROM changed) WHERE j<previous
+----
+0
+
+statement ok
+CHECKPOINT r

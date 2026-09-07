@@ -1,0 +1,92 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// duckdb/storage/recluster/recluster_output_writer.hpp
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/storage/block.hpp"
+#include "duckdb/storage/recluster/replacement_manifest.hpp"
+#include "duckdb/storage/recluster/recluster_types.hpp"
+
+namespace duckdb {
+
+class BlockManager;
+class RangeTask;
+class ReclusterCommitInfo;
+class ReclusterDeleteCatchup;
+class RowGroup;
+class RowGroupCollection;
+class TaskPrivateMetadataBlockOwner;
+struct PersistentCollectionData;
+
+class ReclusterOutput {
+public:
+	~ReclusterOutput();
+
+	const shared_ptr<RowGroupCollection> &GetCollection() const {
+		return collection;
+	}
+	const PersistentCollectionData &GetPersistentData() const;
+	const vector<block_id_t> &GetBlockIds() const {
+		return block_ids;
+	}
+	const ReplacementManifest &GetManifest() const {
+		return manifest;
+	}
+	MetaBlockPointer GetManifestPointer() const {
+		return manifest_pointer;
+	}
+	vector<shared_ptr<RowGroup>> GetRowGroups() const;
+
+	sort_order_id_t GetSortOrderId() const {
+		return manifest.header.sort_order_id;
+	}
+	sort_run_id_t GetRunId() const {
+		return manifest.header.run_id;
+	}
+	idx_t GetRowCount() const;
+	idx_t GetByteSize() const;
+
+	void MarkPublished();
+	void Abort();
+
+private:
+	friend class ReclusterDeleteCatchup;
+	friend class ReclusterCommitInfo;
+	friend void WriteReclusterOutput(RangeTask &task);
+
+	ReclusterOutput(BlockManager &block_manager, shared_ptr<RowGroupCollection> collection,
+	                unique_ptr<PersistentCollectionData> persistent_data,
+	                unique_ptr<TaskPrivateMetadataBlockOwner> replacement_metadata_owner,
+	                unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner, ReplacementManifest manifest,
+	                MetaBlockPointer manifest_pointer);
+	void AdoptTaskPrivateBlocks(vector<block_id_t> block_ids);
+	idx_t ApplyFinalDeletes(const vector<row_t> &new_rowids);
+	idx_t ApplyDeleteCatchup(vector<row_t> new_rowids, delete_sequence_t resolved_through);
+	idx_t ApplyCommittedDeletes(const vector<row_t> &new_rowids);
+	vector<block_id_t> GetReferencedBlockIds() const;
+	void RefreshBlockIds();
+
+private:
+	BlockManager &block_manager;
+	shared_ptr<RowGroupCollection> collection;
+	unique_ptr<PersistentCollectionData> persistent_data;
+	unique_ptr<TaskPrivateMetadataBlockOwner> replacement_metadata_owner;
+	unique_ptr<TaskPrivateMetadataBlockOwner> delete_metadata_owner;
+	unique_ptr<TaskPrivateMetadataBlockOwner> manifest_owner;
+	ReplacementManifest manifest;
+	MetaBlockPointer manifest_pointer;
+	vector<block_id_t> data_block_ids;
+	vector<block_id_t> block_ids;
+	bool owns_blocks = false;
+};
+
+void WriteReclusterOutput(RangeTask &task);
+
+} // namespace duckdb
