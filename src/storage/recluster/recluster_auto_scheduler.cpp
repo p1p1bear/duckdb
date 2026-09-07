@@ -27,6 +27,7 @@ namespace duckdb {
 static constexpr idx_t AUTO_RECLUSTER_MAX_BYTES = 1ULL << 30;
 static constexpr idx_t AUTO_RECLUSTER_MAX_THREADS = 2;
 static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_MIN_INTERVAL_MS = 60 * 1000;
+static constexpr int64_t AUTO_RECLUSTER_CHECKPOINT_RETRY_DELAY_MS = 1000;
 
 struct ReclusterAutoSchedulerState {
 	explicit ReclusterAutoSchedulerState(ReclusterManager &manager_p) : manager(manager_p) {
@@ -188,12 +189,14 @@ void ReclusterManager::RequestAutoCheckpoint() noexcept {
 	}
 	auto now_ms = TimePoint::GetTickMs();
 	optional<int64_t> retry_at_ms;
+	auto retry_delay_ms = AUTO_RECLUSTER_CHECKPOINT_RETRY_DELAY_MS;
 	{
 		lock_guard<mutex> guard(auto_scheduler_state->lock);
 		if (auto_scheduler_state->closing) {
 			return;
 		}
 		auto_scheduler_state->checkpoint_requested = true;
+		retry_delay_ms = MinValue(retry_delay_ms, auto_scheduler_state->auto_checkpoint_interval_ms);
 		if (auto_scheduler_state->auto_checkpoint_completed) {
 			auto elapsed_ms = now_ms - auto_scheduler_state->last_auto_checkpoint_ms;
 			if (elapsed_ms < auto_scheduler_state->auto_checkpoint_interval_ms) {
@@ -226,7 +229,7 @@ void ReclusterManager::RequestAutoCheckpoint() noexcept {
 		auto_scheduler_state->auto_checkpoint_completed = true;
 		auto_scheduler_state->last_auto_checkpoint_ms = now_ms;
 	} catch (TransactionException &) {
-		// A writer or checkpoint owns the lock. A later commit/checkpoint wake-up retries the pending request.
+		ScheduleAutoCheckpointRetry(TimePoint::GetTickMs() + retry_delay_ms);
 	} catch (FatalException &ex) {
 		InvalidateAfterAutoReclusterError(db, ex);
 	} catch (DataCorruptionException &ex) {

@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/recluster/recluster_manager.hpp"
 #include "duckdb/storage/recluster/table_recluster_state.hpp"
@@ -479,12 +480,18 @@ TEST_CASE("Rate-limited automatic checkpoints retry without an external wake-up"
 
 TEST_CASE("Automatic checkpoint requests retry after a writer releases the checkpoint lock",
           "[storage][recluster_auto]") {
+	string finish_transaction = "COMMIT";
+	SECTION("Writer commits") {
+	}
+	SECTION("Writer rolls back") {
+		finish_transaction = "ROLLBACK";
+	}
 	auto path = TestCreatePath("recluster_auto_checkpoint_retry.db");
 	DeleteDatabase(path);
 	DuckDB db;
 	Connection con(db);
 	Connection writer(db);
-	REQUIRE_NO_FAIL(con.Query("SET threads=4"));
+	REQUIRE_NO_FAIL(con.Query("SET threads=1"));
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=false"));
 	REQUIRE_NO_FAIL(con.Query("SET recluster_trigger_checkpoint=true"));
 	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
@@ -499,18 +506,20 @@ TEST_CASE("Automatic checkpoint requests retry after a writer releases the check
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT checkpoint_retry"));
 	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
 	auto &manager = GetReclusterManager(con, "tbl");
+	manager.SetAutoCheckpointIntervalForTesting(10);
 
 	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
 	REQUIRE_NO_FAIL(writer.Query("BEGIN"));
 	REQUIRE_NO_FAIL(writer.Query("UPDATE wake SET i = 2"));
 	manager.RequestAutoRecluster();
-	manager.WaitForAutoRecluster();
+	// Execute the merge pass and the pass that needs the writer's checkpoint lock.
+	TaskScheduler::GetScheduler(*con.context).ExecuteTasks(2);
 	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
 	auto rows = con.Query("SELECT count(*), sum(i) FROM tbl");
 	REQUIRE(CHECK_COLUMN(rows, 0, {20480}));
 	REQUIRE(CHECK_COLUMN(rows, 1, {209704960}));
 
-	REQUIRE_NO_FAIL(writer.Query("COMMIT"));
+	REQUIRE_NO_FAIL(writer.Query(finish_transaction));
 	manager.WaitForAutoRecluster();
 	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number + 1);
 	auto remaining = con.Query("SELECT tasks_completed, state FROM recluster('checkpoint_retry.main.tbl')");
