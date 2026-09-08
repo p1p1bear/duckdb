@@ -516,10 +516,9 @@ void ReclusterManager::RunAutoReclusterPass() noexcept {
 					table_state->SetLastError(result.message);
 				}
 				LogAutoReclusterError(db, table_name.ToString() + ": " + result.message);
-			} else if (result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE &&
-			           result.remaining_recluster_bytes > 0) {
+			} else if (result.needs_checkpoint && result.remaining_recluster_bytes > 0) {
 				checkpoint_needed = true;
-			} else if (result.state == ReclusterExplicitState::BUDGET_EXHAUSTED &&
+			} else if (result.state == ReclusterExplicitState::BUDGET_EXHAUSTED && result.tasks_completed > 0 &&
 			           result.remaining_recluster_bytes > 0) {
 				retry_tables.push_back(table_name);
 			}

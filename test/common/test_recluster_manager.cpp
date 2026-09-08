@@ -609,6 +609,72 @@ TEST_CASE("Only commits to modified sorted tables wake automatic recluster", "[s
 	DeleteDatabase(path);
 }
 
+TEST_CASE("Automatic recluster stops at mature runs and resumes for unsorted appends", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_mature_runs.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=4; SET auto_recluster=false; SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS stop_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE stop_db; CREATE TABLE tbl(i BIGINT) SORTED BY(i); CREATE TABLE wake(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(65536) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(65536) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT stop_db; INSERT INTO wake VALUES (1)"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
+	auto &manager = GetReclusterManager(con, "tbl");
+	manager.SetAutoCheckpointIntervalForTesting(10);
+	REQUIRE_NO_FAIL(con.Query("SET auto_recluster=true"));
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
+	auto stable = con.Query("SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() "
+	                        "WHERE table_name='tbl'");
+	REQUIRE(CHECK_COLUMN(stable, 0, {2}));
+	REQUIRE(CHECK_COLUMN(stable, 1, {0}));
+
+	REQUIRE_NO_FAIL(con.Query("SET enable_sorted_write=false; INSERT INTO tbl SELECT 4095-i FROM range(4096) t(i)"));
+	manager.WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") > checkpoint_number);
+	auto resumed = con.Query("SELECT run_count, remaining_recluster_bytes FROM duckdb_recluster_status() "
+	                         "WHERE table_name='tbl'");
+	REQUIRE(CHECK_COLUMN(resumed, 0, {3}));
+	REQUIRE(CHECK_COLUMN(resumed, 1, {0}));
+	auto rows = con.Query("SELECT count(*), sum(i) FROM tbl");
+	REQUIRE(CHECK_COLUMN(rows, 0, {135168}));
+	REQUIRE(CHECK_COLUMN(rows, 1, {Value::BIGINT(4303288320)}));
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Automatic recluster does not checkpoint to retry a run memory limit", "[storage][recluster_auto]") {
+	auto path = TestCreatePath("recluster_auto_run_limit.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET auto_recluster=false; SET recluster_trigger_checkpoint=true"));
+	REQUIRE_NO_FAIL(con.Query("SET debug_skip_checkpoint_on_commit=true"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS limit_db (STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE limit_db; CREATE TABLE tbl(i BIGINT) SORTED BY(i); CREATE TABLE wake(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i*2 FROM range(245760) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i*2+1 FROM range(245760) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT limit_db; INSERT INTO wake VALUES (1)"));
+	auto checkpoint_number = GetReclusterCheckpointNumber(con, "tbl");
+	auto &manager = GetReclusterManager(con, "tbl");
+	manager.SetAutoCheckpointIntervalForTesting(10);
+	REQUIRE_NO_FAIL(con.Query("SET memory_limit='16MB'; SET auto_recluster=true"));
+	manager.RequestAutoRecluster();
+	manager.WaitForAutoRecluster();
+	REQUIRE(GetReclusterCheckpointNumber(con, "tbl") == checkpoint_number);
+	auto blocked = con.Query("SELECT remaining_recluster_bytes>0, blocked_reason FROM duckdb_recluster_status() "
+	                         "WHERE table_name='tbl'");
+	REQUIRE(CHECK_COLUMN(blocked, 0, {true}));
+	REQUIRE(CHECK_COLUMN(blocked, 1, {"RUN_EXCEEDS_TASK_LIMIT"}));
+	auto explicit_result = con.Query("SELECT tasks_completed, state FROM recluster('limit_db.main.tbl')");
+	REQUIRE(CHECK_COLUMN(explicit_result, 0, {0}));
+	REQUIRE(CHECK_COLUMN(explicit_result, 1, {"NO_ELIGIBLE_RANGE"}));
+	DeleteDatabase(path);
+}
+
 TEST_CASE("Database close drains automatic recluster work", "[storage][recluster_auto]") {
 	auto path = TestCreatePath("recluster_auto_close.db");
 	DeleteDatabase(path);
