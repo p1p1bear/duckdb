@@ -124,8 +124,22 @@ Candidates are selected in this order:
 
 1. Convert checkpointed unsorted/old-rule RGs.
 2. Clean up sufficiently deleted current runs.
-3. Merge complete current runs. Incremental mode prioritizes first-key zonemap
-   overlap; FULL uses deterministic multi-level merging.
+3. Merge complete current runs. Incremental mode merges adjacent small runs,
+   prioritizing first-key zonemap overlap; FULL uses deterministic multi-level merging.
+
+Incremental maintenance stops merging a current run once its live row count reaches
+32 times the configured row-group size. A single small run waits for another eligible
+neighbor. A merge is also skipped when all first-key ranges are known and disjoint
+and packing the live rows cannot reduce the number of RGs. NULLs, non-finite bounds
+and missing statistics do not establish this no-benefit condition. Conversion and
+the existing run-level DELETE cleanup threshold remain eligible regardless of maturity.
+
+Maturity is derived from current layout metadata, not persisted as another flag.
+Reopening with the same `ROW_GROUP_SIZE` preserves the decision; changing that
+configuration changes the target. At the default RG size the target is 3,932,160
+live rows. Mature runs may still overlap: accepting that overlap bounds recurring
+rewrites but can increase the number of RGs read by a selective query. FULL ignores
+these stopping rules while retaining its resource limits.
 
 Current runs are indivisible task units. Candidate selection, task startup and
 final publication each check the relevant identities. A task scans a consistent
@@ -198,6 +212,9 @@ Successful automatic checkpoints are separated by at least 60 seconds. A pending
 cooldown or checkpoint-lock conflict uses one lazily created timer to requeue
 work; the timer itself does not run checkpoint/recluster. Lock conflicts retry
 after approximately one second, including when the blocker ends by ROLLBACK.
+An admission limit does not request a checkpoint. Exhausting a pass budget requeues
+work only if that pass completed a task; a no-progress budget failure waits for a
+later external wake-up instead of continuously resubmitting the same request.
 
 | Budget | Incremental/automatic | Explicit FULL |
 | --- | --- | --- |
@@ -210,11 +227,15 @@ after approximately one second, including when the blocker ends by ROLLBACK.
 The merge producer can overlap a compression batch, so the per-stage cap is not
 a hard limit of two busy CPUs across the complete task. The sizing code retains
 minimum-RG/single-RG admission exceptions. These are
-task budgets, not a process RSS guarantee. A run that cannot fit remains blocked;
+task budgets, not a process RSS guarantee. Work still selected by the policy remains blocked if it cannot fit;
 increasing `max_bytes` alone does not bypass the other limits. Status reports
 coverage, run count, backlog, blocked reason, active work, retired bytes and errors.
-COMPLETE means no selected organization work remains, not necessarily zero retired
-bytes before the next checkpoint.
+The status function reports incremental backlog. A CALL reports backlog for its
+requested mode. COMPLETE means that mode has no remaining organization work;
+incremental COMPLETE may have multiple overlapping runs and nonzero global
+inversions, while FULL can still merge them. Neither mode promises zero retired
+bytes before the next checkpoint. Backlog and candidate selection share the same
+layout units and incremental merge windows; task admission is checked separately.
 
 Unified CPU/I/O/temp/retired-layout admission, journal node reclamation and FULL
 time slicing are not implemented. A long reader can retain old blocks, and large
@@ -264,7 +285,7 @@ The native-default thread reset test runs separately without an overridden initi
 thread count, keeping its original assertion intact.
 
 Targeted entry points include `sorted_write_setting.test`, `adaptive_sorted_write.test`,
-`recluster_explicit.test`, `recluster_run_gaps.test`, and C++ tags
+`recluster_explicit.test`, `recluster_run_gaps.test`, `recluster_incremental_stop.test`, and C++ tags
 `[row_group_layout]`, `[recluster_sort]`, `[recluster_auto]`, `[replacement_manifest]`,
 `[recluster_finalize]` and `[recluster_wal]`.
 
@@ -273,6 +294,10 @@ batch INSERT, COPY, CTAS, public Appender flushes, existing run preservation and
 automatic background-only convergence. Other regressions cover NULL/nested data,
 concurrent INSERT/DELETE, old readers, DDL conflicts, gap-containing inputs,
 bounded payload buffers, failed publication, torn WAL and block retention.
+Stopping-policy regressions cover mature overlapping runs, no-benefit disjoint
+ranges, RG packing after small deletes, live-row maturity, nonadjacent overlap
+inside a merge window, changed checkpoint run boundaries, restart, resumed appends,
+FULL convergence and no-progress automatic checkpoint suppression.
 
 Representative existing measurements are developer experiments on a shared host,
 not release guarantees. The controlled 50M workload uses 12 columns, 8 physical
