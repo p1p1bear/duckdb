@@ -236,12 +236,13 @@ static idx_t EstimateReclusterRangeBytes(DataTable &storage, const RowGroupRange
 	return GetReclusterBlockBytes(storage.GetTableIOManager().GetBlockManagerForRowData(), blocks);
 }
 
-static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const ReclusterLayoutAnalysis &analysis) {
+static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const ReclusterLayoutAnalysis &analysis,
+                                                     ReclusterMode mode) {
 	unordered_set<block_id_t> blocks;
 	idx_t transient_bytes = 0;
 	bool has_remaining_work = false;
 	for (auto &row_group_analysis : analysis.GetRowGroups()) {
-		if (!analysis.RequiresRewrite(row_group_analysis)) {
+		if (!analysis.RequiresRewrite(row_group_analysis, mode)) {
 			continue;
 		}
 		has_remaining_work = true;
@@ -259,9 +260,18 @@ static idx_t EstimateAnalyzedRemainingReclusterBytes(DataTable &storage, const R
 	return 1;
 }
 
-idx_t ReclusterManager::EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const {
-	ReclusterLayoutAnalysis analysis(*storage.GetRowGroupCollection(), storage.Columns(), state);
-	return EstimateAnalyzedRemainingReclusterBytes(storage, analysis);
+idx_t ReclusterManager::EstimateRemainingReclusterBytes(DuckTableEntry &table, TableReclusterState &state,
+                                                        ReclusterMode mode) const {
+	auto &storage = table.GetStorage();
+	auto scheduling = state.GetSchedulingSnapshot();
+	optional_idx first_sort_column;
+	auto metadata = table.GetSortMetadata();
+	if (metadata && metadata->current_sort_order_id == scheduling.sort_order_id && metadata->GetCurrent()) {
+		first_sort_column = BindPersistentSortIndexes(storage.Columns(), *metadata->GetCurrent())[0];
+	}
+	ReclusterLayoutAnalysis analysis(*storage.GetRowGroupCollection(), storage.Columns(), std::move(scheduling),
+	                                 first_sort_column);
+	return EstimateAnalyzedRemainingReclusterBytes(storage, analysis, mode);
 }
 
 ReclusterTaskStartResult ReclusterManager::TryStartTask(DuckTableEntry &table, const ReclusterCandidate &candidate,
@@ -659,7 +669,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 	if (!explicit_lock.owns_lock() || state->GetTaskCount() != 0) {
 		result.state = ReclusterExplicitState::ALREADY_RUNNING;
 		result.message = "another maintenance task is already active for this table";
-		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(initial_table, *state, options.mode);
 		return result;
 	}
 	bool checkpoint_created = false;
@@ -668,6 +678,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 	idx_t stale_attempts = 0;
 	while (result.tasks_completed < options.max_tasks) {
 		remaining_bytes_computed = false;
+		result.needs_checkpoint = false;
 		context.InterruptCheck();
 		auto ddl_coordination_lock = storage->GetDataTableInfo()->GetReclusterDDLCoordinationLock();
 		auto &table = Catalog::GetEntry<DuckTableEntry>(context, table_name);
@@ -703,7 +714,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		idx_t candidate_bytes = 0;
 		while (true) {
 			auto limits = GetReclusterCandidateLimits(*storage, max_row_groups, max_merge_runs);
-			limits.prioritize_overlap = !full_mode;
+			limits.mode = options.mode;
 			selection = analysis.SelectCandidate(limits);
 			if (!selection.candidate) {
 				if (!expanded_for_run && max_row_groups < max_row_group_limit &&
@@ -736,7 +747,8 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 		}
 
 		if (!selection.candidate) {
-			result.remaining_recluster_bytes = EstimateAnalyzedRemainingReclusterBytes(*storage, analysis);
+			result.remaining_recluster_bytes =
+			    EstimateAnalyzedRemainingReclusterBytes(*storage, analysis, options.mode);
 			remaining_bytes_computed = true;
 			if (candidate_bytes > caller_remaining_budget || result.input_bytes >= options.max_bytes) {
 				result.state = ReclusterExplicitState::BUDGET_EXHAUSTED;
@@ -761,6 +773,8 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 				continue;
 			}
 			result.state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
+			result.needs_checkpoint = selection.status == ReclusterCandidateSelectionStatus::NO_CHECKPOINTED_RANGE ||
+			                          selection.status == ReclusterCandidateSelectionStatus::NO_ELIGIBLE_RANGE;
 			result.message = selection.status == ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT
 			                     ? (full_mode ? "the next sorted run exceeds the FULL remap memory limit"
 			                                  : "the next sorted run exceeds the per-task row-group limit")
@@ -842,7 +856,7 @@ ReclusterExplicitResult ReclusterManager::RunExplicit(ClientContext &context, co
 	}
 
 	if (!remaining_bytes_computed) {
-		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(*storage, *state);
+		result.remaining_recluster_bytes = EstimateRemainingReclusterBytes(initial_table, *state, options.mode);
 	}
 	if (result.state == ReclusterExplicitState::FAILED || result.state == ReclusterExplicitState::ALREADY_RUNNING ||
 	    result.state == ReclusterExplicitState::NO_ELIGIBLE_RANGE) {

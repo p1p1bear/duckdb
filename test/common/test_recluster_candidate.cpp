@@ -148,7 +148,9 @@ TEST_CASE("Recluster candidates convert the earliest checkpointed inputs", "[sto
 		REQUIRE(analysis.GetCheckpointRowGroupCount() == 0);
 		REQUIRE(analysis.GetRowGroups().size() == collection->GetRowGroupCount());
 		for (auto &row_group : analysis.GetRowGroups()) {
-			REQUIRE(analysis.RequiresRewrite(row_group));
+			REQUIRE(analysis.RequiresRewrite(row_group) ==
+			        (row_group.sort_metadata.sort_order_id != catalog_state.sort_order_id));
+			REQUIRE(analysis.RequiresRewrite(row_group, ReclusterMode::FULL));
 		}
 	});
 	DeleteDatabase(path);
@@ -199,7 +201,7 @@ TEST_CASE("Recluster candidates preserve runs and prioritize delete cleanup", "[
 	REQUIRE(selection.candidate->run_count == 1);
 
 	InstallCandidateTestRuns(con, "tbl", {51, 51, 52, 53, 54, 55});
-	selection = SelectCandidateForTest(con, "tbl", {8192, 4, 4, 1.0});
+	selection = SelectCandidateForTest(con, "tbl", {8192, 4, 4, 1.0, ReclusterMode::FULL});
 	REQUIRE(selection.candidate);
 	REQUIRE(selection.candidate->type == ReclusterCandidateType::RUN_MERGE);
 	REQUIRE(selection.candidate->range.start == 4096);
@@ -243,7 +245,7 @@ TEST_CASE("Incremental run merges prioritize overlapping key ranges", "[storage]
 
 	ReclusterCandidateLimits incremental {4096, 2, 2, 1.0};
 	ReclusterCandidateLimits full = incremental;
-	full.prioritize_overlap = false;
+	full.mode = ReclusterMode::FULL;
 	auto selections = SelectCandidatesFromOneAnalysisForTest(con, "tbl", {incremental, full});
 	REQUIRE(selections[0].candidate);
 	REQUIRE(selections[0].candidate->type == ReclusterCandidateType::RUN_MERGE);
@@ -253,5 +255,78 @@ TEST_CASE("Incremental run merges prioritize overlapping key ranges", "[storage]
 	REQUIRE(selections[1].candidate->type == ReclusterCandidateType::RUN_MERGE);
 	REQUIRE(selections[1].candidate->range.start == 0);
 	REQUIRE(selections[1].candidate->range.end == 4096);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Incremental maturity counts surviving rows instead of physical row groups",
+          "[storage][recluster_candidate]") {
+	auto path = TestCreatePath("recluster_partial_run_maturity.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE candidate_db; CREATE TABLE tbl(i BIGINT) SORTED BY(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(65536) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(65536) t(i); CHECKPOINT candidate_db"));
+	REQUIRE_NO_FAIL(con.Query("DELETE FROM tbl WHERE i%2=0"));
+	auto selection = SelectCandidateForTest(con, "tbl", {131072, 64, 4, 1.0});
+	REQUIRE(selection.candidate);
+	REQUIRE(selection.candidate->type == ReclusterCandidateType::RUN_MERGE);
+	REQUIRE(selection.candidate->run_count == 2);
+	REQUIRE(selection.candidate->input_live_rows == 65536);
+	REQUIRE(selection.candidate->input_physical_rows == 131072);
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Incremental backlog includes nonadjacent overlap within a merge window", "[storage][recluster_candidate]") {
+	auto path = TestCreatePath("recluster_nonadjacent_overlap.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE candidate_db; CREATE TABLE tbl(i BIGINT) SORTED BY(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i+10000 FROM range(2048) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(2048) t(i); CHECKPOINT candidate_db"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		auto state = entry.GetStorage().GetDataTableInfo()->GetReclusterState();
+		REQUIRE(state);
+		ReclusterLayoutAnalysis analysis(*collection, entry.GetStorage().Columns(), *state, optional_idx(0));
+		for (auto &row_group : analysis.GetRowGroups()) {
+			REQUIRE(analysis.RequiresRewrite(row_group));
+		}
+		auto selection = analysis.SelectCandidate({6144, 3, 4, 0.25});
+		REQUIRE(selection.candidate);
+		REQUIRE(selection.candidate->run_count == 3);
+		REQUIRE(analysis.SelectCandidate({4096, 2, 4, 0.25}).status ==
+		        ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT);
+	});
+	DeleteDatabase(path);
+}
+
+TEST_CASE("Candidate selection does not split a checkpoint run after its boundary changes",
+          "[storage][recluster_candidate]") {
+	auto path = TestCreatePath("recluster_changed_run_boundary.db");
+	DeleteDatabase(path);
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET auto_recluster=false"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS candidate_db (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')"));
+	REQUIRE_NO_FAIL(con.Query("USE candidate_db; CREATE TABLE tbl(i BIGINT) SORTED BY(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(4096) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO tbl SELECT i FROM range(4096) t(i); CHECKPOINT candidate_db"));
+	con.context->RunFunctionInTransaction([&]() {
+		auto &entry = Catalog::GetEntry<DuckTableEntry>(*con.context, QualifiedName(Identifier("tbl")));
+		auto collection = entry.GetStorage().GetRowGroupCollection();
+		REQUIRE(collection->GetRowGroupCount() == 4);
+		collection->GetRowGroup(3)->SetSortMetadata({}, true);
+	});
+	auto selection = SelectCandidateForTest(con, "tbl", {8192, 4, 4, 0.25, ReclusterMode::FULL});
+	REQUIRE(!selection.candidate);
+	REQUIRE(selection.status == ReclusterCandidateSelectionStatus::NO_ELIGIBLE_RANGE);
 	DeleteDatabase(path);
 }

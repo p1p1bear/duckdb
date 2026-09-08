@@ -33,7 +33,6 @@ class TableReclusterState;
 struct ReclusterTableStatus;
 
 enum class ReclusterExplicitState : uint8_t { COMPLETE, BUDGET_EXHAUSTED, NO_ELIGIBLE_RANGE, ALREADY_RUNNING, FAILED };
-enum class ReclusterMode : uint8_t { INCREMENTAL, FULL };
 
 struct ReclusterExplicitOptions {
 	bool create_checkpoint = false;
@@ -52,6 +51,8 @@ struct ReclusterExplicitResult {
 	idx_t remaining_recluster_bytes = 0;
 	ReclusterExplicitState state = ReclusterExplicitState::NO_ELIGIBLE_RANGE;
 	string message;
+	//! Only missing checkpoint inputs can be refreshed by automatic checkpointing.
+	bool needs_checkpoint = false;
 };
 
 const char *ReclusterExplicitStateToString(ReclusterExplicitState state);
@@ -132,7 +133,7 @@ private:
 	void ClearAutoCheckpointRequest() noexcept;
 	bool AutoReclusterEnabled() const noexcept;
 	bool AutoCheckpointEnabled() const noexcept;
-	idx_t EstimateRemainingReclusterBytes(DataTable &storage, TableReclusterState &state) const;
+	idx_t EstimateRemainingReclusterBytes(DuckTableEntry &table, TableReclusterState &state, ReclusterMode mode) const;
 	vector<QualifiedName> DiscoverSortedTables();
 	shared_ptr<TableReclusterState> SynchronizeTable(DuckTableEntry &table);
 	uint64_t AllocateInitializationToken();

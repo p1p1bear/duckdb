@@ -240,7 +240,7 @@ TEST_CASE("Recluster merge bounds variable-length source buffers across refills"
 		                          key + " AS k FROM range(65536) t(i))"));
 	}
 	REQUIRE_NO_FAIL(con.Query("CHECKPOINT buffers"));
-	auto start = StartRunMergeTask(con, "tbl", {131072, 64, 4, 0.25});
+	auto start = StartRunMergeTask(con, "tbl", {131072, 64, 4, 0.25, ReclusterMode::FULL});
 	REQUIRE(start.status == ReclusterTaskStartStatus::STARTED);
 	ReclusterSorter sorter(*start.task);
 	sorter.Prepare();

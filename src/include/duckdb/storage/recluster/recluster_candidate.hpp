@@ -25,6 +25,7 @@ struct TableReclusterSchedulingSnapshot;
 static constexpr idx_t DEFAULT_RECLUSTER_MAX_MERGE_RUNS = 4;
 static constexpr idx_t FULL_RECLUSTER_MAX_MERGE_RUNS = 32;
 
+enum class ReclusterMode : uint8_t { INCREMENTAL, FULL };
 enum class ReclusterCandidateType : uint8_t { CONVERSION, DELETE_CLEANUP, RUN_MERGE };
 
 enum class ReclusterCandidateSelectionStatus : uint8_t {
@@ -39,7 +40,7 @@ struct ReclusterCandidateLimits {
 	idx_t max_row_groups = 0;
 	idx_t max_merge_runs = 0;
 	double delete_cleanup_ratio = 0;
-	bool prioritize_overlap = true;
+	ReclusterMode mode = ReclusterMode::INCREMENTAL;
 };
 
 idx_t GetReclusterRowGroupLimit(DataTable &storage);
@@ -73,6 +74,7 @@ struct ReclusterAnalyzedRowGroup {
 	RowGroupSortMetadata sort_metadata;
 	idx_t physical_rows = 0;
 	idx_t live_rows = 0;
+	idx_t unit_index = 0;
 };
 
 class ReclusterLayoutAnalysisState;
@@ -93,7 +95,8 @@ public:
 	bool IsCheckpointedRowGroup(idx_t row_group_index);
 	layout_version_t GetLayoutVersion() const;
 	idx_t GetLayoutPatchCount() const;
-	bool RequiresRewrite(const ReclusterAnalyzedRowGroup &row_group) const;
+	bool RequiresRewrite(const ReclusterAnalyzedRowGroup &row_group,
+	                     ReclusterMode mode = ReclusterMode::INCREMENTAL) const;
 
 private:
 	unique_ptr<ReclusterLayoutAnalysisState> analysis;

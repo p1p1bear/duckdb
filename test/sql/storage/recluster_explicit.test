@@ -144,8 +144,8 @@ CALL recluster('r.main.events', mode='invalid')
 ----
 <REGEX>:.*mode must be either 'incremental' or 'full'.*
 
-# Incremental mode rejects indivisible sorted runs above its conservative remap
-# budget. FULL raises only the explicit remap budget and streams the input.
+# Incremental mode leaves mature runs intact. FULL raises the explicit remap
+# budget and streams these runs even under a small memory limit.
 statement ok
 CREATE TABLE full_merge(k BIGINT, payload BIGINT) SORTED BY (k)
 
@@ -164,7 +164,7 @@ SET memory_limit='16MB'
 query IT
 SELECT tasks_completed, state FROM recluster('r.main.full_merge')
 ----
-0	NO_ELIGIBLE_RANGE
+0	COMPLETE
 
 query IT
 SELECT tasks_completed, state FROM recluster('r.main.full_merge', mode='full', max_bytes='1B')

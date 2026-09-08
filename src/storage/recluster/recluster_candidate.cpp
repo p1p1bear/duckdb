@@ -26,6 +26,7 @@ static constexpr idx_t RECLUSTER_REMAP_MEMORY_DIVISOR = 64;
 static constexpr idx_t FULL_RECLUSTER_REMAP_MEMORY_DIVISOR = 8;
 static constexpr idx_t RECLUSTER_INPUT_MEMORY_DIVISOR = 8;
 static constexpr double DEFAULT_RECLUSTER_DELETE_CLEANUP_RATIO = 0.25;
+static constexpr idx_t INCREMENTAL_RECLUSTER_TARGET_ROW_GROUPS = 32;
 static idx_t GetReclusterRowGroupLimit(DataTable &storage, idx_t memory_divisor) {
 	if (memory_divisor == 0) {
 		throw InternalException("Recluster candidate requires a non-zero remap memory divisor");
@@ -71,17 +72,13 @@ ReclusterCandidateLimits GetReclusterCandidateLimits(DataTable &storage, idx_t m
 	return {max_rows, max_row_groups, max_merge_runs, DEFAULT_RECLUSTER_DELETE_CLEANUP_RATIO};
 }
 
-struct CandidateRowGroupState {
-	idx_t live_rows = 0;
-	optional_idx current_index;
-};
-
 struct CandidateUnit {
 	idx_t input_begin = 0;
 	idx_t input_end = 0;
 	RowGroupRange range {0, 0};
 	bool current_run = false;
 	bool available = false;
+	bool requires_rewrite = false;
 	idx_t physical_rows = 0;
 	idx_t live_rows = 0;
 	idx_t deleted_rows = 0;
@@ -111,6 +108,9 @@ public:
 
 	bool selectable = false;
 	bool candidate_cache_built = false;
+	idx_t row_group_size = 0;
+	idx_t target_run_rows = 0;
+	optional<ReclusterMode> rewrite_mode;
 	reference<const vector<ColumnDefinition>> columns;
 	RowGroupCollectionSnapshot current;
 	vector<RowGroupRange> reserved_ranges;
@@ -121,33 +121,33 @@ public:
 	optional_idx first_sort_column;
 	vector<ReclusterAnalyzedRowGroup> row_groups;
 	vector<AnalyzedCheckpointState> checkpoint_states;
-	vector<CandidateRowGroupState> input_states;
 	vector<CandidateUnit> units;
 };
 
-bool GetReclusterRowGroupStatisticsRange(RowGroup &row_group, idx_t column_index, Value &minimum, Value &maximum) {
-	auto statistics = row_group.GetStatistics(column_index);
-	if (!statistics) {
-		return false;
-	}
-	switch (statistics->GetStatsType()) {
+static bool GetStatisticsRange(const BaseStatistics &statistics, Value &minimum, Value &maximum) {
+	switch (statistics.GetStatsType()) {
 	case StatisticsType::NUMERIC_STATS:
-		if (!NumericStats::HasMinMax(*statistics)) {
+		if (!NumericStats::HasMinMax(statistics)) {
 			return false;
 		}
-		minimum = NumericStats::Min(*statistics);
-		maximum = NumericStats::Max(*statistics);
+		minimum = NumericStats::Min(statistics);
+		maximum = NumericStats::Max(statistics);
 		return true;
 	case StatisticsType::STRING_STATS:
-		if (!StringStats::HasMinMax(*statistics)) {
+		if (!StringStats::HasMinMax(statistics)) {
 			return false;
 		}
-		minimum = Value::BLOB_RAW(StringStats::Min(*statistics));
-		maximum = Value::BLOB_RAW(StringStats::Max(*statistics));
+		minimum = Value::BLOB_RAW(StringStats::Min(statistics));
+		maximum = Value::BLOB_RAW(StringStats::Max(statistics));
 		return true;
 	default:
 		return false;
 	}
+}
+
+bool GetReclusterRowGroupStatisticsRange(RowGroup &row_group, idx_t column_index, Value &minimum, Value &maximum) {
+	auto statistics = row_group.GetStatistics(column_index);
+	return statistics && GetStatisticsRange(*statistics, minimum, maximum);
 }
 
 static RowGroupRange GetIdentityRange(const RowGroupPhysicalIdentity &identity) {
@@ -240,6 +240,24 @@ static void AnalyzeCurrentLayout(ReclusterLayoutAnalysisState &analysis) {
 		row_group.live_rows = entry.row_group->GetCommittedRowCount();
 		auto is_current = analysis.sort_order_id != INVALID_SORT_ORDER_ID &&
 		                  row_group.sort_metadata.sort_order_id == analysis.sort_order_id;
+		auto new_unit = !is_current || !previous_was_current || row_group.sort_metadata.run_id != previous_run_id;
+		if (new_unit) {
+			CandidateUnit unit;
+			unit.input_begin = analysis.row_groups.size();
+			unit.range.start = entry.row_start;
+			unit.current_run = is_current;
+			analysis.units.push_back(std::move(unit));
+		}
+		row_group.unit_index = analysis.units.size() - 1;
+		auto &unit = analysis.units.back();
+		unit.input_end = analysis.row_groups.size() + 1;
+		unit.range.end = entry.GetRowEnd();
+		unit.physical_rows = AddCount(unit.physical_rows, row_group.physical_rows);
+		unit.live_rows = AddCount(unit.live_rows, row_group.live_rows);
+		if (unit.live_rows > unit.physical_rows) {
+			throw InternalException("Recluster candidate has more committed rows than physical rows");
+		}
+		unit.deleted_rows = unit.physical_rows - unit.live_rows;
 		if (!is_current) {
 			has_old_organization = true;
 		} else if (!previous_was_current || row_group.sort_metadata.run_id != previous_run_id) {
@@ -248,8 +266,8 @@ static void AnalyzeCurrentLayout(ReclusterLayoutAnalysisState &analysis) {
 		previous_was_current = is_current;
 		previous_run_id = is_current ? row_group.sort_metadata.run_id : INVALID_SORT_RUN_ID;
 
+		AnalyzedCheckpointState checkpoint_state;
 		if (analysis.checkpoint) {
-			AnalyzedCheckpointState checkpoint_state;
 			while (checkpoint_index < analysis.checkpoint->row_groups.size() &&
 			       GetIdentityRange(analysis.checkpoint->row_groups[checkpoint_index]).end <= entry.row_start) {
 				checkpoint_index++;
@@ -262,88 +280,49 @@ static void AnalyzeCurrentLayout(ReclusterLayoutAnalysisState &analysis) {
 					checkpoint_index++;
 				}
 			}
-			analysis.checkpoint_states.push_back(std::move(checkpoint_state));
 		}
+		analysis.checkpoint_states.push_back(std::move(checkpoint_state));
 		analysis.row_groups.push_back(std::move(row_group));
 	}
 	analysis.includes_current_runs = current_run_count > 1 || (has_old_organization && current_run_count > 0);
 }
 
-static vector<CandidateRowGroupState>
-BuildCandidateInputStates(const CheckpointLayoutSnapshot &checkpoint,
-                          const vector<ReclusterAnalyzedRowGroup> &row_groups,
-                          const vector<AnalyzedCheckpointState> &checkpoint_states,
-                          const RowGroupCollectionSnapshot &current, const vector<RowGroupRange> &reserved_ranges) {
-	D_ASSERT(row_groups.size() == checkpoint_states.size());
-	vector<CandidateRowGroupState> result(checkpoint.row_groups.size());
-	for (idx_t row_group_index = 0; row_group_index < row_groups.size(); row_group_index++) {
-		auto &row_group = row_groups[row_group_index];
-		auto &checkpoint_state = checkpoint_states[row_group_index];
-		if (!checkpoint_state.checkpoint_index.IsValid() ||
-		    (checkpoint_state.identity_checked && !checkpoint_state.identity_matches)) {
-			continue;
-		}
-		auto input_index = checkpoint_state.checkpoint_index.GetIndex();
-		auto &expected = checkpoint.row_groups[input_index];
-		auto expected_range = GetIdentityRange(expected);
-		if (!expected.sealed || current.HasPatch(expected_range) || OverlapsAny(expected_range, reserved_ranges)) {
-			continue;
-		}
-		if (row_group.live_rows > expected.count) {
-			throw InternalException("Recluster candidate has more committed rows than physical rows");
-		}
-		result[input_index].live_rows = row_group.live_rows;
-		result[input_index].current_index = row_group_index;
+static bool SplitsCurrentRun(const CheckpointLayoutSnapshot &checkpoint, sort_order_id_t sort_order_id,
+                             idx_t checkpoint_begin, idx_t checkpoint_end) {
+	auto &first = checkpoint.row_groups[checkpoint_begin].sort_metadata;
+	if (first.sort_order_id == sort_order_id && checkpoint_begin > 0 &&
+	    checkpoint.row_groups[checkpoint_begin - 1].sort_metadata == first) {
+		return true;
 	}
-	return result;
-}
-
-static vector<CandidateUnit> BuildCandidateUnits(const CheckpointLayoutSnapshot &checkpoint,
-                                                 const vector<CandidateRowGroupState> &input_states,
-                                                 sort_order_id_t current_sort_order_id,
-                                                 const vector<RowGroupRange> &reserved_ranges) {
-	vector<CandidateUnit> units;
-	idx_t input_index = 0;
-	while (input_index < checkpoint.row_groups.size()) {
-		auto &first = checkpoint.row_groups[input_index];
-		auto current_run = first.sort_metadata.sort_order_id == current_sort_order_id;
-		idx_t input_end = input_index + 1;
-		if (current_run) {
-			while (input_end < checkpoint.row_groups.size() &&
-			       checkpoint.row_groups[input_end].sort_metadata.sort_order_id == current_sort_order_id &&
-			       checkpoint.row_groups[input_end].sort_metadata.run_id == first.sort_metadata.run_id) {
-				input_end++;
-			}
-		}
-
-		CandidateUnit unit;
-		unit.input_begin = input_index;
-		unit.input_end = input_end;
-		unit.range.start = first.start;
-		unit.range.end = GetIdentityRange(checkpoint.row_groups[input_end - 1]).end;
-		unit.current_run = current_run;
-		unit.available = true;
-		for (idx_t unit_index = input_index; unit_index < input_end; unit_index++) {
-			auto &identity = checkpoint.row_groups[unit_index];
-			unit.physical_rows = AddCount(unit.physical_rows, identity.count);
-			unit.live_rows = AddCount(unit.live_rows, input_states[unit_index].live_rows);
-			unit.available = unit.available && input_states[unit_index].current_index.IsValid();
-		}
-		unit.deleted_rows = unit.physical_rows - unit.live_rows;
-		unit.available = unit.available && !OverlapsAny(unit.range, reserved_ranges);
-		units.push_back(unit);
-		input_index = input_end;
-	}
-	return units;
+	auto &last = checkpoint.row_groups[checkpoint_end - 1].sort_metadata;
+	return last.sort_order_id == sort_order_id && checkpoint_end < checkpoint.row_groups.size() &&
+	       checkpoint.row_groups[checkpoint_end].sort_metadata == last;
 }
 
 static void RebuildCandidateCache(ReclusterLayoutAnalysisState &analysis) {
-	analysis.input_states =
-	    BuildCandidateInputStates(*analysis.checkpoint, analysis.row_groups, analysis.checkpoint_states,
-	                              analysis.current, analysis.reserved_ranges);
-	analysis.units = BuildCandidateUnits(*analysis.checkpoint, analysis.input_states, analysis.sort_order_id,
-	                                     analysis.reserved_ranges);
-	analysis.unit_key_ranges_built = false;
+	for (auto &unit : analysis.units) {
+		unit.available = !analysis.current.HasPatch(unit.range) && !OverlapsAny(unit.range, analysis.reserved_ranges);
+		optional_idx previous_index;
+		for (idx_t row_group_index = unit.input_begin; unit.available && row_group_index < unit.input_end;
+		     row_group_index++) {
+			auto &state = analysis.checkpoint_states[row_group_index];
+			if (!state.checkpoint_index.IsValid() || (state.identity_checked && !state.identity_matches)) {
+				unit.available = false;
+				break;
+			}
+			auto index = state.checkpoint_index.GetIndex();
+			auto &expected = analysis.checkpoint->row_groups[index];
+			unit.available = expected.sealed &&
+			                 expected.sort_metadata == analysis.row_groups[row_group_index].sort_metadata &&
+			                 (!previous_index.IsValid() || index == previous_index.GetIndex() + 1);
+			previous_index = index;
+		}
+		if (unit.available && unit.current_run) {
+			auto begin = analysis.checkpoint_states[unit.input_begin].checkpoint_index.GetIndex();
+			unit.available =
+			    !SplitsCurrentRun(*analysis.checkpoint, analysis.sort_order_id, begin, previous_index.GetIndex() + 1);
+		}
+	}
 	analysis.candidate_cache_built = true;
 }
 
@@ -352,7 +331,7 @@ static void BuildUnitKeyRanges(ReclusterLayoutAnalysisState &analysis) {
 		return;
 	}
 	for (auto &unit : analysis.units) {
-		if (!unit.current_run || !unit.available) {
+		if (!unit.current_run || unit.live_rows >= analysis.target_run_rows) {
 			continue;
 		}
 		if (!analysis.first_sort_column.IsValid()) {
@@ -360,16 +339,22 @@ static void BuildUnitKeyRanges(ReclusterLayoutAnalysisState &analysis) {
 			continue;
 		}
 		for (idx_t input_index = unit.input_begin; input_index < unit.input_end; input_index++) {
-			auto &input_state = analysis.input_states[input_index];
-			if (input_state.live_rows == 0) {
+			auto &row_group = analysis.row_groups[input_index];
+			if (row_group.live_rows == 0) {
 				continue;
 			}
-			D_ASSERT(input_state.current_index.IsValid());
-			auto &row_group = analysis.row_groups[input_state.current_index.GetIndex()];
 			Value minimum;
 			Value maximum;
-			if (!GetReclusterRowGroupStatisticsRange(*row_group.entry.row_group, analysis.first_sort_column.GetIndex(),
-			                                         minimum, maximum)) {
+			auto statistics = row_group.entry.row_group->GetStatistics(analysis.first_sort_column.GetIndex());
+			if (!statistics || statistics->CanHaveNull() || !GetStatisticsRange(*statistics, minimum, maximum)) {
+				unit.key_range_complete = false;
+				continue;
+			}
+			auto physical_type = statistics->GetType().InternalType();
+			if ((physical_type == PhysicalType::FLOAT &&
+			     (!std::isfinite(minimum.GetValue<float>()) || !std::isfinite(maximum.GetValue<float>()))) ||
+			    (physical_type == PhysicalType::DOUBLE &&
+			     (!std::isfinite(minimum.GetValue<double>()) || !std::isfinite(maximum.GetValue<double>())))) {
 				unit.key_range_complete = false;
 				continue;
 			}
@@ -411,6 +396,14 @@ ReclusterLayoutAnalysis::ReclusterLayoutAnalysis(RowGroupCollection &collection,
 		checkpoint = scheduling.checkpoint;
 	}
 	analysis->sort_order_id = scheduling.sort_order_id;
+	analysis->row_group_size = collection.GetRowGroupSize();
+	if (analysis->row_group_size == 0) {
+		throw InternalException("Recluster analysis requires a non-zero row group size");
+	}
+	analysis->target_run_rows =
+	    analysis->row_group_size > NumericLimits<idx_t>::Maximum() / INCREMENTAL_RECLUSTER_TARGET_ROW_GROUPS
+	        ? NumericLimits<idx_t>::Maximum()
+	        : analysis->row_group_size * INCREMENTAL_RECLUSTER_TARGET_ROW_GROUPS;
 	analysis->first_sort_column = first_sort_column;
 	analysis->checkpoint = checkpoint;
 	AnalyzeCurrentLayout(*analysis);
@@ -491,18 +484,6 @@ idx_t ReclusterLayoutAnalysis::GetLayoutPatchCount() const {
 	           : 0;
 }
 
-bool ReclusterLayoutAnalysis::RequiresRewrite(const ReclusterAnalyzedRowGroup &row_group) const {
-	if (analysis->sort_order_id == INVALID_SORT_ORDER_ID) {
-		return false;
-	}
-	auto is_current = row_group.sort_metadata.sort_order_id == analysis->sort_order_id;
-	auto needs_delete_cleanup =
-	    row_group.physical_rows > 0 && row_group.live_rows < row_group.physical_rows &&
-	    static_cast<long double>(row_group.physical_rows - row_group.live_rows) >=
-	        static_cast<long double>(row_group.physical_rows) * DEFAULT_RECLUSTER_DELETE_CLEANUP_RATIO;
-	return !is_current || analysis->includes_current_runs || needs_delete_cleanup;
-}
-
 static bool FitsLimits(idx_t physical_rows, idx_t row_group_count, const ReclusterCandidateLimits &limits) {
 	return physical_rows <= limits.max_physical_rows && row_group_count <= limits.max_row_groups;
 }
@@ -512,9 +493,17 @@ static bool MeetsDeleteThreshold(const CandidateUnit &unit, double threshold) {
 	       static_cast<long double>(unit.deleted_rows) >= static_cast<long double>(unit.physical_rows) * threshold;
 }
 
-static ReclusterCandidate BuildCandidate(ReclusterCandidateType type, const CheckpointLayoutSnapshot &checkpoint,
-                                         const vector<CandidateUnit> &units, idx_t unit_begin, idx_t unit_end,
-                                         layout_version_t layout_version, sort_order_id_t sort_order_id) {
+static bool AdjacentCheckpointUnits(const ReclusterLayoutAnalysisState &analysis, idx_t left, idx_t right) {
+	auto last = analysis.checkpoint_states[analysis.units[left].input_end - 1].checkpoint_index;
+	auto first = analysis.checkpoint_states[analysis.units[right].input_begin].checkpoint_index;
+	return last.IsValid() && first.IsValid() && first.GetIndex() == last.GetIndex() + 1;
+}
+
+static ReclusterCandidate BuildCandidate(ReclusterCandidateType type, const ReclusterLayoutAnalysisState &analysis,
+                                         idx_t unit_begin, idx_t unit_end, layout_version_t layout_version,
+                                         sort_order_id_t sort_order_id) {
+	auto &checkpoint = *analysis.checkpoint;
+	auto &units = analysis.units;
 	D_ASSERT(unit_begin < unit_end);
 	D_ASSERT(unit_end <= units.size());
 	ReclusterCandidate result;
@@ -535,16 +524,17 @@ static ReclusterCandidate BuildCandidate(ReclusterCandidateType type, const Chec
 			result.run_count++;
 		}
 		for (idx_t input_index = unit.input_begin; input_index < unit.input_end; input_index++) {
-			result.expected_row_groups.push_back(checkpoint.row_groups[input_index]);
+			auto checkpoint_index = analysis.checkpoint_states[input_index].checkpoint_index.GetIndex();
+			result.expected_row_groups.push_back(checkpoint.row_groups[checkpoint_index]);
 		}
 	}
 	return result;
 }
 
-static optional<ReclusterCandidate> SelectConversion(const CheckpointLayoutSnapshot &checkpoint,
-                                                     const vector<CandidateUnit> &units,
+static optional<ReclusterCandidate> SelectConversion(const ReclusterLayoutAnalysisState &analysis,
                                                      const ReclusterCandidateLimits &limits,
                                                      layout_version_t layout_version, sort_order_id_t sort_order_id) {
+	auto &units = analysis.units;
 	for (idx_t unit_begin = 0; unit_begin < units.size(); unit_begin++) {
 		if (units[unit_begin].current_run || !units[unit_begin].available) {
 			continue;
@@ -553,6 +543,9 @@ static optional<ReclusterCandidate> SelectConversion(const CheckpointLayoutSnaps
 		idx_t row_group_count = 0;
 		idx_t unit_end = unit_begin;
 		while (unit_end < units.size() && !units[unit_end].current_run && units[unit_end].available) {
+			if (unit_end > unit_begin && !AdjacentCheckpointUnits(analysis, unit_end - 1, unit_end)) {
+				break;
+			}
 			auto next_physical_rows = AddCount(physical_rows, units[unit_end].physical_rows);
 			auto next_row_group_count = AddCount(row_group_count, units[unit_end].RowGroupCount());
 			if (!FitsLimits(next_physical_rows, next_row_group_count, limits)) {
@@ -563,8 +556,8 @@ static optional<ReclusterCandidate> SelectConversion(const CheckpointLayoutSnaps
 			unit_end++;
 		}
 		if (unit_end > unit_begin) {
-			return BuildCandidate(ReclusterCandidateType::CONVERSION, checkpoint, units, unit_begin, unit_end,
-			                      layout_version, sort_order_id);
+			return BuildCandidate(ReclusterCandidateType::CONVERSION, analysis, unit_begin, unit_end, layout_version,
+			                      sort_order_id);
 		}
 	}
 	return nullopt;
@@ -651,51 +644,102 @@ static bool PreferMergeCandidate(const ReclusterCandidate &candidate, bool candi
 	return candidate.range.end < best.range.end;
 }
 
-static optional<ReclusterCandidate> SelectRunMerge(const CheckpointLayoutSnapshot &checkpoint,
-                                                   const vector<CandidateUnit> &units,
+template <class CALLBACK>
+static bool VisitRunMerges(ReclusterLayoutAnalysisState &analysis, const ReclusterCandidateLimits &limits,
+                           bool require_checkpoint, CALLBACK callback) {
+	auto &units = analysis.units;
+	auto incremental = limits.mode == ReclusterMode::INCREMENTAL;
+	if (incremental) {
+		BuildUnitKeyRanges(analysis);
+	}
+	auto eligible = [&](const CandidateUnit &unit) {
+		return unit.current_run && (!incremental || unit.live_rows < analysis.target_run_rows) &&
+		       (!require_checkpoint || unit.available);
+	};
+	bool run_exceeds_limit = false;
+	for (idx_t unit_begin = 0; unit_begin < units.size(); unit_begin++) {
+		if (!eligible(units[unit_begin])) {
+			continue;
+		}
+		idx_t physical_rows = 0;
+		idx_t live_rows = 0;
+		idx_t row_group_count = 0;
+		idx_t run_count = 0;
+		for (idx_t unit_end = unit_begin; unit_end < units.size() && run_count < limits.max_merge_runs; unit_end++) {
+			auto &unit = units[unit_end];
+			if (!eligible(unit) || (require_checkpoint && unit_end > unit_begin &&
+			                        !AdjacentCheckpointUnits(analysis, unit_end - 1, unit_end))) {
+				break;
+			}
+			physical_rows = AddCount(physical_rows, unit.physical_rows);
+			live_rows = AddCount(live_rows, unit.live_rows);
+			row_group_count = AddCount(row_group_count, unit.RowGroupCount());
+			run_count++;
+			if (run_count < 2) {
+				continue;
+			}
+			bool overlap_known = false;
+			idx_t overlapping_pairs = 0;
+			if (incremental) {
+				ComputeMergeOverlap(units, unit_begin, unit_end + 1, overlap_known, overlapping_pairs);
+				auto output_groups = live_rows / analysis.row_group_size + (live_rows % analysis.row_group_size != 0);
+				if (overlap_known && overlapping_pairs == 0 && output_groups >= row_group_count) {
+					continue;
+				}
+			}
+			if (!FitsLimits(physical_rows, row_group_count, limits)) {
+				run_exceeds_limit = true;
+				break;
+			}
+			callback(unit_begin, unit_end + 1, overlap_known, overlapping_pairs);
+		}
+	}
+	return run_exceeds_limit;
+}
+
+bool ReclusterLayoutAnalysis::RequiresRewrite(const ReclusterAnalyzedRowGroup &row_group, ReclusterMode mode) const {
+	if (analysis->sort_order_id == INVALID_SORT_ORDER_ID) {
+		return false;
+	}
+	if (!analysis->rewrite_mode || *analysis->rewrite_mode != mode) {
+		for (auto &unit : analysis->units) {
+			unit.requires_rewrite = !unit.current_run ||
+			                        MeetsDeleteThreshold(unit, DEFAULT_RECLUSTER_DELETE_CLEANUP_RATIO) ||
+			                        (mode == ReclusterMode::FULL && analysis->includes_current_runs);
+		}
+		if (mode == ReclusterMode::INCREMENTAL) {
+			ReclusterCandidateLimits limits {NumericLimits<idx_t>::Maximum(), NumericLimits<idx_t>::Maximum(),
+			                                 DEFAULT_RECLUSTER_MAX_MERGE_RUNS, DEFAULT_RECLUSTER_DELETE_CLEANUP_RATIO};
+			// Backlog uses the same policy windows without checkpoint or admission limits.
+			VisitRunMerges(*analysis, limits, false, [&](idx_t begin, idx_t end, bool, idx_t) {
+				for (idx_t index = begin; index < end; index++) {
+					analysis->units[index].requires_rewrite = true;
+				}
+			});
+		}
+		analysis->rewrite_mode = mode;
+	}
+	return analysis->units[row_group.unit_index].requires_rewrite;
+}
+
+static optional<ReclusterCandidate> SelectRunMerge(ReclusterLayoutAnalysisState &analysis,
                                                    const ReclusterCandidateLimits &limits,
                                                    layout_version_t layout_version, sort_order_id_t sort_order_id,
                                                    bool &run_exceeds_limit) {
 	optional<ReclusterCandidate> best;
 	bool best_overlap_known = false;
 	idx_t best_overlapping_pairs = 0;
-	for (idx_t unit_begin = 0; unit_begin < units.size(); unit_begin++) {
-		if (!units[unit_begin].current_run || !units[unit_begin].available) {
-			continue;
-		}
-		idx_t physical_rows = 0;
-		idx_t row_group_count = 0;
-		idx_t run_count = 0;
-		for (idx_t unit_end = unit_begin; unit_end < units.size() && run_count < limits.max_merge_runs; unit_end++) {
-			auto &unit = units[unit_end];
-			if (!unit.current_run || !unit.available) {
-				break;
-			}
-			physical_rows = AddCount(physical_rows, unit.physical_rows);
-			row_group_count = AddCount(row_group_count, unit.RowGroupCount());
-			run_count++;
-			if (run_count < 2) {
-				continue;
-			}
-			if (!FitsLimits(physical_rows, row_group_count, limits)) {
-				run_exceeds_limit = true;
-				break;
-			}
-			auto candidate = BuildCandidate(ReclusterCandidateType::RUN_MERGE, checkpoint, units, unit_begin,
-			                                unit_end + 1, layout_version, sort_order_id);
-			bool overlap_known = false;
-			idx_t overlapping_pairs = 0;
-			if (limits.prioritize_overlap) {
-				ComputeMergeOverlap(units, unit_begin, unit_end + 1, overlap_known, overlapping_pairs);
-			}
-			if (!best || PreferMergeCandidate(candidate, overlap_known, overlapping_pairs, *best, best_overlap_known,
-			                                  best_overlapping_pairs, limits.prioritize_overlap)) {
-				best = std::move(candidate);
-				best_overlap_known = overlap_known;
-				best_overlapping_pairs = overlapping_pairs;
-			}
-		}
-	}
+	run_exceeds_limit |=
+	    VisitRunMerges(analysis, limits, true, [&](idx_t begin, idx_t end, bool known, idx_t overlaps) {
+		    auto candidate =
+		        BuildCandidate(ReclusterCandidateType::RUN_MERGE, analysis, begin, end, layout_version, sort_order_id);
+		    if (!best || PreferMergeCandidate(candidate, known, overlaps, *best, best_overlap_known,
+		                                      best_overlapping_pairs, limits.mode == ReclusterMode::INCREMENTAL)) {
+			    best = std::move(candidate);
+			    best_overlap_known = known;
+			    best_overlapping_pairs = overlaps;
+		    }
+	    });
 	return best;
 }
 
@@ -711,22 +755,17 @@ ReclusterCandidateSelection ReclusterLayoutAnalysis::SelectCandidate(const Reclu
 	auto layout_version = GetSnapshotLayoutVersion(analysis->current);
 	while (true) {
 		optional<ReclusterCandidate> candidate =
-		    SelectConversion(*analysis->checkpoint, analysis->units, limits, layout_version, analysis->sort_order_id);
+		    SelectConversion(*analysis, limits, layout_version, analysis->sort_order_id);
 		bool run_exceeds_limit = false;
 		if (!candidate) {
 			auto cleanup_unit = SelectDeleteCleanup(analysis->units, limits, run_exceeds_limit);
 			if (cleanup_unit) {
-				candidate =
-				    BuildCandidate(ReclusterCandidateType::DELETE_CLEANUP, *analysis->checkpoint, analysis->units,
-				                   *cleanup_unit, *cleanup_unit + 1, layout_version, analysis->sort_order_id);
+				candidate = BuildCandidate(ReclusterCandidateType::DELETE_CLEANUP, *analysis, *cleanup_unit,
+				                           *cleanup_unit + 1, layout_version, analysis->sort_order_id);
 			}
 		}
 		if (!candidate) {
-			if (limits.prioritize_overlap) {
-				BuildUnitKeyRanges(*analysis);
-			}
-			candidate = SelectRunMerge(*analysis->checkpoint, analysis->units, limits, layout_version,
-			                           analysis->sort_order_id, run_exceeds_limit);
+			candidate = SelectRunMerge(*analysis, limits, layout_version, analysis->sort_order_id, run_exceeds_limit);
 		}
 		if (!candidate) {
 			return {run_exceeds_limit ? ReclusterCandidateSelectionStatus::RUN_EXCEEDS_TASK_LIMIT
@@ -770,19 +809,6 @@ static void ValidateCandidateEnvelope(const ReclusterCandidate &candidate) {
 	}
 }
 
-static bool SplitsCurrentRun(const CheckpointLayoutSnapshot &checkpoint, const ReclusterCandidate &candidate,
-                             idx_t checkpoint_begin) {
-	auto checkpoint_end = checkpoint_begin + candidate.expected_row_groups.size();
-	auto &first = candidate.expected_row_groups.front().sort_metadata;
-	if (first.sort_order_id == candidate.sort_order_id && checkpoint_begin > 0 &&
-	    checkpoint.row_groups[checkpoint_begin - 1].sort_metadata == first) {
-		return true;
-	}
-	auto &last = candidate.expected_row_groups.back().sort_metadata;
-	return last.sort_order_id == candidate.sort_order_id && checkpoint_end < checkpoint.row_groups.size() &&
-	       checkpoint.row_groups[checkpoint_end].sort_metadata == last;
-}
-
 optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &collection,
                                                           const vector<ColumnDefinition> &columns,
                                                           TableReclusterState &state,
@@ -800,7 +826,9 @@ optional<ReclusterCandidate> RevalidateReclusterCandidate(RowGroupCollection &co
 		return nullopt;
 	}
 	auto checkpoint_begin = FindCheckpointRowGroups(*checkpoint, candidate.expected_row_groups);
-	if (!checkpoint_begin.IsValid() || SplitsCurrentRun(*checkpoint, candidate, checkpoint_begin.GetIndex())) {
+	if (!checkpoint_begin.IsValid() ||
+	    SplitsCurrentRun(*checkpoint, candidate.sort_order_id, checkpoint_begin.GetIndex(),
+	                     checkpoint_begin.GetIndex() + candidate.expected_row_groups.size())) {
 		return nullopt;
 	}
 
